@@ -7,16 +7,18 @@ your LLM clients, HTTP calls, database queries, and logging — then streams tra
 ## Installation
 
 ```bash
-pip install evalkit
+pip install syntropylabs-evalkit
 ```
 
 Optional provider extras:
 
 ```bash
-pip install "evalkit[openai]"      # OpenAI
-pip install "evalkit[anthropic]"   # Anthropic
-pip install "evalkit[all]"         # everything
+pip install "syntropylabs-evalkit[openai]"      # OpenAI
+pip install "syntropylabs-evalkit[anthropic]"   # Anthropic
+pip install "syntropylabs-evalkit[all]"         # everything
 ```
+
+> The PyPI package is `syntropylabs-evalkit`, but you import it as `evalkit`.
 
 ## Quickstart
 

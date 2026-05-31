@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "evalkit"
+name = "syntropylabs-evalkit"
 version = "0.1.0"
 description = "EvalKit Python SDK — LLM observability and tracing"
 readme = "README.md"
