@@ -24,7 +24,7 @@ jobs:
   publish:
     name: Build & publish to PyPI
     runs-on: ubuntu-latest
-    environment: pypi          # optional: lets you add approval gates in repo settings
+    environment: prod          # must match the GitHub environment that holds your PyPI secret
     steps:
       - uses: actions/checkout@v4
 
