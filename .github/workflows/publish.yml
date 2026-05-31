@@ -1,0 +1,48 @@
+name: Publish Python SDK
+
+# Publishes the EvalKit Python SDK to PyPI.
+#
+# Triggers:
+#   - Manually from the Actions tab ("Run workflow").
+#   - Automatically when a tag like v0.1.0 is pushed.
+#
+# NOTE: This file assumes sdk-py is its OWN repository (pyproject.toml at the
+# repo root). If you instead drop this into the monorepo at
+# .github/workflows/, add `working-directory: apps/sdk-py` to the build/check/
+# publish steps.
+
+on:
+  workflow_dispatch: {}
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Build & publish to PyPI
+    runs-on: ubuntu-latest
+    environment: pypi          # optional: lets you add approval gates in repo settings
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build tools
+        run: pip install --upgrade build twine
+
+      - name: Build wheel + sdist
+        run: python -m build
+
+      - name: Validate metadata
+        run: twine check dist/*
+
+      - name: Publish to PyPI
+        run: twine upload --non-interactive dist/*
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
