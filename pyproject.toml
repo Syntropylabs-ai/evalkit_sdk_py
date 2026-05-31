@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "evalkit"
+version = "0.1.0"
+description = "EvalKit Python SDK — LLM observability and tracing"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "LicenseRef-Proprietary"
+license-files = ["LICENSE"]
+authors = [{ name = "Syntropy Labs" }]
+keywords = ["llm", "observability", "tracing", "evaluation", "openai", "anthropic", "ai", "agents"]
+dependencies = []
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: Other/Proprietary License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://syntropylabs.ai"
+Documentation = "https://syntropylabs.ai/docs"
+
+[project.optional-dependencies]
+openai = ["openai>=1.0.0"]
+anthropic = ["anthropic>=0.20.0"]
+all = ["openai>=1.0.0", "anthropic>=0.20.0"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["evalkit"]
+
+[tool.hatch.build.targets.sdist]
+only-include = ["evalkit"]
+include = ["/README.md", "/LICENSE"]
+exclude = ["examples", ".claude", ".gitignore"]
