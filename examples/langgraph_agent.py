@@ -1,9 +1,10 @@
 """
 EvalKit + LangGraph demo
 
-Just call evalkit.init() — auto-instruments all OpenAI calls made by LangGraph
-(LangChain's ChatOpenAI uses openai under the hood, which is class-level patched).
-Every node execution is wrapped in a named span for richer traces.
+Just call evalkit.init() — it registers a global LangChain callback handler, so every
+LangGraph node/chain, LLM/chat-model call, tool, and retriever run is traced automatically
+as a nested span tree (no callbacks=[...] needed). The optional start_trace / trace_function
+calls below add your own custom spans on top.
 
 Install:
     pip install langgraph langchain-openai openai python-dotenv

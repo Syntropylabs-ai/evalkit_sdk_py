@@ -16,6 +16,9 @@ _SENSITIVE_META = {
 }
 
 
+_SENSITIVE_RESP = {"set-cookie", "authorization", "x-api-key", "x-subscription-key"}
+
+
 def _sanitize_meta(meta: dict) -> dict:
     out = {}
     for k, v in meta.items():
@@ -25,6 +28,18 @@ def _sanitize_meta(meta: dict) -> dict:
             continue
         header_name = k[5:].replace("_", "-").lower()
         out[header_name] = str(v)
+    return out
+
+
+def _sanitize_response_headers(response: Any) -> dict:
+    out = {}
+    try:
+        for k, v in response.items():  # HttpResponse supports .items()
+            if str(k).lower() in _SENSITIVE_RESP:
+                continue
+            out[str(k)] = str(v)
+    except Exception:
+        pass
     return out
 
 
@@ -40,54 +55,84 @@ class EvalKitDjangoMiddleware:
         return self._client
 
     def __call__(self, request: Any) -> Any:
-        client = self._get_client()
+        # Tracing setup must never break the request — fall back to untraced.
+        try:
+            client = self._get_client()
 
-        method = request.method or "GET"
-        path = request.path or "/"
-        url = request.build_absolute_uri()
+            method = request.method or "GET"
+            path = request.path or "/"
+            url = request.build_absolute_uri()
 
-        safe_headers = _sanitize_meta(request.META)
+            safe_headers = _sanitize_meta(request.META)
 
-        upstream_trace_id, upstream_span_id = None, None
-        tp = request.META.get("HTTP_TRACEPARENT", "")
-        if tp:
-            upstream_trace_id, upstream_span_id = parse_traceparent(tp)
+            upstream_trace_id, upstream_span_id = None, None
+            tp = request.META.get("HTTP_TRACEPARENT", "")
+            if tp:
+                upstream_trace_id, upstream_span_id = parse_traceparent(tp)
 
-        body_json: Any = None
-        if method in ("POST", "PUT", "PATCH"):
-            try:
-                body_json = json.loads(request.body[:_BODY_MAX])
-            except Exception:
+            body_json: Any = None
+            if method in ("POST", "PUT", "PATCH"):
                 try:
-                    body_text = request.body[:_BODY_MAX].decode("utf-8", errors="replace")
-                    body_json = body_text or None
+                    body_json = json.loads(request.body[:_BODY_MAX])
                 except Exception:
-                    pass
+                    try:
+                        body_text = request.body[:_BODY_MAX].decode("utf-8", errors="replace")
+                        body_json = body_text or None
+                    except Exception:
+                        pass
 
-        trace_id, end, ctx = client.start_http_trace(
-            f"{method} {path}",
-            method=method,
-            url=url,
-            headers=safe_headers,
-            request_body=body_json,
-            upstream_trace_id=upstream_trace_id,
-            upstream_span_id=upstream_span_id,
-        )
-        token = _current_span.set(ctx)
-        request._evalkit_trace_id = trace_id
+            trace_id, end, ctx = client.start_http_trace(
+                f"{method} {path}",
+                method=method,
+                url=url,
+                headers=safe_headers,
+                request_body=body_json,
+                upstream_trace_id=upstream_trace_id,
+                upstream_span_id=upstream_span_id,
+            )
+            token = _current_span.set(ctx)
+            request._evalkit_trace_id = trace_id
+        except Exception:
+            return self.get_response(request)
 
         try:
             response = self.get_response(request)
             sc = response.status_code
-            end("ERROR" if sc >= 400 else "OK", status_code=sc)
-            response["X-Trace-Id"] = trace_id
-            response["traceparent"] = f"00-{trace_id}-{ctx.span_id}-01"
+            resp_headers = None
+            resp_body: Any = None
+            try:
+                resp_headers = _sanitize_response_headers(response) or None
+            except Exception:
+                pass
+            try:
+                if not getattr(response, "streaming", False):
+                    content = getattr(response, "content", b"") or b""
+                    if content:
+                        resp_body = content[:_BODY_MAX].decode("utf-8", errors="replace") or None
+            except Exception:
+                pass
+            try:
+                end("ERROR" if sc >= 400 else "OK", status_code=sc,
+                    response_body=resp_body, response_headers=resp_headers)
+            except Exception:
+                pass
+            try:
+                response["X-Trace-Id"] = trace_id
+                response["traceparent"] = f"00-{trace_id}-{ctx.span_id}-01"
+            except Exception:
+                pass
             return response
         except Exception:
-            end("ERROR")
+            try:
+                end("ERROR", status_code=500)
+            except Exception:
+                pass
             raise
         finally:
-            _current_span.reset(token)
+            try:
+                _current_span.reset(token)
+            except Exception:
+                pass
 
     def process_exception(self, request: Any, exception: Exception) -> None:
         pass

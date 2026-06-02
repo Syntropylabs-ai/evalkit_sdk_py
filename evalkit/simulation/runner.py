@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+import contextvars
 import inspect
 import logging
 import secrets
+import threading
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, Iterable, List, Optional, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 from ..core.context import SimulationContext, _current_simulation
 from ..evaluate import evaluate
@@ -24,18 +27,37 @@ def with_simulation(sim: SimulationContext):
         _current_simulation.reset(token)
 
 
-def _resolve(value: Any) -> Any:
-    if inspect.isawaitable(value):
-        import asyncio
+def _run_coro_blocking(coro: Any) -> Any:
+    """Run a coroutine to completion from sync code, even if an event loop is
+    already running in this thread (in which case we run it on a private loop in
+    a worker thread so we never collide with the caller's loop)."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
 
+    # A loop is already running in this thread — run on a dedicated thread.
+    result: Dict[str, Any] = {}
+
+    def _worker() -> None:
         try:
-            return asyncio.run(value)
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            try:
-                return loop.run_until_complete(value)
-            finally:
-                loop.close()
+            result["value"] = asyncio.run(coro)
+        except Exception as exc:  # surface to caller
+            result["error"] = exc
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join()
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
+
+
+def _resolve(value: Any) -> Any:
+    """Resolve an entrypoint return value for the synchronous driver: await it
+    if it is a coroutine/awaitable, otherwise return as-is."""
+    if inspect.isawaitable(value):
+        return _run_coro_blocking(value)
     return value
 
 
@@ -55,15 +77,29 @@ def _user_turns(scenario: Dict[str, Any]) -> List[str]:
 
 
 def _tools_from_collector(sim: SimulationContext) -> List[Dict[str, Any]]:
-    tools: List[Dict[str, Any]] = []
+    """Reconstruct the agent's actual tool calls from spans captured during the
+    scenario. Handles both explicit ``tool_call`` spans and the ``gen_ai.tool.call``
+    events that the LLM patchers (OpenAI / Anthropic / Google / ADK) attach to the
+    ``llm_call`` span — so deterministic tool metrics work without the user having
+    to return an AgentTurnResult."""
+    span_tools: List[Dict[str, Any]] = []
+    event_tools: List[Dict[str, Any]] = []
     for env in sim.collector:
-        if getattr(env, "span_type", None) != "tool_call":
-            continue
+        span_type = getattr(env, "span_type", None)
         attrs = env.attributes or {}
-        name = attrs.get("tool.name") or env.operation
-        if name:
-            tools.append({"name": name, "args": attrs.get("tool.arguments")})
-    return tools
+        if span_type == "tool_call":
+            name = attrs.get("tool.name") or attrs.get("gen_ai.tool.name") or env.operation
+            if name:
+                span_tools.append({"name": name, "args": attrs.get("tool.arguments")})
+        elif span_type == "llm_call":
+            for ev in (getattr(env, "events", None) or []):
+                ev_attrs = getattr(ev, "attributes", None) or {}
+                name = ev_attrs.get("gen_ai.tool.name")
+                if name:
+                    event_tools.append({"name": name, "args": ev_attrs.get("gen_ai.tool.call.arguments")})
+    # Prefer first-class tool_call spans; fall back to the LLM span's tool events
+    # (avoids double-counting now that enqueue promotes events → tool_call spans).
+    return span_tools or event_tools
 
 
 def _score(
@@ -90,7 +126,7 @@ def _score(
         return {}
 
 
-def _run_scenario(client: Any, entrypoint: Entrypoint, scenario: Dict[str, Any], **cfg: Any) -> Dict[str, Any]:
+def _begin_scenario(client: Any, scenario: Dict[str, Any], cfg: Dict[str, Any]):
     name = scenario.get("name", "scenario")
     scenario_id = scenario.get("scenario_id") or ("scn_" + secrets.token_hex(6))
     persona_id, _ = resolve_persona(scenario.get("persona"))
@@ -106,9 +142,40 @@ def _run_scenario(client: Any, entrypoint: Entrypoint, scenario: Dict[str, Any],
         persona=persona_id,
         tags=cfg["tags"],
     )
-
     turn_messages = _user_turns(scenario)[: cfg["max_turns"]]
     trace_id, end_trace, _root = client.start_trace(f"scenario:{name}", session_id=ctx.session_id)
+    return name, scenario_id, ctx, sim, turn_messages, end_trace
+
+
+def _finish_scenario(
+    scenario: Dict[str, Any],
+    scenario_id: str,
+    name: str,
+    sim: SimulationContext,
+    texts: List[str],
+    explicit_tools: List[Dict[str, Any]],
+    metrics: Optional[List[str]],
+) -> Tuple[Dict[str, float], List[Dict[str, Any]]]:
+    actual_tools = explicit_tools or _tools_from_collector(sim)
+    scores = _score(scenario, "\n".join(texts), actual_tools, metrics)
+    return scores, actual_tools
+
+
+def _result(scenario_id: str, name: str, status: str, turns: int, scores: Dict[str, float], error: Optional[str]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "scenario_id": scenario_id,
+        "name": name,
+        "status": status,
+        "turns": turns,
+        "scores": scores,
+    }
+    if error:
+        out["error"] = error
+    return out
+
+
+def _run_scenario(client: Any, entrypoint: Entrypoint, scenario: Dict[str, Any], **cfg: Any) -> Dict[str, Any]:
+    name, scenario_id, ctx, sim, turn_messages, end_trace = _begin_scenario(client, scenario, cfg)
 
     status, error, turns = "OK", None, 0
     texts: List[str] = []
@@ -129,24 +196,48 @@ def _run_scenario(client: Any, entrypoint: Entrypoint, scenario: Dict[str, Any],
                     texts.append(str(result))
                 turns += 1
 
-            actual_tools = explicit_tools or _tools_from_collector(sim)
-            scores = _score(scenario, "\n".join(texts), actual_tools, cfg["metrics"])
+            scores, _ = _finish_scenario(scenario, scenario_id, name, sim, texts, explicit_tools, cfg["metrics"])
         except Exception as exc:
             status, error = "ERROR", str(exc)
             _log.warning("[evalkit] scenario '%s' failed: %s", name, exc)
         finally:
             end_trace(status)
 
-    out: Dict[str, Any] = {
-        "scenario_id": scenario_id,
-        "name": name,
-        "status": status,
-        "turns": turns,
-        "scores": scores,
-    }
-    if error:
-        out["error"] = error
-    return out
+    return _result(scenario_id, name, status, turns, scores, error)
+
+
+async def _run_scenario_async(client: Any, entrypoint: Entrypoint, scenario: Dict[str, Any], **cfg: Any) -> Dict[str, Any]:
+    name, scenario_id, ctx, sim, turn_messages, end_trace = _begin_scenario(client, scenario, cfg)
+
+    status, error, turns = "OK", None, 0
+    texts: List[str] = []
+    explicit_tools: List[Dict[str, Any]] = []
+    scores: Dict[str, float] = {}
+
+    with with_simulation(sim):
+        try:
+            for i, msg in enumerate(turn_messages):
+                sim.turn = i + 1
+                ctx.turn = i + 1
+                ctx.message = msg
+                result = entrypoint(ctx)
+                if inspect.isawaitable(result):
+                    result = await result
+                if isinstance(result, AgentTurnResult):
+                    texts.append(result.text)
+                    explicit_tools.extend(result.tool_calls or [])
+                else:
+                    texts.append(str(result))
+                turns += 1
+
+            scores, _ = _finish_scenario(scenario, scenario_id, name, sim, texts, explicit_tools, cfg["metrics"])
+        except Exception as exc:
+            status, error = "ERROR", str(exc)
+            _log.warning("[evalkit] scenario '%s' failed: %s", name, exc)
+        finally:
+            end_trace(status)
+
+    return _result(scenario_id, name, status, turns, scores, error)
 
 
 def simulate_user(
@@ -172,5 +263,31 @@ def simulate_user(
         "tags": tags,
         "safe_mode": safe_mode,
     }
-    results = [_run_scenario(client, entrypoint, sc, **cfg) for sc in scenarios]
+    scenario_list = list(scenarios)
+
+    if inspect.iscoroutinefunction(entrypoint):
+        # Drive every scenario inside ONE event loop so async agents (e.g. ADK)
+        # keep their loop/clients across scenarios. Each scenario runs in its own
+        # task so its trace/ambient/simulation context is isolated — every scenario
+        # becomes a distinct trace instead of all sharing one id.
+        async def _run_all() -> List[Dict[str, Any]]:
+            out: List[Dict[str, Any]] = []
+            for sc in scenario_list:
+                out.append(await asyncio.ensure_future(_run_scenario_async(client, entrypoint, sc, **cfg)))
+            return out
+
+        results = _run_coro_blocking(_run_all())
+    else:
+        # Run each scenario in an isolated copy of the context so the ambient trace
+        # id pinned by one scenario's start_trace doesn't leak into the next.
+        results = [
+            contextvars.copy_context().run(_run_scenario, client, entrypoint, sc, **cfg)
+            for sc in scenario_list
+        ]
+
+    try:
+        client.flush()
+    except Exception:
+        pass
+
     return {"simulation_id": cfg["simulation_id"], "run_id": cfg["run_id"], "results": results}

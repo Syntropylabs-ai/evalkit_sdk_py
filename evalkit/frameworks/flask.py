@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from .._version import SDK_VERSION
 from ..core.client import EvalKitClient
 from ..core.context import _current_span
 from ..utils.headers import parse_traceparent, sanitize_headers
+
+_BODY_MAX = 4096
 
 
 def instrument_flask(app: Any, client: EvalKitClient) -> None:
@@ -37,9 +38,10 @@ def instrument_flask(app: Any, client: EvalKitClient) -> None:
             g._ek_end = end
             g._ek_ctx = ctx
             g._ek_trace_id = trace_id
+            g._ek_ended = False
             g._ek_token = _current_span.set(ctx)
         except Exception:
-            pass
+            pass  # tracing setup must never break the request
 
     @app.after_request
     def _evalkit_after(response: Any) -> Any:
@@ -47,11 +49,28 @@ def instrument_flask(app: Any, client: EvalKitClient) -> None:
             end = getattr(g, "_ek_end", None)
             trace_id = getattr(g, "_ek_trace_id", None)
             ctx = getattr(g, "_ek_ctx", None)
-            if end:
+            if end and not getattr(g, "_ek_ended", False):
+                # Capture response headers + body (bounded) for parity with the ASGI middleware.
+                resp_headers = None
+                resp_body: Any = None
+                try:
+                    resp_headers = sanitize_headers(dict(response.headers)) or None
+                except Exception:
+                    pass
+                try:
+                    if not getattr(response, "direct_passthrough", False):
+                        text = response.get_data(as_text=True)
+                        if text:
+                            resp_body = text[:_BODY_MAX]
+                except Exception:
+                    pass
                 end(
                     "ERROR" if response.status_code >= 400 else "OK",
                     status_code=response.status_code,
+                    response_body=resp_body,
+                    response_headers=resp_headers,
                 )
+                g._ek_ended = True
             if trace_id:
                 response.headers["X-Trace-Id"] = trace_id
             if ctx:
@@ -63,8 +82,21 @@ def instrument_flask(app: Any, client: EvalKitClient) -> None:
     @app.teardown_request
     def _evalkit_teardown(exc: Any) -> None:
         try:
-            token = getattr(g, "_ek_token", None)
-            if token is not None:
-                _current_span.reset(token)
+            # On an UNHANDLED exception Flask skips after_request, so close the span
+            # here as an error — otherwise the request span would be silently dropped.
+            end = getattr(g, "_ek_end", None)
+            if end and not getattr(g, "_ek_ended", False):
+                try:
+                    end("ERROR", status_code=500)
+                except Exception:
+                    pass
+                g._ek_ended = True
         except Exception:
             pass
+        finally:
+            try:
+                token = getattr(g, "_ek_token", None)
+                if token is not None:
+                    _current_span.reset(token)
+            except Exception:
+                pass

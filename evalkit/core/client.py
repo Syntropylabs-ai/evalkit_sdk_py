@@ -94,12 +94,56 @@ class EvalKitClient:
         if envelope.span_type in ("tool_call", "llm_call"):
             sim.collector.append(envelope)
 
+    def _maybe_emit_tool_spans(self, envelope: TraceEnvelope) -> None:
+        """Promote each tool call an LLM requested (carried as a gen_ai.tool.call
+        event on the llm_call span) into a first-class child tool_call span, so
+        tool calls show as their own rows in the trace waterfall across EVERY
+        provider (OpenAI/Anthropic/Google/ADK/Cohere/Bedrock/Mistral/LiteLLM)."""
+        if envelope.span_type != "llm_call" or not envelope.events:
+            return
+        ts = envelope.end_time or envelope.created_at
+        for ev in envelope.events:
+            attrs = getattr(ev, "attributes", None) or {}
+            name = attrs.get("gen_ai.tool.name")
+            if not name:
+                continue
+            tool_attrs = {
+                "tool.name": name,
+                "tool.arguments": attrs.get("gen_ai.tool.call.arguments"),
+                "gen_ai.tool.name": name,
+                "gen_ai.tool.call.id": attrs.get("gen_ai.tool.call.id"),
+            }
+            tool_attrs = {k: v for k, v in tool_attrs.items() if v is not None}
+            self.enqueue(TraceEnvelope(
+                trace_id=envelope.trace_id,
+                span_id=_new_span_id(),
+                parent_span_id=envelope.span_id,
+                span_type="tool_call",
+                status="OK",
+                operation=str(name),
+                service_name=envelope.service_name,
+                attributes=tool_attrs,
+                latency_ms=0,
+                start_time=ts,
+                end_time=ts,
+                created_at=envelope.created_at,
+                environment=envelope.environment,
+                app_version=envelope.app_version,
+                session_id=envelope.session_id,
+                device_id=envelope.device_id,
+                sdk_version=envelope.sdk_version,
+            ))
+
     def enqueue(self, envelope: TraceEnvelope) -> None:
         # Never blocks and never raises into the caller's code path. Export happens
         # only on the daemon flush thread; here we just buffer and (when a batch is
         # ready) signal that thread to drain promptly.
         try:
             self._apply_simulation(envelope)
+            try:
+                self._maybe_emit_tool_spans(envelope)
+            except Exception:
+                pass
             full = False
             with self._lock:
                 if len(self._queue) >= self._opts.max_queue_size:

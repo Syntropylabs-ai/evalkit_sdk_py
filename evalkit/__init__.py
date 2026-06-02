@@ -20,6 +20,8 @@ from .instrumentation.llm.cohere import patch_cohere
 from .instrumentation.llm.google_ai import patch_google_ai
 from .instrumentation.llm.google_genai import patch_google_genai as _patch_google_genai
 from .instrumentation.llm.mistral import patch_mistral, patch_async_mistral
+from .instrumentation.llm.langchain import patch_langchain as _patch_langchain
+from .instrumentation.llm.litellm import patch_litellm as _patch_litellm
 
 from .instrumentation.http.requests import patch_requests
 from .instrumentation.http.httpx import patch_httpx
@@ -61,6 +63,8 @@ __all__ = [
     "patch_cohere_client",
     "patch_google_ai_model",
     "patch_google_genai",
+    "patch_langchain",
+    "patch_litellm",
     "patch_mistral_client",
     "patch_async_openai_client",
     "patch_async_anthropic_client",
@@ -190,6 +194,17 @@ def patch_google_ai_model(model: Any) -> None:
 
 def patch_google_genai() -> None:
     _patch_google_genai(_get_instance())
+
+
+def patch_langchain() -> Any:
+    """Register the global LangChain/LangGraph callback handler. Called by
+    init() automatically; returns the handler (also usable as callbacks=[h])."""
+    return _patch_langchain(_get_instance())
+
+
+def patch_litellm() -> None:
+    """Instrument litellm.completion/acompletion. Called by init() automatically."""
+    _patch_litellm(_get_instance())
 
 
 def patch_mistral_client(

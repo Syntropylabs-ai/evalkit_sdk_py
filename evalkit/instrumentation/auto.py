@@ -29,7 +29,7 @@ def _try_patch_openai(ek: "EvalKitClient") -> None:
         pass
 
 
-def _patch_openai_class_sync(ek: "EvalKitClient", cls) -> None:
+def _patch_openai_class_sync(ek: "EvalKitClient", cls, provider: str = "openai") -> None:
     if getattr(cls.create, "_evalkit", False):
         return
     import time
@@ -59,7 +59,7 @@ def _patch_openai_class_sync(ek: "EvalKitClient", cls) -> None:
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                     span_type="llm_call", status="OK",
                     operation="chat.completions.create",
-                    service_name=ek._opts.service_name, provider="openai", model=model,
+                    service_name=ek._opts.service_name, provider=provider, model=model,
                     prompt=prompt, completion=completion,
                     tokens_in=tokens_in, tokens_out=tokens_out,
                     latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
@@ -79,7 +79,7 @@ def _patch_openai_class_sync(ek: "EvalKitClient", cls) -> None:
                 trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                 span_type="llm_call", status="ERROR", status_message=str(exc),
                 operation="chat.completions.create",
-                service_name=ek._opts.service_name, provider="openai", model=model,
+                service_name=ek._opts.service_name, provider=provider, model=model,
                 prompt=prompt, latency_ms=int(time.time() * 1000 - start_ms),
                 start_time=ts, end_time=_now_iso(), created_at=ts,
                 attributes={**ek._meta_attrs(), "gen_ai.request.model": model},
@@ -109,7 +109,7 @@ def _patch_openai_class_sync(ek: "EvalKitClient", cls) -> None:
             trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
             span_type="llm_call", status="OK",
             operation="chat.completions.create",
-            service_name=ek._opts.service_name, provider="openai", model=model,
+            service_name=ek._opts.service_name, provider=provider, model=model,
             prompt=prompt, completion=completion,
             tokens_in=tokens_in, tokens_out=tokens_out,
             latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
@@ -126,7 +126,7 @@ def _patch_openai_class_sync(ek: "EvalKitClient", cls) -> None:
     cls.create = traced
 
 
-def _patch_openai_class_async(ek: "EvalKitClient", cls) -> None:
+def _patch_openai_class_async(ek: "EvalKitClient", cls, provider: str = "openai") -> None:
     if getattr(cls.create, "_evalkit", False):
         return
     import time
@@ -156,7 +156,7 @@ def _patch_openai_class_async(ek: "EvalKitClient", cls) -> None:
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                     span_type="llm_call", status="OK",
                     operation="chat.completions.create",
-                    service_name=ek._opts.service_name, provider="openai", model=model,
+                    service_name=ek._opts.service_name, provider=provider, model=model,
                     prompt=prompt, completion=completion,
                     tokens_in=tokens_in, tokens_out=tokens_out,
                     latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
@@ -177,7 +177,7 @@ def _patch_openai_class_async(ek: "EvalKitClient", cls) -> None:
                 trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                 span_type="llm_call", status="ERROR", status_message=str(exc),
                 operation="chat.completions.create",
-                service_name=ek._opts.service_name, provider="openai", model=model,
+                service_name=ek._opts.service_name, provider=provider, model=model,
                 prompt=prompt, latency_ms=int(time.time() * 1000 - start_ms),
                 start_time=ts, end_time=end_ts, created_at=ts,
                 attributes={**ek._meta_attrs(), "gen_ai.request.model": model},
@@ -207,7 +207,7 @@ def _patch_openai_class_async(ek: "EvalKitClient", cls) -> None:
             trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
             span_type="llm_call", status="OK",
             operation="chat.completions.create",
-            service_name=ek._opts.service_name, provider="openai", model=model,
+            service_name=ek._opts.service_name, provider=provider, model=model,
             prompt=prompt, completion=completion,
             tokens_in=tokens_in, tokens_out=tokens_out,
             latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
@@ -618,6 +618,37 @@ def _patch_cohere_class(ek: "EvalKitClient", cls) -> None:
     cls.chat = traced
 
 
+# ── Groq (OpenAI-compatible SDK) ──────────────────────────────────────────────
+
+def _try_patch_groq(ek: "EvalKitClient") -> None:
+    try:
+        import groq.resources.chat.completions as _gc
+    except ImportError:
+        return
+    try:
+        _patch_openai_class_sync(ek, _gc.Completions, provider="groq")
+    except Exception:
+        pass
+    try:
+        _patch_openai_class_async(ek, _gc.AsyncCompletions, provider="groq")
+    except Exception:
+        pass
+
+
+# ── LiteLLM (aggregator) ──────────────────────────────────────────────────────
+
+def _try_patch_litellm(ek: "EvalKitClient") -> None:
+    try:
+        import litellm  # noqa: F401
+    except ImportError:
+        return
+    try:
+        from .llm.litellm import patch_litellm
+        patch_litellm(ek)
+    except Exception:
+        pass
+
+
 # ── AWS Bedrock ───────────────────────────────────────────────────────────────
 
 def _try_patch_bedrock(ek: "EvalKitClient") -> None:
@@ -806,6 +837,38 @@ def _patch_mistral_class_async(ek: "EvalKitClient", cls) -> None:
     pass  # async Mistral patched via instance patcher (patch_async_mistral_client)
 
 
+# ── Database drivers (raw drivers + NoSQL; SQLAlchemy is patched per-engine) ──
+
+def _try_patch_databases(ek: "EvalKitClient") -> None:
+    for mod_name, fn_name in (
+        ("redis", "patch_redis"),
+        ("pymongo", "patch_pymongo"),
+        ("asyncpg", "patch_asyncpg"),
+        ("psycopg", "patch_psycopg"),
+        ("pymysql", "patch_pymysql"),
+    ):
+        try:
+            import importlib
+            mod = importlib.import_module(f".db.{mod_name}", __package__)
+            getattr(mod, fn_name)(ek)
+        except Exception:
+            pass
+
+
+# ── LangChain / LangGraph ─────────────────────────────────────────────────────
+
+def _try_patch_langchain(ek: "EvalKitClient") -> None:
+    try:
+        import langchain_core  # noqa: F401
+    except ImportError:
+        return
+    try:
+        from .llm.langchain import patch_langchain
+        patch_langchain(ek)
+    except Exception:
+        pass
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def setup_auto_instrumentation(
@@ -846,3 +909,7 @@ def setup_auto_instrumentation(
     _try_patch_cohere(client)
     _try_patch_bedrock(client)
     _try_patch_mistral(client)
+    _try_patch_groq(client)
+    _try_patch_litellm(client)
+    _try_patch_langchain(client)
+    _try_patch_databases(client)
