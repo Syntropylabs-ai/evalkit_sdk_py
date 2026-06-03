@@ -91,35 +91,43 @@ def _patch_openai_class_sync(ek: "EvalKitClient", cls, provider: str = "openai")
             _current_span.reset(token)
         end_ts = _now_iso()
         latency = int(time.time() * 1000 - start_ms)
-        choice = result.choices[0] if result.choices else None
-        completion = (choice.message.content or "") if choice else ""
-        usage = getattr(result, "usage", None)
-        tokens_in = getattr(usage, "prompt_tokens", 0) or 0
-        tokens_out = getattr(usage, "completion_tokens", 0) or 0
-        events = []
-        if choice and getattr(choice.message, "tool_calls", None):
-            for tc in choice.message.tool_calls:
-                events.append(SpanEvent(
-                    name="gen_ai.tool.call", timestamp=end_ts,
-                    attributes={"gen_ai.tool.name": tc.function.name,
-                                "gen_ai.tool.call.id": getattr(tc, "id", ""),
-                                "gen_ai.tool.call.arguments": tc.function.arguments},
-                ))
-        ek.enqueue(TraceEnvelope(
-            trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-            span_type="llm_call", status="OK",
-            operation="chat.completions.create",
-            service_name=ek._opts.service_name, provider=provider, model=model,
-            prompt=prompt, completion=completion,
-            tokens_in=tokens_in, tokens_out=tokens_out,
-            latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
-            events=events or None,
-            attributes={**ek._meta_attrs(), "gen_ai.request.model": model,
-                        "gen_ai.response.model": getattr(result, "model", model),
-                        "gen_ai.usage.total_tokens": getattr(usage, "total_tokens", 0) or 0},
-            environment=ek._opts.environment, app_version=ek._opts.app_version,
-            sdk_version=SDK_VERSION,
-        ))
+        # Trace extraction must NEVER break the caller's request. Some callers
+        # (e.g. litellm via `chat.completions.with_raw_response.create`) get back a
+        # LegacyAPIResponse with no `.choices` — skip extraction instead of raising.
+        if not hasattr(result, "choices"):
+            return result
+        try:
+            choice = result.choices[0] if result.choices else None
+            completion = (choice.message.content or "") if choice else ""
+            usage = getattr(result, "usage", None)
+            tokens_in = getattr(usage, "prompt_tokens", 0) or 0
+            tokens_out = getattr(usage, "completion_tokens", 0) or 0
+            events = []
+            if choice and getattr(choice.message, "tool_calls", None):
+                for tc in choice.message.tool_calls:
+                    events.append(SpanEvent(
+                        name="gen_ai.tool.call", timestamp=end_ts,
+                        attributes={"gen_ai.tool.name": tc.function.name,
+                                    "gen_ai.tool.call.id": getattr(tc, "id", ""),
+                                    "gen_ai.tool.call.arguments": tc.function.arguments},
+                    ))
+            ek.enqueue(TraceEnvelope(
+                trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
+                span_type="llm_call", status="OK",
+                operation="chat.completions.create",
+                service_name=ek._opts.service_name, provider=provider, model=model,
+                prompt=prompt, completion=completion,
+                tokens_in=tokens_in, tokens_out=tokens_out,
+                latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
+                events=events or None,
+                attributes={**ek._meta_attrs(), "gen_ai.request.model": model,
+                            "gen_ai.response.model": getattr(result, "model", model),
+                            "gen_ai.usage.total_tokens": getattr(usage, "total_tokens", 0) or 0},
+                environment=ek._opts.environment, app_version=ek._opts.app_version,
+                sdk_version=SDK_VERSION,
+            ))
+        except Exception:
+            pass
         return result
 
     traced._evalkit = True  # type: ignore[attr-defined]
@@ -189,35 +197,43 @@ def _patch_openai_class_async(ek: "EvalKitClient", cls, provider: str = "openai"
             _current_span.reset(token)
         end_ts = _now_iso()
         latency = int(time.time() * 1000 - start_ms)
-        choice = result.choices[0] if result.choices else None
-        completion = (choice.message.content or "") if choice else ""
-        usage = getattr(result, "usage", None)
-        tokens_in = getattr(usage, "prompt_tokens", 0) or 0
-        tokens_out = getattr(usage, "completion_tokens", 0) or 0
-        events = []
-        if choice and getattr(choice.message, "tool_calls", None):
-            for tc in choice.message.tool_calls:
-                events.append(SpanEvent(
-                    name="gen_ai.tool.call", timestamp=end_ts,
-                    attributes={"gen_ai.tool.name": tc.function.name,
-                                "gen_ai.tool.call.arguments": tc.function.arguments,
-                                "gen_ai.tool.call.id": getattr(tc, "id", "")},
-                ))
-        ek.enqueue(TraceEnvelope(
-            trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-            span_type="llm_call", status="OK",
-            operation="chat.completions.create",
-            service_name=ek._opts.service_name, provider=provider, model=model,
-            prompt=prompt, completion=completion,
-            tokens_in=tokens_in, tokens_out=tokens_out,
-            latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
-            events=events or None,
-            attributes={**ek._meta_attrs(), "gen_ai.request.model": model,
-                        "gen_ai.response.model": getattr(result, "model", model),
-                        "gen_ai.usage.total_tokens": getattr(usage, "total_tokens", 0) or 0},
-            environment=ek._opts.environment, app_version=ek._opts.app_version,
-            sdk_version=SDK_VERSION,
-        ))
+        # Trace extraction must NEVER break the caller's request. Some callers
+        # (e.g. litellm via `chat.completions.with_raw_response.create`) get back a
+        # LegacyAPIResponse with no `.choices` — skip extraction instead of raising.
+        if not hasattr(result, "choices"):
+            return result
+        try:
+            choice = result.choices[0] if result.choices else None
+            completion = (choice.message.content or "") if choice else ""
+            usage = getattr(result, "usage", None)
+            tokens_in = getattr(usage, "prompt_tokens", 0) or 0
+            tokens_out = getattr(usage, "completion_tokens", 0) or 0
+            events = []
+            if choice and getattr(choice.message, "tool_calls", None):
+                for tc in choice.message.tool_calls:
+                    events.append(SpanEvent(
+                        name="gen_ai.tool.call", timestamp=end_ts,
+                        attributes={"gen_ai.tool.name": tc.function.name,
+                                    "gen_ai.tool.call.arguments": tc.function.arguments,
+                                    "gen_ai.tool.call.id": getattr(tc, "id", "")},
+                    ))
+            ek.enqueue(TraceEnvelope(
+                trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
+                span_type="llm_call", status="OK",
+                operation="chat.completions.create",
+                service_name=ek._opts.service_name, provider=provider, model=model,
+                prompt=prompt, completion=completion,
+                tokens_in=tokens_in, tokens_out=tokens_out,
+                latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
+                events=events or None,
+                attributes={**ek._meta_attrs(), "gen_ai.request.model": model,
+                            "gen_ai.response.model": getattr(result, "model", model),
+                            "gen_ai.usage.total_tokens": getattr(usage, "total_tokens", 0) or 0},
+                environment=ek._opts.environment, app_version=ek._opts.app_version,
+                sdk_version=SDK_VERSION,
+            ))
+        except Exception:
+            pass
         return result
 
     traced_async._evalkit = True  # type: ignore[attr-defined]
