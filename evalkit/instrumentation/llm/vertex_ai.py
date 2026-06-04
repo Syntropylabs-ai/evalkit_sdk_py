@@ -202,6 +202,14 @@ def patch_vertex_generative_model(
             "gen_ai.response.model": model_name,
             "gen_ai.usage.total_tokens": tokens_in + tokens_out,
         }
+        try:
+            candidates = getattr(result, "candidates", None) or []
+            if candidates:
+                finish_reason = getattr(candidates[0], "finish_reason", None)
+                if finish_reason is not None:
+                    attrs["gen_ai.response.finish_reasons"] = [str(finish_reason)]
+        except Exception:
+            pass
         if temperature is not None:
             attrs["gen_ai.request.temperature"] = temperature
         if max_tokens is not None:

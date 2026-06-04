@@ -98,11 +98,13 @@ def _extract_prompt(contents: Any, config: Any = None) -> str:
 
 
 def _extract_completion(response: Any) -> str:
-    """Pull text from a generate_content response, joining all text parts."""
-    # Iterate candidates → content → parts and concatenate every text part so
-    # multi-part responses (and tool-calling turns with interleaved text) are
-    # captured fully rather than only the first chunk.
-    collected: List[str] = []
+    """Pull text from a generate_content response, joining all text parts.
+
+    When the model returns only function calls (no text), we return a compact
+    JSON summary of the calls so the span is never silently empty.
+    """
+    text_parts: List[str] = []
+    fn_parts: List[str] = []
     try:
         for candidate in (getattr(response, "candidates", None) or []):
             content = getattr(candidate, "content", None)
@@ -111,12 +113,24 @@ def _extract_completion(response: Any) -> str:
             for part in getattr(content, "parts", []) or []:
                 t = getattr(part, "text", None)
                 if t:
-                    collected.append(str(t))
+                    text_parts.append(str(t))
+                fc = getattr(part, "function_call", None)
+                if fc is not None:
+                    name = getattr(fc, "name", "?")
+                    raw_args = getattr(fc, "args", None) or {}
+                    try:
+                        args_str = json.dumps(dict(raw_args))
+                    except Exception:
+                        args_str = str(raw_args)
+                    fn_parts.append(f"[tool_call] {name}({args_str})")
     except Exception:
         pass
-    if collected:
-        return "".join(collected)
-    # Fall back to the .text shortcut (raises if the response has no text part).
+
+    if text_parts:
+        return "".join(text_parts)
+    if fn_parts:
+        return "\n".join(fn_parts)
+    # Fall back to the .text shortcut.
     try:
         text = getattr(response, "text", None)
         if text:

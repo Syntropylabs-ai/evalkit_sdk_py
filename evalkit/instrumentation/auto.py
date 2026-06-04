@@ -338,6 +338,16 @@ def _patch_anthropic_class_sync(ek: "EvalKitClient", cls) -> None:
                                 "gen_ai.tool.call.id": getattr(block, "id", ""),
                                 "gen_ai.tool.call.arguments": _json.dumps(getattr(block, "input", {}))},
                 ))
+        stop_reason = getattr(result, "stop_reason", None)
+        attrs = {
+            **ek._meta_attrs(),
+            "gen_ai.request.model": model,
+            "gen_ai.response.model": getattr(result, "model", model),
+            "gen_ai.response.id": getattr(result, "id", ""),
+            "gen_ai.usage.total_tokens": tokens_in + tokens_out,
+        }
+        if stop_reason:
+            attrs["gen_ai.response.finish_reasons"] = [stop_reason]
         ek.enqueue(TraceEnvelope(
             trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
             span_type="llm_call", status="OK",
@@ -347,9 +357,7 @@ def _patch_anthropic_class_sync(ek: "EvalKitClient", cls) -> None:
             tokens_in=tokens_in, tokens_out=tokens_out,
             latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
             events=events or None,
-            attributes={**ek._meta_attrs(), "gen_ai.request.model": model,
-                        "gen_ai.response.model": getattr(result, "model", model),
-                        "gen_ai.usage.total_tokens": tokens_in + tokens_out},
+            attributes=attrs,
             environment=ek._opts.environment, app_version=ek._opts.app_version,
             sdk_version=SDK_VERSION,
         ))
@@ -441,6 +449,16 @@ def _patch_anthropic_class_async(ek: "EvalKitClient", cls) -> None:
                                 "gen_ai.tool.call.id": getattr(block, "id", ""),
                                 "gen_ai.tool.call.arguments": _json.dumps(getattr(block, "input", {}))},
                 ))
+        stop_reason = getattr(result, "stop_reason", None)
+        attrs = {
+            **ek._meta_attrs(),
+            "gen_ai.request.model": model,
+            "gen_ai.response.model": getattr(result, "model", model),
+            "gen_ai.response.id": getattr(result, "id", ""),
+            "gen_ai.usage.total_tokens": tokens_in + tokens_out,
+        }
+        if stop_reason:
+            attrs["gen_ai.response.finish_reasons"] = [stop_reason]
         ek.enqueue(TraceEnvelope(
             trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
             span_type="llm_call", status="OK",
@@ -450,9 +468,7 @@ def _patch_anthropic_class_async(ek: "EvalKitClient", cls) -> None:
             tokens_in=tokens_in, tokens_out=tokens_out,
             latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
             events=events or None,
-            attributes={**ek._meta_attrs(), "gen_ai.request.model": model,
-                        "gen_ai.response.model": getattr(result, "model", model),
-                        "gen_ai.usage.total_tokens": tokens_in + tokens_out},
+            attributes=attrs,
             environment=ek._opts.environment, app_version=ek._opts.app_version,
             sdk_version=SDK_VERSION,
         ))
@@ -632,6 +648,233 @@ def _patch_cohere_class(ek: "EvalKitClient", cls) -> None:
 
     traced._evalkit = True  # type: ignore[attr-defined]
     cls.chat = traced
+
+
+# ── OpenAI Responses API (used by OpenAI Agents SDK) ─────────────────────────
+
+def _try_patch_openai_responses(ek: "EvalKitClient") -> None:
+    try:
+        from openai.resources.responses.responses import Responses, AsyncResponses
+    except ImportError:
+        return
+    try:
+        _patch_openai_responses_sync(ek, Responses)
+    except Exception:
+        pass
+    try:
+        _patch_openai_responses_async(ek, AsyncResponses)
+    except Exception:
+        pass
+
+
+def _patch_openai_responses_sync(ek: "EvalKitClient", cls) -> None:
+    if getattr(cls.create, "_evalkit", False):
+        return
+    import time
+    from ..core.client import _new_span_id, _now_iso
+    from ..core.context import SpanContext, _current_span, get_or_create_ambient_trace_id
+    from ..core.types import SpanEvent, TraceEnvelope
+    from .._version import SDK_VERSION
+
+    original = cls.create
+
+    def traced(self, *args, **kwargs):
+        ctx_parent = _current_span.get()
+        trace_id = ctx_parent.trace_id if ctx_parent else get_or_create_ambient_trace_id()
+        span_id = _new_span_id()
+        parent_span_id = ctx_parent.span_id if ctx_parent else None
+        start_ms = time.time() * 1000
+        ts = _now_iso()
+        model = kwargs.get("model", "unknown")
+        raw_input = kwargs.get("input", "")
+        instructions = kwargs.get("instructions") or ""
+        if isinstance(raw_input, str):
+            input_text = raw_input
+        elif isinstance(raw_input, list):
+            parts = []
+            for item in raw_input:
+                if isinstance(item, dict):
+                    role = item.get("role", "")
+                    content = item.get("content", "")
+                    if isinstance(content, list):
+                        content = " ".join(
+                            (c.get("text", "") if isinstance(c, dict) else getattr(c, "text", ""))
+                            for c in content
+                        )
+                    parts.append(f"{role}: {content}" if role else str(content))
+                else:
+                    parts.append(str(item))
+            input_text = "\n".join(parts)
+        else:
+            input_text = str(raw_input)
+        prompt = (f"system: {instructions}\n" if instructions else "") + input_text
+
+        span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
+        token = _current_span.set(span_ctx)
+        try:
+            result = original(self, *args, **kwargs)
+        except Exception as exc:
+            end_ts = _now_iso()
+            ek.enqueue(TraceEnvelope(
+                trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
+                span_type="llm_call", status="ERROR", status_message=str(exc),
+                operation="responses.create",
+                service_name=ek._opts.service_name, provider="openai", model=model,
+                prompt=prompt[:32768], latency_ms=int(time.time() * 1000 - start_ms),
+                start_time=ts, end_time=end_ts, created_at=ts,
+                attributes={**ek._meta_attrs(), "gen_ai.request.model": model},
+                environment=ek._opts.environment, app_version=ek._opts.app_version,
+                sdk_version=SDK_VERSION,
+            ))
+            raise
+        finally:
+            _current_span.reset(token)
+        end_ts = _now_iso()
+        latency = int(time.time() * 1000 - start_ms)
+        try:
+            completion = result.output_text or ""
+            usage = getattr(result, "usage", None)
+            tokens_in = getattr(usage, "input_tokens", 0) or 0
+            tokens_out = getattr(usage, "output_tokens", 0) or 0
+            total_tokens = getattr(usage, "total_tokens", 0) or 0
+            events = []
+            for item in getattr(result, "output", []):
+                if getattr(item, "type", None) == "function_call":
+                    events.append(SpanEvent(
+                        name="gen_ai.tool.call", timestamp=end_ts,
+                        attributes={
+                            "gen_ai.tool.call.id": getattr(item, "call_id", "") or getattr(item, "id", ""),
+                            "gen_ai.tool.name": getattr(item, "name", ""),
+                            "gen_ai.tool.call.arguments": getattr(item, "arguments", ""),
+                        },
+                    ))
+            ek.enqueue(TraceEnvelope(
+                trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
+                span_type="llm_call", status="OK",
+                operation="responses.create",
+                service_name=ek._opts.service_name, provider="openai", model=model,
+                prompt=prompt[:32768], completion=completion[:32768],
+                tokens_in=tokens_in, tokens_out=tokens_out,
+                latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
+                events=events or None,
+                attributes={**ek._meta_attrs(), "gen_ai.request.model": model,
+                            "gen_ai.response.model": getattr(result, "model", model),
+                            "gen_ai.response.id": getattr(result, "id", ""),
+                            "gen_ai.usage.total_tokens": total_tokens},
+                environment=ek._opts.environment, app_version=ek._opts.app_version,
+                sdk_version=SDK_VERSION,
+            ))
+        except Exception:
+            pass
+        return result
+
+    traced._evalkit = True  # type: ignore[attr-defined]
+    cls.create = traced
+
+
+def _patch_openai_responses_async(ek: "EvalKitClient", cls) -> None:
+    if getattr(cls.create, "_evalkit", False):
+        return
+    import time
+    from ..core.client import _new_span_id, _now_iso
+    from ..core.context import SpanContext, _current_span, get_or_create_ambient_trace_id
+    from ..core.types import SpanEvent, TraceEnvelope
+    from .._version import SDK_VERSION
+
+    original = cls.create
+
+    async def traced_async(self, *args, **kwargs):
+        ctx_parent = _current_span.get()
+        trace_id = ctx_parent.trace_id if ctx_parent else get_or_create_ambient_trace_id()
+        span_id = _new_span_id()
+        parent_span_id = ctx_parent.span_id if ctx_parent else None
+        start_ms = time.time() * 1000
+        ts = _now_iso()
+        model = kwargs.get("model", "unknown")
+        raw_input = kwargs.get("input", "")
+        instructions = kwargs.get("instructions") or ""
+        if isinstance(raw_input, str):
+            input_text = raw_input
+        elif isinstance(raw_input, list):
+            parts = []
+            for item in raw_input:
+                if isinstance(item, dict):
+                    role = item.get("role", "")
+                    content = item.get("content", "")
+                    if isinstance(content, list):
+                        content = " ".join(
+                            (c.get("text", "") if isinstance(c, dict) else getattr(c, "text", ""))
+                            for c in content
+                        )
+                    parts.append(f"{role}: {content}" if role else str(content))
+                else:
+                    parts.append(str(item))
+            input_text = "\n".join(parts)
+        else:
+            input_text = str(raw_input)
+        prompt = (f"system: {instructions}\n" if instructions else "") + input_text
+
+        span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
+        token = _current_span.set(span_ctx)
+        try:
+            result = await original(self, *args, **kwargs)
+        except Exception as exc:
+            end_ts = _now_iso()
+            ek.enqueue(TraceEnvelope(
+                trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
+                span_type="llm_call", status="ERROR", status_message=str(exc),
+                operation="responses.create",
+                service_name=ek._opts.service_name, provider="openai", model=model,
+                prompt=prompt[:32768], latency_ms=int(time.time() * 1000 - start_ms),
+                start_time=ts, end_time=end_ts, created_at=ts,
+                attributes={**ek._meta_attrs(), "gen_ai.request.model": model},
+                environment=ek._opts.environment, app_version=ek._opts.app_version,
+                sdk_version=SDK_VERSION,
+            ))
+            raise
+        finally:
+            _current_span.reset(token)
+        end_ts = _now_iso()
+        latency = int(time.time() * 1000 - start_ms)
+        try:
+            completion = result.output_text or ""
+            usage = getattr(result, "usage", None)
+            tokens_in = getattr(usage, "input_tokens", 0) or 0
+            tokens_out = getattr(usage, "output_tokens", 0) or 0
+            total_tokens = getattr(usage, "total_tokens", 0) or 0
+            events = []
+            for item in getattr(result, "output", []):
+                if getattr(item, "type", None) == "function_call":
+                    events.append(SpanEvent(
+                        name="gen_ai.tool.call", timestamp=end_ts,
+                        attributes={
+                            "gen_ai.tool.call.id": getattr(item, "call_id", "") or getattr(item, "id", ""),
+                            "gen_ai.tool.name": getattr(item, "name", ""),
+                            "gen_ai.tool.call.arguments": getattr(item, "arguments", ""),
+                        },
+                    ))
+            ek.enqueue(TraceEnvelope(
+                trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
+                span_type="llm_call", status="OK",
+                operation="responses.create",
+                service_name=ek._opts.service_name, provider="openai", model=model,
+                prompt=prompt[:32768], completion=completion[:32768],
+                tokens_in=tokens_in, tokens_out=tokens_out,
+                latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
+                events=events or None,
+                attributes={**ek._meta_attrs(), "gen_ai.request.model": model,
+                            "gen_ai.response.model": getattr(result, "model", model),
+                            "gen_ai.response.id": getattr(result, "id", ""),
+                            "gen_ai.usage.total_tokens": total_tokens},
+                environment=ek._opts.environment, app_version=ek._opts.app_version,
+                sdk_version=SDK_VERSION,
+            ))
+        except Exception:
+            pass
+        return result
+
+    traced_async._evalkit = True  # type: ignore[attr-defined]
+    cls.create = traced_async
 
 
 # ── Groq (OpenAI-compatible SDK) ──────────────────────────────────────────────
@@ -919,6 +1162,7 @@ def setup_auto_instrumentation(
             pass
 
     _try_patch_openai(client)
+    _try_patch_openai_responses(client)
     _try_patch_anthropic(client)
     _try_patch_google_genai(client)
     _try_patch_google_ai(client)

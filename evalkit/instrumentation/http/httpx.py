@@ -29,13 +29,16 @@ def _req_body(request: Any) -> Optional[str]:
 
 
 def _resp_body(resp: Any) -> Optional[str]:
-    # Only read the body if httpx already buffered it (non-streaming responses).
-    # Touching .content on a streaming response would consume the caller's stream.
+    # Only read the body if httpx has already buffered it (non-streaming response).
+    # For a live stream is_stream_consumed=False — touching .content would consume
+    # the caller's stream, so we skip it and return None instead.
     try:
-        if getattr(resp, "is_stream_consumed", True) or getattr(resp, "is_closed", False):
-            raw = resp.content
-            if raw:
-                return raw[:_BODY_MAX].decode("utf-8", errors="replace")
+        is_streaming = getattr(resp, "is_stream_consumed", None) is False
+        if is_streaming:
+            return None
+        raw = resp.content
+        if raw:
+            return raw[:_BODY_MAX].decode("utf-8", errors="replace")
     except Exception:
         pass
     return None
