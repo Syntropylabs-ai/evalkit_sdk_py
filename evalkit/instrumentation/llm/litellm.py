@@ -14,7 +14,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from ..._version import SDK_VERSION
-from ...core.client import _new_span_id, _now_iso
+from ...core.client import _exc_attrs, _new_span_id, _now_iso
 from ...core.context import (
     SpanContext,
     _ambient_trace_id,
@@ -129,7 +129,7 @@ def _patch_sync(ek: "EvalKitClient", litellm: Any) -> None:
                 span_type="llm_call", status="ERROR", status_message=str(exc), operation="litellm.completion",
                 service_name=ek._opts.service_name, provider="litellm", model=model, prompt=prompt,
                 latency_ms=int(time.time() * 1000 - start_ms), start_time=ts, end_time=_now_iso(), created_at=ts,
-                attributes={**ek._meta_attrs(), "gen_ai.request.model": model},
+                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_exc_attrs(exc)},
                 environment=ek._opts.environment, app_version=ek._opts.app_version, sdk_version=SDK_VERSION,
             ))
             raise
@@ -196,7 +196,7 @@ def _patch_async(ek: "EvalKitClient", litellm: Any) -> None:
                 span_type="llm_call", status="ERROR", status_message=str(exc), operation="litellm.acompletion",
                 service_name=ek._opts.service_name, provider="litellm", model=model, prompt=prompt,
                 latency_ms=int(time.time() * 1000 - start_ms), start_time=ts, end_time=_now_iso(), created_at=ts,
-                attributes={**ek._meta_attrs(), "gen_ai.request.model": model},
+                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_exc_attrs(exc)},
                 environment=ek._opts.environment, app_version=ek._opts.app_version, sdk_version=SDK_VERSION,
             ))
             raise

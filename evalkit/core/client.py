@@ -49,6 +49,20 @@ def _new_span_id() -> str:
     return secrets.token_hex(8)
 
 
+def _exc_attrs(exc: BaseException) -> Dict[str, Any]:
+    """Return standard APM exception attributes including full stack trace.
+
+    Stored as ``exception.*`` keys (OpenTelemetry semantic convention) so the
+    dashboard can display file + line info for any error span.
+    """
+    import traceback as _tb
+    return {
+        "exception.type": type(exc).__qualname__,
+        "exception.message": str(exc),
+        "exception.stacktrace": _tb.format_exc(),
+    }
+
+
 class EvalKitClient:
     def __init__(self, opts: EvalKitOptions) -> None:
         self._opts = opts
@@ -391,7 +405,7 @@ class EvalKitClient:
                         end("OK")
                         return result
                     except Exception as exc:
-                        attrs["error.message"] = str(exc)
+                        attrs.update(_exc_attrs(exc))
                         end("ERROR")
                         raise
                     finally:
@@ -410,7 +424,7 @@ class EvalKitClient:
                         end("OK")
                         return result
                     except Exception as exc:
-                        attrs["error.message"] = str(exc)
+                        attrs.update(_exc_attrs(exc))
                         end("ERROR")
                         raise
                     finally:

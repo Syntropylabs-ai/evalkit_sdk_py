@@ -4,6 +4,7 @@ import sys
 from typing import TYPE_CHECKING
 
 from ._streaming import _AsyncStreamTracer, _SyncStreamTracer
+from ..core.client import _exc_attrs  # standard exception attributes for error spans
 
 if TYPE_CHECKING:
     from ..core.client import EvalKitClient
@@ -82,7 +83,7 @@ def _patch_openai_class_sync(ek: "EvalKitClient", cls, provider: str = "openai")
                 service_name=ek._opts.service_name, provider=provider, model=model,
                 prompt=prompt, latency_ms=int(time.time() * 1000 - start_ms),
                 start_time=ts, end_time=_now_iso(), created_at=ts,
-                attributes={**ek._meta_attrs(), "gen_ai.request.model": model},
+                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_exc_attrs(exc)},
                 environment=ek._opts.environment, app_version=ek._opts.app_version,
                 sdk_version=SDK_VERSION,
             ))
@@ -93,9 +94,17 @@ def _patch_openai_class_sync(ek: "EvalKitClient", cls, provider: str = "openai")
         latency = int(time.time() * 1000 - start_ms)
         # Trace extraction must NEVER break the caller's request. Some callers
         # (e.g. litellm via `chat.completions.with_raw_response.create`) get back a
-        # LegacyAPIResponse with no `.choices` — skip extraction instead of raising.
+        # LegacyAPIResponse / APIResponse (openai SDK v2) with no `.choices`.
+        # Try to parse it before giving up so we still emit a span.
         if not hasattr(result, "choices"):
-            return result
+            try:
+                parsed = result.parse()
+                if hasattr(parsed, "choices"):
+                    result = parsed
+                else:
+                    return result
+            except Exception:
+                return result
         try:
             choice = result.choices[0] if result.choices else None
             completion = (choice.message.content or "") if choice else ""
@@ -188,7 +197,7 @@ def _patch_openai_class_async(ek: "EvalKitClient", cls, provider: str = "openai"
                 service_name=ek._opts.service_name, provider=provider, model=model,
                 prompt=prompt, latency_ms=int(time.time() * 1000 - start_ms),
                 start_time=ts, end_time=end_ts, created_at=ts,
-                attributes={**ek._meta_attrs(), "gen_ai.request.model": model},
+                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_exc_attrs(exc)},
                 environment=ek._opts.environment, app_version=ek._opts.app_version,
                 sdk_version=SDK_VERSION,
             ))
@@ -199,9 +208,17 @@ def _patch_openai_class_async(ek: "EvalKitClient", cls, provider: str = "openai"
         latency = int(time.time() * 1000 - start_ms)
         # Trace extraction must NEVER break the caller's request. Some callers
         # (e.g. litellm via `chat.completions.with_raw_response.create`) get back a
-        # LegacyAPIResponse with no `.choices` — skip extraction instead of raising.
+        # LegacyAPIResponse / APIResponse (openai SDK v2) with no `.choices`.
+        # Try to parse it before giving up so we still emit a span.
         if not hasattr(result, "choices"):
-            return result
+            try:
+                parsed = result.parse()
+                if hasattr(parsed, "choices"):
+                    result = parsed
+                else:
+                    return result
+            except Exception:
+                return result
         try:
             choice = result.choices[0] if result.choices else None
             completion = (choice.message.content or "") if choice else ""
@@ -314,7 +331,7 @@ def _patch_anthropic_class_sync(ek: "EvalKitClient", cls) -> None:
                 service_name=ek._opts.service_name, provider="anthropic", model=model,
                 prompt=prompt, latency_ms=int(time.time() * 1000 - start_ms),
                 start_time=ts, end_time=end_ts, created_at=ts,
-                attributes={**ek._meta_attrs(), "gen_ai.request.model": model},
+                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_exc_attrs(exc)},
                 environment=ek._opts.environment, app_version=ek._opts.app_version,
                 sdk_version=SDK_VERSION,
             ))
@@ -425,7 +442,7 @@ def _patch_anthropic_class_async(ek: "EvalKitClient", cls) -> None:
                 service_name=ek._opts.service_name, provider="anthropic", model=model,
                 prompt=prompt, latency_ms=int(time.time() * 1000 - start_ms),
                 start_time=ts, end_time=end_ts, created_at=ts,
-                attributes={**ek._meta_attrs(), "gen_ai.request.model": model},
+                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_exc_attrs(exc)},
                 environment=ek._opts.environment, app_version=ek._opts.app_version,
                 sdk_version=SDK_VERSION,
             ))
@@ -541,7 +558,7 @@ def _patch_google_genai_legacy_class(ek: "EvalKitClient", cls) -> None:
                 service_name=ek._opts.service_name, provider="google-ai", model=model_name,
                 prompt=prompt, latency_ms=int(time.time() * 1000 - start_ms),
                 start_time=ts, end_time=end_ts, created_at=ts,
-                attributes={**ek._meta_attrs(), "gen_ai.request.model": model_name},
+                attributes={**ek._meta_attrs(), "gen_ai.request.model": model_name, **_exc_attrs(exc)},
                 environment=ek._opts.environment, app_version=ek._opts.app_version,
                 sdk_version=SDK_VERSION,
             ))
@@ -619,7 +636,7 @@ def _patch_cohere_class(ek: "EvalKitClient", cls) -> None:
                 service_name=ek._opts.service_name, provider="cohere", model=model,
                 prompt=str(message)[:2000], latency_ms=int(time.time() * 1000 - start_ms),
                 start_time=ts, end_time=end_ts, created_at=ts,
-                attributes={**ek._meta_attrs(), "gen_ai.request.model": model},
+                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_exc_attrs(exc)},
                 environment=ek._opts.environment, app_version=ek._opts.app_version,
                 sdk_version=SDK_VERSION,
             ))
@@ -722,7 +739,7 @@ def _patch_openai_responses_sync(ek: "EvalKitClient", cls) -> None:
                 service_name=ek._opts.service_name, provider="openai", model=model,
                 prompt=prompt[:32768], latency_ms=int(time.time() * 1000 - start_ms),
                 start_time=ts, end_time=end_ts, created_at=ts,
-                attributes={**ek._meta_attrs(), "gen_ai.request.model": model},
+                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_exc_attrs(exc)},
                 environment=ek._opts.environment, app_version=ek._opts.app_version,
                 sdk_version=SDK_VERSION,
             ))
@@ -827,7 +844,7 @@ def _patch_openai_responses_async(ek: "EvalKitClient", cls) -> None:
                 service_name=ek._opts.service_name, provider="openai", model=model,
                 prompt=prompt[:32768], latency_ms=int(time.time() * 1000 - start_ms),
                 start_time=ts, end_time=end_ts, created_at=ts,
-                attributes={**ek._meta_attrs(), "gen_ai.request.model": model},
+                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_exc_attrs(exc)},
                 environment=ek._opts.environment, app_version=ek._opts.app_version,
                 sdk_version=SDK_VERSION,
             ))
@@ -964,7 +981,7 @@ def _patch_bedrock_class(ek: "EvalKitClient", cls) -> None:
                 service_name=ek._opts.service_name, provider="bedrock", model=model,
                 prompt=prompt, latency_ms=int(time.time() * 1000 - start_ms),
                 start_time=ts, end_time=end_ts, created_at=ts,
-                attributes={**ek._meta_attrs(), "gen_ai.request.model": model},
+                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_exc_attrs(exc)},
                 environment=ek._opts.environment, app_version=ek._opts.app_version,
                 sdk_version=SDK_VERSION,
             ))
@@ -1061,7 +1078,7 @@ def _patch_mistral_class_sync(ek: "EvalKitClient", cls) -> None:
                 provider="mistral", model=model, prompt=prompt_text,
                 latency_ms=int(time.time() * 1000 - start_ms),
                 start_time=ts, end_time=end_ts, created_at=ts,
-                attributes={**ek._meta_attrs(), "gen_ai.request.model": model},
+                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_exc_attrs(exc)},
                 environment=ek._opts.environment, app_version=ek._opts.app_version,
                 sdk_version=SDK_VERSION,
             ))
