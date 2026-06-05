@@ -22,6 +22,7 @@ from .instrumentation.llm.google_genai import patch_google_genai as _patch_googl
 from .instrumentation.llm.mistral import patch_mistral, patch_async_mistral
 from .instrumentation.llm.langchain import patch_langchain as _patch_langchain
 from .instrumentation.llm.litellm import patch_litellm as _patch_litellm
+from .instrumentation.llm.claude_agent_sdk import patch_claude_agent_sdk as _patch_claude_agent_sdk
 
 from .instrumentation.http.requests import patch_requests
 from .instrumentation.http.httpx import patch_httpx
@@ -65,6 +66,7 @@ __all__ = [
     "patch_google_genai",
     "patch_langchain",
     "patch_litellm",
+    "patch_claude_agent_sdk",
     "patch_mistral_client",
     "patch_async_openai_client",
     "patch_async_anthropic_client",
@@ -205,6 +207,16 @@ def patch_langchain() -> Any:
 def patch_litellm() -> None:
     """Instrument litellm.completion/acompletion. Called by init() automatically."""
     _patch_litellm(_get_instance())
+
+
+def patch_claude_agent_sdk() -> None:
+    """Instrument ``claude_agent_sdk.query`` and ``ClaudeSDKClient.receive_response``
+    to capture token/cost/latency data from ``ResultMessage`` as ``llm_call`` spans.
+
+    Called automatically by ``init()`` when ``claude_agent_sdk`` is installed.
+    Call explicitly if you install the package after calling ``init()``.
+    """
+    _patch_claude_agent_sdk(_get_instance())
 
 
 def patch_mistral_client(

@@ -82,6 +82,65 @@ import evalkit
 evalkit.patch_sqlalchemy_engine(engine)
 ```
 
+## Evaluation
+
+Score agent outputs locally — no judge-model cost, results appear as `eval_result` spans:
+
+```python
+import evalkit
+
+scores = evalkit.evaluate(
+    output="Your return window is 30 days.",
+    input="What is the return policy?",
+    expected_tools=["search_knowledge_base"],
+    tool_calls=[{"name": "search_knowledge_base"}],
+    constraints={"required_terms": ["return", "30"]},
+)
+# → {"tool_trajectory_f1": 1.0, "required_terms": 1.0, ...}
+```
+
+## Scenario simulation
+
+Generate realistic synthetic-user scenarios from your agent's system prompt and tool list, then run each scenario against your real agent and score the results automatically:
+
+```python
+import evalkit
+
+evalkit.init(subscription_key="tk_live_...", service_name="my-agent")
+
+# Step 1 — generate scenarios server-side (BYOK: your own key for the generation call)
+scenarios = evalkit.generate_scenarios(
+    agent_instructions=SYSTEM_PROMPT,
+    tools=["search_kb", "lookup_order", "create_ticket"],
+    count=5,
+    provider="anthropic",           # "openai" or "google" also supported
+    api_key="sk-ant-...",           # BYOK key for generation model
+    model="claude-haiku-4-5-20251001",
+)
+
+# Step 2 — simulate each scenario against your real agent and score it
+def entrypoint(ctx: evalkit.SimContext) -> evalkit.AgentTurnResult:
+    # ctx.message    — the synthetic user's turn message
+    # ctx.session_id — stable per-scenario, use it to keep multi-turn context
+    reply, tools_used = run_my_agent(ctx.session_id, ctx.message)
+    return evalkit.AgentTurnResult(
+        text=reply,
+        tool_calls=[{"name": t} for t in tools_used],
+    )
+
+report = evalkit.simulate_user(entrypoint, scenarios, tags=["ci"])
+# Results appear in Dashboard → Simulations
+print("Simulation ID:", report["simulation_id"])
+```
+
+### Out-of-process agents (Claude Agent SDK)
+
+The Claude Agent SDK runs the Anthropic call in a subprocess, so the normal in-process patch can't observe it. EvalKit wraps `claude_agent_sdk.query()` and `ClaudeSDKClient.receive_response()` instead, reading token/cost/latency from the `ResultMessage` the SDK already returns. This happens automatically via `init()` when `claude_agent_sdk` is installed. To call it explicitly:
+
+```python
+evalkit.patch_claude_agent_sdk()
+```
+
 ## Flushing
 
 Traces are batched and exported in the background. Flush before exit if needed:

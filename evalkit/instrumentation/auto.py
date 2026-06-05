@@ -1173,3 +1173,12 @@ def setup_auto_instrumentation(
     _try_patch_litellm(client)
     _try_patch_langchain(client)
     _try_patch_databases(client)
+    _try_patch_claude_agent_sdk(client)
+
+
+def _try_patch_claude_agent_sdk(ek: "EvalKitClient") -> None:
+    try:
+        from .llm.claude_agent_sdk import patch_claude_agent_sdk
+        patch_claude_agent_sdk(ek)
+    except Exception:
+        pass

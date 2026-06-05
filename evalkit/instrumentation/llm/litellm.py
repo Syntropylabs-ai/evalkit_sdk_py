@@ -28,22 +28,6 @@ if TYPE_CHECKING:
     from ...core.client import EvalKitClient
 
 
-def _provider_for(model: str) -> str:
-    if not model:
-        return "litellm"
-    if "/" in model:
-        return model.split("/", 1)[0]
-    try:
-        import litellm  # type: ignore
-
-        _, provider, _, _ = litellm.get_llm_provider(model)  # type: ignore[attr-defined]
-        if provider:
-            return str(provider)
-    except Exception:
-        pass
-    return "litellm"
-
-
 def _messages_to_prompt(messages: Any) -> str:
     try:
         return "\n".join(
@@ -119,16 +103,15 @@ def _patch_sync(ek: "EvalKitClient", litellm: Any) -> None:
         parent_span_id = ctx_parent.span_id if ctx_parent else None
         start_ms = time.time() * 1000
         ts = _now_iso()
-        model = kwargs.get("model") or (args[0] if args else "unknown")
-        provider = _provider_for(str(model))
+        model = str(kwargs.get("model") or (args[0] if args else "unknown"))
         prompt = _messages_to_prompt(kwargs.get("messages", []))
 
         if kwargs.get("stream"):
             def on_done(completion: str, tin: int, tout: int) -> None:
                 ek.enqueue(TraceEnvelope(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                    span_type="llm_call", status="OK", operation="completion",
-                    service_name=ek._opts.service_name, provider=provider, model=str(model),
+                    span_type="llm_call", status="OK", operation="litellm.completion",
+                    service_name=ek._opts.service_name, provider="litellm", model=model,
                     prompt=prompt, completion=completion, tokens_in=tin, tokens_out=tout,
                     latency_ms=int(time.time() * 1000 - start_ms), start_time=ts, end_time=_now_iso(),
                     created_at=ts, attributes={**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True},
@@ -143,8 +126,8 @@ def _patch_sync(ek: "EvalKitClient", litellm: Any) -> None:
         except Exception as exc:
             ek.enqueue(TraceEnvelope(
                 trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                span_type="llm_call", status="ERROR", status_message=str(exc), operation="completion",
-                service_name=ek._opts.service_name, provider=provider, model=str(model), prompt=prompt,
+                span_type="llm_call", status="ERROR", status_message=str(exc), operation="litellm.completion",
+                service_name=ek._opts.service_name, provider="litellm", model=model, prompt=prompt,
                 latency_ms=int(time.time() * 1000 - start_ms), start_time=ts, end_time=_now_iso(), created_at=ts,
                 attributes={**ek._meta_attrs(), "gen_ai.request.model": model},
                 environment=ek._opts.environment, app_version=ek._opts.app_version, sdk_version=SDK_VERSION,
@@ -155,15 +138,15 @@ def _patch_sync(ek: "EvalKitClient", litellm: Any) -> None:
 
         end_ts = _now_iso()
         tin, tout = _usage(result)
+        attrs = {**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.usage.total_tokens": tin + tout}
         ek.enqueue(TraceEnvelope(
             trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-            span_type="llm_call", status="OK", operation="completion",
-            service_name=ek._opts.service_name, provider=provider, model=str(model),
+            span_type="llm_call", status="OK", operation="litellm.completion",
+            service_name=ek._opts.service_name, provider="litellm", model=model,
             prompt=prompt, completion=_completion_text(result), tokens_in=tin, tokens_out=tout,
             latency_ms=int(time.time() * 1000 - start_ms), start_time=ts, end_time=end_ts, created_at=ts,
             events=_tool_events(result, end_ts) or None,
-            attributes={**ek._meta_attrs(), "gen_ai.request.model": model,
-                        "gen_ai.usage.total_tokens": tin + tout},
+            attributes=attrs,
             environment=ek._opts.environment, app_version=ek._opts.app_version, sdk_version=SDK_VERSION,
         ))
         return result
@@ -186,16 +169,15 @@ def _patch_async(ek: "EvalKitClient", litellm: Any) -> None:
         parent_span_id = ctx_parent.span_id if ctx_parent else None
         start_ms = time.time() * 1000
         ts = _now_iso()
-        model = kwargs.get("model") or (args[0] if args else "unknown")
-        provider = _provider_for(str(model))
+        model = str(kwargs.get("model") or (args[0] if args else "unknown"))
         prompt = _messages_to_prompt(kwargs.get("messages", []))
 
         if kwargs.get("stream"):
             def on_done(completion: str, tin: int, tout: int) -> None:
                 ek.enqueue(TraceEnvelope(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                    span_type="llm_call", status="OK", operation="acompletion",
-                    service_name=ek._opts.service_name, provider=provider, model=str(model),
+                    span_type="llm_call", status="OK", operation="litellm.acompletion",
+                    service_name=ek._opts.service_name, provider="litellm", model=model,
                     prompt=prompt, completion=completion, tokens_in=tin, tokens_out=tout,
                     latency_ms=int(time.time() * 1000 - start_ms), start_time=ts, end_time=_now_iso(),
                     created_at=ts, attributes={**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True},
@@ -211,8 +193,8 @@ def _patch_async(ek: "EvalKitClient", litellm: Any) -> None:
         except Exception as exc:
             ek.enqueue(TraceEnvelope(
                 trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                span_type="llm_call", status="ERROR", status_message=str(exc), operation="acompletion",
-                service_name=ek._opts.service_name, provider=provider, model=str(model), prompt=prompt,
+                span_type="llm_call", status="ERROR", status_message=str(exc), operation="litellm.acompletion",
+                service_name=ek._opts.service_name, provider="litellm", model=model, prompt=prompt,
                 latency_ms=int(time.time() * 1000 - start_ms), start_time=ts, end_time=_now_iso(), created_at=ts,
                 attributes={**ek._meta_attrs(), "gen_ai.request.model": model},
                 environment=ek._opts.environment, app_version=ek._opts.app_version, sdk_version=SDK_VERSION,
@@ -223,15 +205,15 @@ def _patch_async(ek: "EvalKitClient", litellm: Any) -> None:
 
         end_ts = _now_iso()
         tin, tout = _usage(result)
+        attrs = {**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.usage.total_tokens": tin + tout}
         ek.enqueue(TraceEnvelope(
             trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-            span_type="llm_call", status="OK", operation="acompletion",
-            service_name=ek._opts.service_name, provider=provider, model=str(model),
+            span_type="llm_call", status="OK", operation="litellm.acompletion",
+            service_name=ek._opts.service_name, provider="litellm", model=model,
             prompt=prompt, completion=_completion_text(result), tokens_in=tin, tokens_out=tout,
             latency_ms=int(time.time() * 1000 - start_ms), start_time=ts, end_time=end_ts, created_at=ts,
             events=_tool_events(result, end_ts) or None,
-            attributes={**ek._meta_attrs(), "gen_ai.request.model": model,
-                        "gen_ai.usage.total_tokens": tin + tout},
+            attributes=attrs,
             environment=ek._opts.environment, app_version=ek._opts.app_version, sdk_version=SDK_VERSION,
         ))
         return result

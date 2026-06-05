@@ -1,0 +1,104 @@
+import sys
+import types
+import unittest
+
+import evalkit
+from tests.helpers import fresh, reset_context
+
+
+def _setup_fake_langchain_core():
+    base = types.ModuleType("langchain_core.callbacks.base")
+
+    class BaseCallbackHandler:
+        pass
+
+    base.BaseCallbackHandler = BaseCallbackHandler
+    manager = types.ModuleType("langchain_core.callbacks.manager")
+    manager.register_configure_hook = lambda *a, **k: None
+    callbacks = types.ModuleType("langchain_core.callbacks")
+    root = types.ModuleType("langchain_core")
+
+    mods = {
+        "langchain_core": root,
+        "langchain_core.callbacks": callbacks,
+        "langchain_core.callbacks.base": base,
+        "langchain_core.callbacks.manager": manager,
+    }
+    sys.modules.update(mods)
+    return mods
+
+
+class TestLangChain(unittest.TestCase):
+    def setUp(self):
+        reset_context()
+        self.captured = []
+        self.client = fresh(self.captured)
+        self._mods = _setup_fake_langchain_core()
+
+        import evalkit.instrumentation.llm.langchain as lc
+        lc._registered = False
+        lc._handler_var = None
+
+    def tearDown(self):
+        for name in self._mods:
+            sys.modules.pop(name, None)
+        import evalkit.instrumentation.llm.langchain as lc
+        lc._registered = False
+        lc._handler_var = None
+
+    def _make_human_msg(self, text):
+        return types.SimpleNamespace(type="human", content=text)
+
+    def _make_llm_output(self, text, pin=4, pout=6):
+        return types.SimpleNamespace(
+            generations=[[types.SimpleNamespace(text=text, message=None)]],
+            llm_output={"token_usage": {"prompt_tokens": pin, "completion_tokens": pout}},
+        )
+
+    def test_full_span_tree(self):
+        handler = evalkit.patch_langchain()
+        self.assertIsNotNone(handler)
+
+        handler.on_chain_start({"name": "graph"}, {}, run_id="A", parent_run_id=None)
+        handler.on_chat_model_start(
+            {"id": ["langchain", "chat_models", "openai", "ChatOpenAI"],
+             "kwargs": {"model": "gpt-4o"}},
+            [[self._make_human_msg("hi")]],
+            run_id="B", parent_run_id="A",
+        )
+        handler.on_llm_end(self._make_llm_output("hello", 4, 6), run_id="B")
+        handler.on_tool_start({"name": "search"}, "query", run_id="C", parent_run_id="A")
+        handler.on_tool_end("result", run_id="C")
+        handler.on_chain_end({}, run_id="A")
+        self.client.flush()
+
+        by_type = {}
+        for e in self.captured:
+            by_type.setdefault(e.span_type, []).append(e)
+
+        chain = by_type["function_call"][0]
+        llm = by_type["llm_call"][0]
+        tool = by_type["tool_call"][0]
+
+        self.assertEqual(chain.trace_id, llm.trace_id)
+        self.assertEqual(chain.trace_id, tool.trace_id)
+        self.assertEqual(llm.parent_span_id, chain.span_id)
+        self.assertEqual(tool.parent_span_id, chain.span_id)
+        self.assertEqual(llm.model, "gpt-4o")
+        self.assertEqual(llm.provider, "openai")
+        self.assertEqual(llm.completion, "hello")
+        self.assertEqual(llm.tokens_in, 4)
+        self.assertEqual(llm.tokens_out, 6)
+        self.assertEqual(tool.attributes.get("tool.name"), "search")
+
+    def test_noop_when_no_langchain(self):
+        from evalkit.instrumentation.auto import _try_patch_langchain
+        _try_patch_langchain(self.client)
+
+    def test_patch_langchain_export(self):
+        result = evalkit.patch_langchain()
+        self.assertIsNotNone(result)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
