@@ -130,35 +130,6 @@ def _llm_result_tokens(response: Any):
     return int(tokens_in or 0), int(tokens_out or 0)
 
 
-def _llm_result_tool_events(response: Any, ts: str) -> List[SpanEvent]:
-    events: List[SpanEvent] = []
-    try:
-        import json as _json
-        for batch in (getattr(response, "generations", None) or []):
-            for g in batch:
-                msg = getattr(g, "message", None)
-                for tc in (getattr(msg, "tool_calls", None) or []):
-                    name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", "")
-                    args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", {})
-                    tid = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", "")
-                    try:
-                        args_json = _json.dumps(args)
-                    except Exception:
-                        args_json = str(args)
-                    if name:
-                        events.append(SpanEvent(
-                            name="gen_ai.tool.call", timestamp=ts,
-                            attributes={
-                                "gen_ai.tool.name": name,
-                                "gen_ai.tool.call.arguments": _truncate(args_json),
-                                "gen_ai.tool.call.id": str(tid or ""),
-                            },
-                        ))
-    except Exception:
-        pass
-    return events
-
-
 def _build_handler(client: "EvalKitClient"):
     try:
         from langchain_core.callbacks.base import BaseCallbackHandler
@@ -322,11 +293,10 @@ def _build_handler(client: "EvalKitClient"):
         def on_llm_end(self, response, *, run_id, **kwargs):
             completion = _llm_result_completion(response)
             tokens_in, tokens_out = _llm_result_tokens(response)
-            events = _llm_result_tool_events(response, _now_iso())
             extra = {"gen_ai.usage.total_tokens": tokens_in + tokens_out} if (tokens_in or tokens_out) else None
             self._end(run_id, status="OK", completion=completion,
                       tokens_in=tokens_in or None, tokens_out=tokens_out or None,
-                      extra_attrs=extra, events=events or None)
+                      extra_attrs=extra)
 
         def on_llm_error(self, error, *, run_id, **kwargs):
             self._end(run_id, status="ERROR", status_message=str(error))
@@ -337,12 +307,28 @@ def _build_handler(client: "EvalKitClient"):
             if isinstance(serialized, dict):
                 name = serialized.get("name") or (serialized.get("id") or [None])[-1]
             name = name or kwargs.get("name") or "tool"
-            self._start(run_id, parent_run_id, "tool_call", str(name),
-                        attrs={"evalkit.framework": "langchain", "tool.name": str(name),
-                               "tool.arguments": _truncate(input_str)})
+            tool_call_id = kwargs.get("tool_call_id") or ""
+            attrs: Dict[str, Any] = {
+                "evalkit.framework": "langchain",
+                "tool.name": str(name),
+                "gen_ai.tool.name": str(name),
+                "tool.arguments": _truncate(input_str),
+            }
+            if tool_call_id:
+                attrs["gen_ai.tool.call.id"] = tool_call_id
+            self._start(run_id, parent_run_id, "tool_call", str(name), attrs=attrs)
 
         def on_tool_end(self, output, *, run_id, **kwargs):
-            self._end(run_id, status="OK", extra_attrs={"tool.result": _truncate(output)})
+            # output may be a ToolMessage (newer LangChain) or a raw string/value
+            if hasattr(output, "content"):
+                raw = output.content
+            else:
+                raw = output
+            if raw is None or raw == "" or raw == [] or raw == {}:
+                result = "(empty)"
+            else:
+                result = _truncate(raw)
+            self._end(run_id, status="OK", extra_attrs={"tool.result": result})
 
         def on_tool_error(self, error, *, run_id, **kwargs):
             self._end(run_id, status="ERROR", status_message=str(error))

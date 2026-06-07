@@ -253,6 +253,7 @@ def simulate_user(
     api_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     from .. import _get_instance
+    from ..core.context import get_or_create_ambient_trace_id
 
     client = _get_instance()
     cfg = {
@@ -265,11 +266,13 @@ def simulate_user(
     }
     scenario_list = list(scenarios)
 
+    # Pin ONE ambient trace ID before any scenario runs. Every copy_context() /
+    # ensure_future() below inherits this ID from the parent context, so all
+    # scenarios — and any pre-run ops like generate_scenarios() — land in the
+    # same trace instead of each minting an isolated ID.
+    get_or_create_ambient_trace_id()
+
     if inspect.iscoroutinefunction(entrypoint):
-        # Drive every scenario inside ONE event loop so async agents (e.g. ADK)
-        # keep their loop/clients across scenarios. Each scenario runs in its own
-        # task so its trace/ambient/simulation context is isolated — every scenario
-        # becomes a distinct trace instead of all sharing one id.
         async def _run_all() -> List[Dict[str, Any]]:
             out: List[Dict[str, Any]] = []
             for sc in scenario_list:
@@ -278,8 +281,6 @@ def simulate_user(
 
         results = _run_coro_blocking(_run_all())
     else:
-        # Run each scenario in an isolated copy of the context so the ambient trace
-        # id pinned by one scenario's start_trace doesn't leak into the next.
         results = [
             contextvars.copy_context().run(_run_scenario, client, entrypoint, sc, **cfg)
             for sc in scenario_list

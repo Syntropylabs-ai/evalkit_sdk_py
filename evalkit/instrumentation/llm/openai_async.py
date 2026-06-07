@@ -8,6 +8,7 @@ from ...core.client import EvalKitClient, _new_span_id, _new_trace_id, _now_iso
 from ...core.context import SpanContext, _current_span, get_or_create_ambient_trace_id
 from ...core.types import SpanEvent, TraceEnvelope
 from .._streaming import _AsyncStreamTracer
+from .._toolcalls import from_openai_chat
 from .openai import _messages_to_text
 
 _PROMPT_MAX = 32768
@@ -87,17 +88,7 @@ def patch_async_openai(
         tokens_in = getattr(usage, "prompt_tokens", 0) or 0
         tokens_out = getattr(usage, "completion_tokens", 0) or 0
 
-        events: List[SpanEvent] = []
-        if choice and getattr(choice.message, "tool_calls", None):
-            for tc in choice.message.tool_calls:
-                events.append(SpanEvent(
-                    name="gen_ai.tool.call", timestamp=end_ts,
-                    attributes={
-                        "gen_ai.tool.call.id": getattr(tc, "id", ""),
-                        "gen_ai.tool.name": tc.function.name,
-                        "gen_ai.tool.call.arguments": tc.function.arguments,
-                    },
-                ))
+        events: List[SpanEvent] = from_openai_chat(result, end_ts)
 
         attrs: Dict[str, Any] = {
             **client._meta_attrs(),

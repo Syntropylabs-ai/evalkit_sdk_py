@@ -21,8 +21,9 @@ from ...core.context import (
     _current_span,
     get_or_create_ambient_trace_id,
 )
-from ...core.types import SpanEvent, TraceEnvelope
+from ...core.types import TraceEnvelope
 from .._streaming import _AsyncStreamTracer, _SyncStreamTracer
+from .._toolcalls import from_openai_chat
 
 if TYPE_CHECKING:
     from ...core.client import EvalKitClient
@@ -56,27 +57,7 @@ def _usage(result: Any):
 
 
 def _tool_events(result: Any, ts: str):
-    import json as _json
-
-    events = []
-    try:
-        choice = result.choices[0]
-        for tc in (getattr(choice.message, "tool_calls", None) or []):
-            fn = getattr(tc, "function", None)
-            name = getattr(fn, "name", "") if fn else ""
-            args = getattr(fn, "arguments", "") if fn else ""
-            if name:
-                events.append(SpanEvent(
-                    name="gen_ai.tool.call", timestamp=ts,
-                    attributes={
-                        "gen_ai.tool.name": name,
-                        "gen_ai.tool.call.arguments": args if isinstance(args, str) else _json.dumps(args),
-                        "gen_ai.tool.call.id": getattr(tc, "id", "") or "",
-                    },
-                ))
-    except Exception:
-        pass
-    return events
+    return from_openai_chat(result, ts)
 
 
 def patch_litellm(client: "EvalKitClient") -> None:

@@ -22,6 +22,7 @@ from ..._version import SDK_VERSION
 from ...core.client import _new_span_id, _now_iso
 from ...core.context import SpanContext, _current_span, get_or_create_ambient_trace_id
 from ...core.types import SpanEvent, TraceEnvelope
+from .._toolcalls import from_anthropic_blocks
 
 if TYPE_CHECKING:
     from ...core.client import EvalKitClient
@@ -77,19 +78,9 @@ async def _traced_gen(
                 if m:
                     model = str(m)
                 for block in getattr(message, "content", []):
-                    btype = getattr(block, "type", None)
-                    if btype == "text":
+                    if getattr(block, "type", None) == "text":
                         completion += getattr(block, "text", "")
-                    elif btype == "tool_use":
-                        events.append(SpanEvent(
-                            name="gen_ai.tool.call",
-                            timestamp=_now_iso(),
-                            attributes={
-                                "gen_ai.tool.call.id": getattr(block, "id", ""),
-                                "gen_ai.tool.name": getattr(block, "name", ""),
-                                "gen_ai.tool.call.arguments": str(getattr(block, "input", {})),
-                            },
-                        ))
+                events.extend(from_anthropic_blocks(getattr(message, "content", []), _now_iso()))
 
             elif msg_type == "ResultMessage":
                 usage = _get_attr(message, "usage") or {}

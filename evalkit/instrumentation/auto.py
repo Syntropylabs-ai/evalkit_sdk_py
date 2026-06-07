@@ -4,6 +4,7 @@ import sys
 from typing import TYPE_CHECKING
 
 from ._streaming import _AsyncStreamTracer, _SyncStreamTracer
+from ._toolcalls import from_anthropic_blocks, from_openai_chat, from_openai_responses
 from ..core.client import _exc_attrs  # standard exception attributes for error spans
 
 if TYPE_CHECKING:
@@ -111,15 +112,7 @@ def _patch_openai_class_sync(ek: "EvalKitClient", cls, provider: str = "openai")
             usage = getattr(result, "usage", None)
             tokens_in = getattr(usage, "prompt_tokens", 0) or 0
             tokens_out = getattr(usage, "completion_tokens", 0) or 0
-            events = []
-            if choice and getattr(choice.message, "tool_calls", None):
-                for tc in choice.message.tool_calls:
-                    events.append(SpanEvent(
-                        name="gen_ai.tool.call", timestamp=end_ts,
-                        attributes={"gen_ai.tool.name": tc.function.name,
-                                    "gen_ai.tool.call.id": getattr(tc, "id", ""),
-                                    "gen_ai.tool.call.arguments": tc.function.arguments},
-                    ))
+            events = from_openai_chat(result, end_ts)
             ek.enqueue(TraceEnvelope(
                 trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                 span_type="llm_call", status="OK",
@@ -225,15 +218,7 @@ def _patch_openai_class_async(ek: "EvalKitClient", cls, provider: str = "openai"
             usage = getattr(result, "usage", None)
             tokens_in = getattr(usage, "prompt_tokens", 0) or 0
             tokens_out = getattr(usage, "completion_tokens", 0) or 0
-            events = []
-            if choice and getattr(choice.message, "tool_calls", None):
-                for tc in choice.message.tool_calls:
-                    events.append(SpanEvent(
-                        name="gen_ai.tool.call", timestamp=end_ts,
-                        attributes={"gen_ai.tool.name": tc.function.name,
-                                    "gen_ai.tool.call.arguments": tc.function.arguments,
-                                    "gen_ai.tool.call.id": getattr(tc, "id", "")},
-                    ))
+            events = from_openai_chat(result, end_ts)
             ek.enqueue(TraceEnvelope(
                 trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                 span_type="llm_call", status="OK",
@@ -334,15 +319,7 @@ def _patch_anthropic_stream_sync(ek: "EvalKitClient", cls) -> None:
                     for block in getattr(final_msg, "content", []):
                         if hasattr(block, "text"):
                             completion += block.text
-                        elif getattr(block, "type", None) == "tool_use":
-                            events.append(SpanEvent(
-                                name="gen_ai.tool.call", timestamp=end_ts,
-                                attributes={
-                                    "gen_ai.tool.name": getattr(block, "name", ""),
-                                    "gen_ai.tool.call.id": getattr(block, "id", ""),
-                                    "gen_ai.tool.call.arguments": _json.dumps(getattr(block, "input", {})),
-                                },
-                            ))
+                    events = from_anthropic_blocks(getattr(final_msg, "content", []), end_ts)
                     usage = getattr(final_msg, "usage", None)
                     tokens_in = getattr(usage, "input_tokens", 0) or 0
                     tokens_out = getattr(usage, "output_tokens", 0) or 0
@@ -420,15 +397,7 @@ def _patch_anthropic_stream_async(ek: "EvalKitClient", cls) -> None:
                     for block in getattr(final_msg, "content", []):
                         if hasattr(block, "text"):
                             completion += block.text
-                        elif getattr(block, "type", None) == "tool_use":
-                            events.append(SpanEvent(
-                                name="gen_ai.tool.call", timestamp=end_ts,
-                                attributes={
-                                    "gen_ai.tool.name": getattr(block, "name", ""),
-                                    "gen_ai.tool.call.id": getattr(block, "id", ""),
-                                    "gen_ai.tool.call.arguments": _json.dumps(getattr(block, "input", {})),
-                                },
-                            ))
+                    events = from_anthropic_blocks(getattr(final_msg, "content", []), end_ts)
                     usage = getattr(final_msg, "usage", None)
                     tokens_in = getattr(usage, "input_tokens", 0) or 0
                     tokens_out = getattr(usage, "output_tokens", 0) or 0
@@ -527,16 +496,7 @@ def _patch_anthropic_class_sync(ek: "EvalKitClient", cls) -> None:
         usage = getattr(result, "usage", None)
         tokens_in = getattr(usage, "input_tokens", 0) or 0
         tokens_out = getattr(usage, "output_tokens", 0) or 0
-        import json as _json
-        events = []
-        for block in content:
-            if getattr(block, "type", None) == "tool_use":
-                events.append(SpanEvent(
-                    name="gen_ai.tool.call", timestamp=end_ts,
-                    attributes={"gen_ai.tool.name": block.name,
-                                "gen_ai.tool.call.id": getattr(block, "id", ""),
-                                "gen_ai.tool.call.arguments": _json.dumps(getattr(block, "input", {}))},
-                ))
+        events = from_anthropic_blocks(content, end_ts)
         stop_reason = getattr(result, "stop_reason", None)
         attrs = {
             **ek._meta_attrs(),
@@ -638,16 +598,7 @@ def _patch_anthropic_class_async(ek: "EvalKitClient", cls) -> None:
         usage = getattr(result, "usage", None)
         tokens_in = getattr(usage, "input_tokens", 0) or 0
         tokens_out = getattr(usage, "output_tokens", 0) or 0
-        import json as _json
-        events = []
-        for block in content:
-            if getattr(block, "type", None) == "tool_use":
-                events.append(SpanEvent(
-                    name="gen_ai.tool.call", timestamp=end_ts,
-                    attributes={"gen_ai.tool.name": block.name,
-                                "gen_ai.tool.call.id": getattr(block, "id", ""),
-                                "gen_ai.tool.call.arguments": _json.dumps(getattr(block, "input", {}))},
-                ))
+        events = from_anthropic_blocks(content, end_ts)
         stop_reason = getattr(result, "stop_reason", None)
         attrs = {
             **ek._meta_attrs(),
@@ -851,6 +802,12 @@ def _patch_cohere_class(ek: "EvalKitClient", cls) -> None:
 
 # ── OpenAI Responses API (used by OpenAI Agents SDK) ─────────────────────────
 
+def _responses_tool_events(output_items: list, ts: str) -> list:
+    """Build gen_ai.tool.call SpanEvents from OpenAI Responses API output items.
+    Delegates to the shared normalizer (URL citations -> gen_ai.tool.call.result)."""
+    return from_openai_responses(output_items, ts)
+
+
 def _try_patch_openai_responses(ek: "EvalKitClient") -> None:
     try:
         from openai.resources.responses.responses import Responses, AsyncResponses
@@ -974,28 +931,9 @@ def _patch_openai_responses_sync(ek: "EvalKitClient", cls) -> None:
                                     tokens_in_box[0] = getattr(usage, "input_tokens", 0) or 0
                                     tokens_out_box[0] = getattr(usage, "output_tokens", 0) or 0
                                     end_ts3 = _now_iso()
-                                    for item in getattr(resp, "output", []):
-                                        itype = getattr(item, "type", None)
-                                        if itype == "function_call":
-                                            tool_events_box.append(SpanEvent(
-                                                name="gen_ai.tool.call", timestamp=end_ts3,
-                                                attributes={
-                                                    "gen_ai.tool.call.id": getattr(item, "call_id", "") or getattr(item, "id", ""),
-                                                    "gen_ai.tool.name": getattr(item, "name", ""),
-                                                    "gen_ai.tool.call.arguments": getattr(item, "arguments", ""),
-                                                },
-                                            ))
-                                        elif itype and itype.endswith("_call"):
-                                            action = getattr(item, "action", None)
-                                            q = (getattr(action, "query", "") or "") if action else ""
-                                            tool_events_box.append(SpanEvent(
-                                                name="gen_ai.tool.call", timestamp=end_ts3,
-                                                attributes={
-                                                    "gen_ai.tool.call.id": getattr(item, "id", ""),
-                                                    "gen_ai.tool.name": itype[:-5],
-                                                    "gen_ai.tool.call.arguments": q,
-                                                },
-                                            ))
+                                    tool_events_box.extend(
+                                        from_openai_responses(list(getattr(resp, "output", []) or []), end_ts3)
+                                    )
                             yield event
                     finally:
                         _emit_responses_span()
@@ -1043,29 +981,8 @@ def _patch_openai_responses_sync(ek: "EvalKitClient", cls) -> None:
             tokens_in = getattr(usage, "input_tokens", 0) or 0
             tokens_out = getattr(usage, "output_tokens", 0) or 0
             total_tokens = getattr(usage, "total_tokens", 0) or 0
-            events = []
-            for item in getattr(result, "output", []):
-                itype = getattr(item, "type", None)
-                if itype == "function_call":
-                    events.append(SpanEvent(
-                        name="gen_ai.tool.call", timestamp=end_ts,
-                        attributes={
-                            "gen_ai.tool.call.id": getattr(item, "call_id", "") or getattr(item, "id", ""),
-                            "gen_ai.tool.name": getattr(item, "name", ""),
-                            "gen_ai.tool.call.arguments": getattr(item, "arguments", ""),
-                        },
-                    ))
-                elif itype and itype.endswith("_call"):
-                    action = getattr(item, "action", None)
-                    q = (getattr(action, "query", "") or "") if action else ""
-                    events.append(SpanEvent(
-                        name="gen_ai.tool.call", timestamp=end_ts,
-                        attributes={
-                            "gen_ai.tool.call.id": getattr(item, "id", ""),
-                            "gen_ai.tool.name": itype[:-5],
-                            "gen_ai.tool.call.arguments": q,
-                        },
-                    ))
+            output_items = list(getattr(result, "output", []) or [])
+            events = _responses_tool_events(output_items, end_ts)
             ek.enqueue(TraceEnvelope(
                 trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                 span_type="llm_call", status="OK",
@@ -1160,17 +1077,8 @@ def _patch_openai_responses_async(ek: "EvalKitClient", cls) -> None:
             tokens_in = getattr(usage, "input_tokens", 0) or 0
             tokens_out = getattr(usage, "output_tokens", 0) or 0
             total_tokens = getattr(usage, "total_tokens", 0) or 0
-            events = []
-            for item in getattr(result, "output", []):
-                if getattr(item, "type", None) == "function_call":
-                    events.append(SpanEvent(
-                        name="gen_ai.tool.call", timestamp=end_ts,
-                        attributes={
-                            "gen_ai.tool.call.id": getattr(item, "call_id", "") or getattr(item, "id", ""),
-                            "gen_ai.tool.name": getattr(item, "name", ""),
-                            "gen_ai.tool.call.arguments": getattr(item, "arguments", ""),
-                        },
-                    ))
+            output_items = list(getattr(result, "output", []) or [])
+            events = _responses_tool_events(output_items, end_ts)
             ek.enqueue(TraceEnvelope(
                 trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                 span_type="llm_call", status="OK",

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import time
 from typing import Any, Dict, List, Optional
 
@@ -9,6 +8,7 @@ from ...core.client import EvalKitClient, _new_span_id, _new_trace_id, _now_iso
 from ...core.context import SpanContext, _current_span, get_or_create_ambient_trace_id
 from ...core.types import SpanEvent, TraceEnvelope
 from .._streaming import _AsyncStreamTracer
+from .._toolcalls import from_anthropic_blocks
 from .anthropic import _build_prompt
 
 _PROMPT_MAX = 32768
@@ -86,20 +86,10 @@ def patch_async_anthropic(
         latency = int(time.time() * 1000 - start_ms)
 
         text_content = ""
-        events: List[SpanEvent] = []
         for block in getattr(result, "content", []):
-            btype = getattr(block, "type", None)
-            if btype == "text":
+            if getattr(block, "type", None) == "text":
                 text_content += getattr(block, "text", "")
-            elif btype == "tool_use":
-                events.append(SpanEvent(
-                    name="gen_ai.tool.call", timestamp=end_ts,
-                    attributes={
-                        "gen_ai.tool.call.id": getattr(block, "id", ""),
-                        "gen_ai.tool.name": getattr(block, "name", ""),
-                        "gen_ai.tool.call.arguments": json.dumps(getattr(block, "input", {})),
-                    },
-                ))
+        events: List[SpanEvent] = from_anthropic_blocks(getattr(result, "content", []), end_ts)
 
         usage = getattr(result, "usage", None)
         tokens_in = getattr(usage, "input_tokens", 0) or 0

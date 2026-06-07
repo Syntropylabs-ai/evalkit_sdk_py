@@ -7,6 +7,7 @@ from ..._version import SDK_VERSION
 from ...core.client import EvalKitClient, _new_span_id, _new_trace_id, _now_iso
 from ...core.context import SpanContext, _current_span, get_or_create_ambient_trace_id
 from ...core.types import SpanEvent, TraceEnvelope
+from .._toolcalls import from_openai_chat
 
 _PROMPT_MAX = 32768
 _COMPLETION_MAX = 32768
@@ -48,28 +49,7 @@ def _extract_mistral_usage(result: Any):
 
 
 def _extract_mistral_tool_events(result: Any, ts: str) -> List[SpanEvent]:
-    events: List[SpanEvent] = []
-    try:
-        choices = getattr(result, "choices", None) or []
-        for choice in choices:
-            msg = getattr(choice, "message", None)
-            if msg is None:
-                continue
-            for tc in (getattr(msg, "tool_calls", None) or []):
-                fn = getattr(tc, "function", None)
-                if fn is None:
-                    continue
-                events.append(SpanEvent(
-                    name="gen_ai.tool.call", timestamp=ts,
-                    attributes={
-                        "gen_ai.tool.call.id": getattr(tc, "id", ""),
-                        "gen_ai.tool.name": getattr(fn, "name", ""),
-                        "gen_ai.tool.call.arguments": getattr(fn, "arguments", ""),
-                    },
-                ))
-    except Exception:
-        pass
-    return events
+    return from_openai_chat(result, ts)
 
 
 def patch_mistral(

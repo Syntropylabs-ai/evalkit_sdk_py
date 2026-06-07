@@ -128,6 +128,7 @@ class EvalKitClient:
                 "tool.arguments": attrs.get("gen_ai.tool.call.arguments"),
                 "gen_ai.tool.name": name,
                 "gen_ai.tool.call.id": attrs.get("gen_ai.tool.call.id"),
+                "tool.result": attrs.get("gen_ai.tool.call.result"),
             }
             tool_attrs = {k: v for k, v in tool_attrs.items() if v is not None}
             self.enqueue(TraceEnvelope(

@@ -28,6 +28,7 @@ from ...core.context import (
     get_or_create_ambient_trace_id,
 )
 from ...core.types import SpanEvent, TraceEnvelope
+from .._toolcalls import from_google_parts
 
 if TYPE_CHECKING:
     pass
@@ -142,32 +143,7 @@ def _extract_completion(response: Any) -> str:
 
 def _extract_tool_events(response: Any, ts: str) -> List[SpanEvent]:
     """Extract function calls from response as SpanEvent list."""
-    events: List[SpanEvent] = []
-    try:
-        for candidate in (getattr(response, "candidates", None) or []):
-            content = getattr(candidate, "content", None)
-            if content is None:
-                continue
-            for part in getattr(content, "parts", []) or []:
-                fc = getattr(part, "function_call", None)
-                if fc is not None:
-                    raw_args = getattr(fc, "args", None) or {}
-                    try:
-                        args_json = json.dumps(dict(raw_args))
-                    except Exception:
-                        args_json = str(raw_args)
-                    events.append(SpanEvent(
-                        name="gen_ai.tool.call",
-                        timestamp=ts,
-                        attributes={
-                            "gen_ai.tool.name": getattr(fc, "name", ""),
-                            "gen_ai.tool.call.arguments": args_json,
-                            "gen_ai.tool.call.id": f"call_{id(fc):016x}",
-                        },
-                    ))
-    except Exception:
-        pass
-    return events
+    return from_google_parts(response, ts)
 
 
 def _usage_tokens(response: Any):
