@@ -112,7 +112,7 @@ def init(
 ) -> EvalKitClient:
     global _instance
     if _instance is not None:
-        _instance.destroy()
+        return _instance  # already initialized — reuse; patch closures reference this client
     opts = EvalKitOptions(
         subscription_key=subscription_key,
         base_url=base_url,

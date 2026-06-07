@@ -272,6 +272,188 @@ def _try_patch_anthropic(ek: "EvalKitClient") -> None:
         _patch_anthropic_class_async(ek, _am.AsyncMessages)
     except Exception:
         pass
+    # Also patch messages.stream() — the context-manager API used by agno and
+    # other frameworks (identified by x-stainless-helper-method: stream header).
+    try:
+        _patch_anthropic_stream_sync(ek, _am.Messages)
+    except Exception:
+        pass
+    try:
+        _patch_anthropic_stream_async(ek, _am.AsyncMessages)
+    except Exception:
+        pass
+
+
+def _patch_anthropic_stream_sync(ek: "EvalKitClient", cls) -> None:
+    original_stream = getattr(cls, "stream", None)
+    if original_stream is None or getattr(original_stream, "_evalkit", False):
+        return
+    import json as _json
+    import time
+    from ..core.client import _new_span_id, _now_iso
+    from ..core.context import SpanContext, _current_span, get_or_create_ambient_trace_id
+    from ..core.types import SpanEvent, TraceEnvelope
+    from .._version import SDK_VERSION
+
+    def traced_stream(self, *args, **kwargs):
+        ctx_parent = _current_span.get()
+        trace_id = ctx_parent.trace_id if ctx_parent else get_or_create_ambient_trace_id()
+        span_id = _new_span_id()
+        parent_span_id = ctx_parent.span_id if ctx_parent else None
+        start_ms = time.time() * 1000
+        ts = _now_iso()
+        model = kwargs.get("model", "unknown")
+        system = kwargs.get("system")
+        messages_arg = kwargs.get("messages", [])
+        parts = ([f"system: {system}"] if system else []) + [
+            f"{(m.get('role','') if isinstance(m, dict) else getattr(m,'role',''))}: "
+            f"{(m.get('content','') if isinstance(m, dict) else getattr(m,'content',''))}"
+            for m in messages_arg
+        ]
+        prompt = "\n".join(parts)
+
+        class _TracedStreamManager:
+            def __enter__(self_inner):
+                span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
+                self_inner._token = _current_span.set(span_ctx)
+                self_inner._mgr = original_stream(self, *args, **kwargs)
+                self_inner._underlying = self_inner._mgr.__enter__()
+                _current_span.reset(self_inner._token)
+                self_inner._token = None
+                return self_inner._underlying
+
+            def __exit__(self_inner, exc_type, exc_val, exc_tb):
+                result = self_inner._mgr.__exit__(exc_type, exc_val, exc_tb)
+                end_ts = _now_iso()
+                latency = int(time.time() * 1000 - start_ms)
+                completion = ""
+                tokens_in = tokens_out = 0
+                events = []
+                try:
+                    final_msg = self_inner._underlying.get_final_message()
+                    for block in getattr(final_msg, "content", []):
+                        if hasattr(block, "text"):
+                            completion += block.text
+                        elif getattr(block, "type", None) == "tool_use":
+                            events.append(SpanEvent(
+                                name="gen_ai.tool.call", timestamp=end_ts,
+                                attributes={
+                                    "gen_ai.tool.name": getattr(block, "name", ""),
+                                    "gen_ai.tool.call.id": getattr(block, "id", ""),
+                                    "gen_ai.tool.call.arguments": _json.dumps(getattr(block, "input", {})),
+                                },
+                            ))
+                    usage = getattr(final_msg, "usage", None)
+                    tokens_in = getattr(usage, "input_tokens", 0) or 0
+                    tokens_out = getattr(usage, "output_tokens", 0) or 0
+                except Exception:
+                    pass
+                status = "ERROR" if exc_type else "OK"
+                ek.enqueue(TraceEnvelope(
+                    trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
+                    span_type="llm_call", status=status,
+                    operation="messages.stream",
+                    service_name=ek._opts.service_name, provider="anthropic", model=model,
+                    prompt=prompt[:32768], completion=completion[:32768],
+                    tokens_in=tokens_in, tokens_out=tokens_out,
+                    latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
+                    events=events or None,
+                    attributes={**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True},
+                    environment=ek._opts.environment, app_version=ek._opts.app_version,
+                    sdk_version=SDK_VERSION,
+                ))
+                return result
+
+        return _TracedStreamManager()
+
+    traced_stream._evalkit = True  # type: ignore[attr-defined]
+    cls.stream = traced_stream
+
+
+def _patch_anthropic_stream_async(ek: "EvalKitClient", cls) -> None:
+    original_stream = getattr(cls, "stream", None)
+    if original_stream is None or getattr(original_stream, "_evalkit", False):
+        return
+    import json as _json
+    import time
+    from ..core.client import _new_span_id, _now_iso
+    from ..core.context import SpanContext, _current_span, get_or_create_ambient_trace_id
+    from ..core.types import SpanEvent, TraceEnvelope
+    from .._version import SDK_VERSION
+
+    def traced_stream_async(self, *args, **kwargs):
+        ctx_parent = _current_span.get()
+        trace_id = ctx_parent.trace_id if ctx_parent else get_or_create_ambient_trace_id()
+        span_id = _new_span_id()
+        parent_span_id = ctx_parent.span_id if ctx_parent else None
+        start_ms = time.time() * 1000
+        ts = _now_iso()
+        model = kwargs.get("model", "unknown")
+        system = kwargs.get("system")
+        messages_arg = kwargs.get("messages", [])
+        parts = ([f"system: {system}"] if system else []) + [
+            f"{(m.get('role','') if isinstance(m, dict) else getattr(m,'role',''))}: "
+            f"{(m.get('content','') if isinstance(m, dict) else getattr(m,'content',''))}"
+            for m in messages_arg
+        ]
+        prompt = "\n".join(parts)
+
+        class _TracedAsyncStreamManager:
+            async def __aenter__(self_inner):
+                span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
+                self_inner._token = _current_span.set(span_ctx)
+                self_inner._mgr = original_stream(self, *args, **kwargs)
+                self_inner._underlying = await self_inner._mgr.__aenter__()
+                _current_span.reset(self_inner._token)
+                self_inner._token = None
+                return self_inner._underlying
+
+            async def __aexit__(self_inner, exc_type, exc_val, exc_tb):
+                result = await self_inner._mgr.__aexit__(exc_type, exc_val, exc_tb)
+                end_ts = _now_iso()
+                latency = int(time.time() * 1000 - start_ms)
+                completion = ""
+                tokens_in = tokens_out = 0
+                events = []
+                try:
+                    final_msg = await self_inner._underlying.get_final_message()
+                    for block in getattr(final_msg, "content", []):
+                        if hasattr(block, "text"):
+                            completion += block.text
+                        elif getattr(block, "type", None) == "tool_use":
+                            events.append(SpanEvent(
+                                name="gen_ai.tool.call", timestamp=end_ts,
+                                attributes={
+                                    "gen_ai.tool.name": getattr(block, "name", ""),
+                                    "gen_ai.tool.call.id": getattr(block, "id", ""),
+                                    "gen_ai.tool.call.arguments": _json.dumps(getattr(block, "input", {})),
+                                },
+                            ))
+                    usage = getattr(final_msg, "usage", None)
+                    tokens_in = getattr(usage, "input_tokens", 0) or 0
+                    tokens_out = getattr(usage, "output_tokens", 0) or 0
+                except Exception:
+                    pass
+                status = "ERROR" if exc_type else "OK"
+                ek.enqueue(TraceEnvelope(
+                    trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
+                    span_type="llm_call", status=status,
+                    operation="messages.stream",
+                    service_name=ek._opts.service_name, provider="anthropic", model=model,
+                    prompt=prompt[:32768], completion=completion[:32768],
+                    tokens_in=tokens_in, tokens_out=tokens_out,
+                    latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
+                    events=events or None,
+                    attributes={**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True},
+                    environment=ek._opts.environment, app_version=ek._opts.app_version,
+                    sdk_version=SDK_VERSION,
+                ))
+                return result
+
+        return _TracedAsyncStreamManager()
+
+    traced_stream_async._evalkit = True  # type: ignore[attr-defined]
+    cls.stream = traced_stream_async
 
 
 def _patch_anthropic_class_sync(ek: "EvalKitClient", cls) -> None:
@@ -725,6 +907,91 @@ def _patch_openai_responses_sync(ek: "EvalKitClient", cls) -> None:
         else:
             input_text = str(raw_input)
         prompt = (f"system: {instructions}\n" if instructions else "") + input_text
+
+        if kwargs.get("stream"):
+            chunks: list[str] = []
+            tokens_in_box = [0]
+            tokens_out_box = [0]
+            tool_events_box: list[SpanEvent] = []
+            done_box = [False]
+
+            span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
+            token = _current_span.set(span_ctx)
+            try:
+                raw_stream = original(self, *args, **kwargs)
+            except Exception as exc:
+                _current_span.reset(token)
+                end_ts = _now_iso()
+                ek.enqueue(TraceEnvelope(
+                    trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
+                    span_type="llm_call", status="ERROR", status_message=str(exc),
+                    operation="responses.create",
+                    service_name=ek._opts.service_name, provider="openai", model=model,
+                    prompt=prompt[:32768], latency_ms=int(time.time() * 1000 - start_ms),
+                    start_time=ts, end_time=end_ts, created_at=ts,
+                    attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_exc_attrs(exc)},
+                    environment=ek._opts.environment, app_version=ek._opts.app_version,
+                    sdk_version=SDK_VERSION,
+                ))
+                raise
+            _current_span.reset(token)
+
+            def _emit_responses_span() -> None:
+                if done_box[0]:
+                    return
+                done_box[0] = True
+                end_ts2 = _now_iso()
+                latency2 = int(time.time() * 1000 - start_ms)
+                ek.enqueue(TraceEnvelope(
+                    trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
+                    span_type="llm_call", status="OK",
+                    operation="responses.create",
+                    service_name=ek._opts.service_name, provider="openai", model=model,
+                    prompt=prompt[:32768], completion="".join(chunks)[:32768],
+                    tokens_in=tokens_in_box[0], tokens_out=tokens_out_box[0],
+                    latency_ms=latency2, start_time=ts, end_time=end_ts2, created_at=ts,
+                    events=tool_events_box or None,
+                    attributes={**ek._meta_attrs(), "gen_ai.request.model": model,
+                                "gen_ai.streaming": True,
+                                "gen_ai.usage.total_tokens": tokens_in_box[0] + tokens_out_box[0]},
+                    environment=ek._opts.environment, app_version=ek._opts.app_version,
+                    sdk_version=SDK_VERSION,
+                ))
+
+            class _ResponsesStreamWrapper:
+                def __iter__(self_inner):
+                    try:
+                        for event in raw_stream:
+                            etype = getattr(event, "type", "")
+                            if etype == "response.output_text.delta":
+                                delta = getattr(event, "delta", "")
+                                if delta:
+                                    chunks.append(delta)
+                            elif etype in ("response.completed", "response.done"):
+                                resp = getattr(event, "response", None)
+                                if resp:
+                                    usage = getattr(resp, "usage", None)
+                                    tokens_in_box[0] = getattr(usage, "input_tokens", 0) or 0
+                                    tokens_out_box[0] = getattr(usage, "output_tokens", 0) or 0
+                                    end_ts3 = _now_iso()
+                                    for item in getattr(resp, "output", []):
+                                        if getattr(item, "type", None) == "function_call":
+                                            tool_events_box.append(SpanEvent(
+                                                name="gen_ai.tool.call", timestamp=end_ts3,
+                                                attributes={
+                                                    "gen_ai.tool.call.id": getattr(item, "call_id", "") or getattr(item, "id", ""),
+                                                    "gen_ai.tool.name": getattr(item, "name", ""),
+                                                    "gen_ai.tool.call.arguments": getattr(item, "arguments", ""),
+                                                },
+                                            ))
+                            yield event
+                    finally:
+                        _emit_responses_span()
+
+                def __getattr__(self_inner, name):
+                    return getattr(raw_stream, name)
+
+            return _ResponsesStreamWrapper()
 
         span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
         token = _current_span.set(span_ctx)
