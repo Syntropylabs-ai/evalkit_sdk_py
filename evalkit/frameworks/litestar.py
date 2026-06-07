@@ -7,7 +7,7 @@ from ..core.client import EvalKitClient
 from ..core.context import _current_span
 from ..utils.headers import parse_traceparent, sanitize_headers
 
-_BODY_MAX = 4096
+_BODY_MAX = 10 * 1024 * 1024  # default; overridden from client options per request
 
 
 def create_litestar_middleware(client: "EvalKitClient | None" = None) -> Any:
@@ -29,6 +29,8 @@ def create_litestar_middleware(client: "EvalKitClient | None" = None) -> Any:
                 return
 
             ek = _get_client()
+            global _BODY_MAX
+            _BODY_MAX = ek._opts.max_body_bytes
             method = scope.get("method", "GET")
             path = scope.get("path", "/")
             query = scope.get("query_string", b"").decode()

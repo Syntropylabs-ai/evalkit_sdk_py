@@ -131,6 +131,11 @@ class EvalKitOptions:
     max_export_batch_size: int = 512
     scheduled_delay_ms: int = 5000
     max_queue_size: int = 4096
+    # Max bytes of any captured HTTP request/response body stored on a span.
+    # Bodies larger than this are truncated. Applies to every HTTP client patch
+    # (requests/httpx/aiohttp) and framework middleware (FastAPI/Starlette/
+    # Django/Flask/Litestar).
+    max_body_bytes: int = 10 * 1024 * 1024
     environment: Optional[str] = None
     app_version: Optional[str] = None
     device_id: Optional[str] = None

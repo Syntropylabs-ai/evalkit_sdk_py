@@ -111,10 +111,18 @@ class EvalKitClient:
             sim.collector.append(envelope)
 
     def _maybe_emit_tool_spans(self, envelope: TraceEnvelope) -> None:
-        """Promote each tool call an LLM requested (carried as a gen_ai.tool.call
-        event on the llm_call span) into a first-class child tool_call span, so
-        tool calls show as their own rows in the trace waterfall across EVERY
-        provider (OpenAI/Anthropic/Google/ADK/Cohere/Bedrock/Mistral/LiteLLM)."""
+        """Promote a tool call carried as a gen_ai.tool.call event on the llm_call
+        span into a first-class child tool_call span — but ONLY when the SDK has the
+        tool's result (server-side tools like OpenAI Responses web_search, where the
+        result is in the LLM response).
+
+        For client-side function tools the SDK only ever sees the model's *request*
+        (name + arguments); the result is produced by the application after the call.
+        Emitting a child span for those would be a zero-duration, output-less row, so
+        we keep just the gen_ai.tool.call event on the llm_call span instead. To trace
+        a client-side tool's execution (output + latency), wrap it with
+        evalkit.trace_function. Simulation tool metrics still work: _tools_from_collector
+        falls back to the llm_call span's tool events when no tool_call span exists."""
         if envelope.span_type != "llm_call" or not envelope.events:
             return
         ts = envelope.end_time or envelope.created_at
@@ -122,6 +130,10 @@ class EvalKitClient:
             attrs = getattr(ev, "attributes", None) or {}
             name = attrs.get("gen_ai.tool.name")
             if not name:
+                continue
+            result = attrs.get("gen_ai.tool.call.result")
+            if result is None:
+                # Client-side tool: no result available — keep the event only.
                 continue
             tool_attrs = {
                 "tool.name": name,
@@ -424,6 +436,76 @@ class EvalKitClient:
                         result = fn(*args, **kwargs)
                         if capture_io:
                             attrs["function.result"] = _safe_io(result)
+                        end("OK")
+                        return result
+                    except Exception as exc:
+                        attrs.update(_exc_attrs(exc))
+                        end("ERROR")
+                        raise
+                    finally:
+                        _current_span.reset(token)
+                return sync_wrapper  # type: ignore[return-value]
+
+        return decorator
+
+    def trace_tool(
+        self,
+        name: Optional[str] = None,
+        attributes: Optional[Dict[str, Any]] = None,
+        capture_io: bool = True,
+    ) -> Callable[[F], F]:
+        """Like ``trace_function`` but emits a first-class ``tool_call`` span — it
+        renders in the trace UI's Input/Output panels and counts toward tool
+        metrics. Use it on your own client-side tools so they behave exactly like
+        server-side / LangChain tools. Decorator; works on sync or async functions."""
+        def decorator(fn: F) -> F:
+            tool_name = name or fn.__qualname__
+
+            def _mk_attrs(args: tuple, kwargs: dict) -> Dict[str, Any]:
+                a: Dict[str, Any] = {
+                    "evalkit.span_type": "tool_call",
+                    "tool.name": tool_name,
+                    "gen_ai.tool.name": tool_name,
+                    **(attributes or {}),
+                }
+                if capture_io:
+                    if args and kwargs:
+                        a["tool.arguments"] = _safe_io({"args": list(args), "kwargs": kwargs})
+                    elif kwargs:
+                        a["tool.arguments"] = _safe_io(kwargs)
+                    elif args:
+                        a["tool.arguments"] = _safe_io(args[0] if len(args) == 1 else list(args))
+                return a
+
+            if asyncio.iscoroutinefunction(fn):
+                @functools.wraps(fn)
+                async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                    attrs = _mk_attrs(args, kwargs)
+                    end, ctx = self.start_span(tool_name, attrs)
+                    token = _current_span.set(ctx)
+                    try:
+                        result = await fn(*args, **kwargs)
+                        if capture_io:
+                            attrs["tool.result"] = _safe_io(result)
+                        end("OK")
+                        return result
+                    except Exception as exc:
+                        attrs.update(_exc_attrs(exc))
+                        end("ERROR")
+                        raise
+                    finally:
+                        _current_span.reset(token)
+                return async_wrapper  # type: ignore[return-value]
+            else:
+                @functools.wraps(fn)
+                def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+                    attrs = _mk_attrs(args, kwargs)
+                    end, ctx = self.start_span(tool_name, attrs)
+                    token = _current_span.set(ctx)
+                    try:
+                        result = fn(*args, **kwargs)
+                        if capture_io:
+                            attrs["tool.result"] = _safe_io(result)
                         end("OK")
                         return result
                     except Exception as exc:

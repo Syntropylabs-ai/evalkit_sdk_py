@@ -26,7 +26,7 @@ class TestGroq(unittest.TestCase):
         self.assertEqual(llm[0].provider, "groq")
         self.assertEqual(llm[0].completion, "Groq fast response")
 
-    def test_groq_tool_call_span(self):
+    def test_groq_tool_call_event(self):
         from evalkit.instrumentation.auto import _patch_openai_class_sync
 
         class FakeGroqCompletions:
@@ -36,9 +36,12 @@ class TestGroq(unittest.TestCase):
         _patch_openai_class_sync(self.client, FakeGroqCompletions, provider="groq")
         FakeGroqCompletions().create(model="llama3-70b-8192", messages=[])
         self.client.flush()
+        # Client-side function tool -> event on the llm_call span, no child span.
+        llm = [e for e in self.captured if e.span_type == "llm_call"][0]
+        self.assertTrue(llm.events)
+        self.assertEqual(llm.events[0].attributes["gen_ai.tool.name"], "web_search")
         tools = [e for e in self.captured if e.span_type == "tool_call"]
-        self.assertEqual(len(tools), 1)
-        self.assertEqual(tools[0].operation, "web_search")
+        self.assertEqual(len(tools), 0)
 
 
 if __name__ == "__main__":

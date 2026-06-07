@@ -68,12 +68,45 @@ try:
     ...  # your work
 finally:
     end("ok")
+```
 
-# Or as a decorator
+## Tracing your own functions & tools (APM)
+
+Auto-instrumentation covers libraries (LLM / HTTP / DB). For **your** code, opt in
+with one decorator — a function, a tool, a whole class, or an entire module:
+
+```python
+import evalkit
+
+# One function -> function_call span (input / output / latency)
 @evalkit.trace_function()
 def do_work(x):
     return x * 2
+
+# One tool -> tool_call span (renders in the Input/Output panels + tool metrics)
+@evalkit.trace_tool()
+def search_web(query: str):
+    return run_search(query)
+
+# Every method of a class, APM-style
+@evalkit.traced
+class OrderService:
+    def place(self, order): ...
+    def cancel(self, id): ...
+
+# Every function defined in a module — one call
+import myapp.services as svc
+evalkit.trace_module(svc)
+
+# Or your WHOLE app at once (recurses every submodule) — any framework:
+import myapp
+evalkit.trace_package(myapp)
 ```
+
+> **Client-side tools you run yourself** only show their output if you wrap them with
+> `trace_tool` — the SDK sees the model's *request* but never your function's return
+> value. Server-side tools (OpenAI `web_search`, …) and LangChain tools are captured
+> automatically. Call `init()` before the decorated class/module is imported.
 
 ## SQLAlchemy
 

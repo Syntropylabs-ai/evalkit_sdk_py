@@ -11,7 +11,7 @@ from ...core.types import TraceEnvelope
 from ...utils.headers import make_traceparent, path_from_url, sanitize_headers
 
 _SKIP = {"/v1/ingest", "/health", "/healthz"}
-_BODY_MAX = 8192
+_BODY_MAX = 10 * 1024 * 1024  # default; overridden from client options at patch time
 
 
 def _should_skip(url: str) -> bool:
@@ -45,6 +45,8 @@ def _resp_body(resp: Any) -> Optional[str]:
 
 
 def patch_httpx(client: EvalKitClient) -> None:
+    global _BODY_MAX
+    _BODY_MAX = client._opts.max_body_bytes
     try:
         import httpx
     except ImportError:

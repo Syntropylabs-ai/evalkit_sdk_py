@@ -79,7 +79,7 @@ class TestClaudeAgentSDK(unittest.TestCase):
         self.assertEqual(attrs.get("gen_ai.finish_reason"), "end_turn")
         self.assertEqual(attrs.get("llm.num_turns"), "2")
 
-    def test_tool_events_and_child_span(self):
+    def test_tool_events_no_child_span(self):
         sdk = _install_sdk(self.client, [
             SDKAssistantMessage(text="", tool=("lookup_order", {"order_id": "ORD-1001"})),
             SDKResultMessage(),
@@ -90,9 +90,9 @@ class TestClaudeAgentSDK(unittest.TestCase):
         llm = [e for e in self.captured if e.span_type == "llm_call"][0]
         self.assertTrue(llm.events)
         self.assertEqual(llm.events[0].attributes["gen_ai.tool.name"], "lookup_order")
+        # Client-side tool: event only, no empty child span.
         tools = [e for e in self.captured if e.span_type == "tool_call"]
-        self.assertEqual(len(tools), 1)
-        self.assertEqual(tools[0].operation, "lookup_order")
+        self.assertEqual(len(tools), 0)
 
     def test_model_from_assistant_message(self):
         sdk = _install_sdk(self.client, [

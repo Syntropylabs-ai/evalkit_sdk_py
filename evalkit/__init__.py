@@ -78,6 +78,10 @@ __all__ = [
     "start_span",
     "with_trace",
     "trace_function",
+    "trace_tool",
+    "traced",
+    "trace_module",
+    "trace_package",
     "install_logging_handler",
     "EvalKitLoggingHandler",
     "EvalKitLogFilter",
@@ -106,6 +110,7 @@ def init(
     max_export_batch_size: int = 512,
     scheduled_delay_ms: int = 5000,
     max_queue_size: int = 4096,
+    max_body_bytes: int = 10 * 1024 * 1024,
     environment: Optional[str] = None,
     app_version: Optional[str] = None,
     device_id: Optional[str] = None,
@@ -122,6 +127,7 @@ def init(
         max_export_batch_size=max_export_batch_size,
         scheduled_delay_ms=scheduled_delay_ms,
         max_queue_size=max_queue_size,
+        max_body_bytes=max_body_bytes,
         environment=environment,
         app_version=app_version,
         device_id=device_id,
@@ -300,3 +306,127 @@ def trace_function(
     capture_io: bool = True,
 ) -> Callable:
     return _get_instance().trace_function(name, attributes, capture_io=capture_io)
+
+
+def trace_tool(
+    name: Optional[str] = None,
+    attributes: Optional[Dict[str, Any]] = None,
+    capture_io: bool = True,
+) -> Callable:
+    """Decorator that traces a function as a first-class ``tool_call`` span
+    (renders in the Input/Output panels and counts toward tool metrics). Use it
+    on your own client-side tools."""
+    return _get_instance().trace_tool(name, attributes, capture_io=capture_io)
+
+
+def traced(cls: Any = None, *, prefix: Optional[str] = None, capture_io: bool = True) -> Any:
+    """Class decorator — trace EVERY user-defined method of the class as a
+    function_call span, APM-style, without decorating each method:
+
+        @evalkit.traced
+        class OrderService:
+            def place(self, ...): ...
+            def cancel(self, ...): ...
+
+    Both ``@evalkit.traced`` and ``@evalkit.traced(prefix="orders")`` work.
+    Call ``init()`` before the class is defined.
+    """
+    def wrap(klass: Any) -> Any:
+        label = prefix or klass.__name__
+        for attr_name, member in list(vars(klass).items()):
+            if attr_name.startswith("__"):
+                continue
+            span_name = f"{label}.{attr_name}"
+            if isinstance(member, staticmethod):
+                fn = member.__func__
+                setattr(klass, attr_name, staticmethod(
+                    _get_instance().trace_function(span_name, capture_io=capture_io)(fn)))
+            elif isinstance(member, classmethod):
+                fn = member.__func__
+                setattr(klass, attr_name, classmethod(
+                    _get_instance().trace_function(span_name, capture_io=capture_io)(fn)))
+            elif callable(member):
+                setattr(klass, attr_name,
+                        _get_instance().trace_function(span_name, capture_io=capture_io)(member))
+        return klass
+    return wrap(cls) if cls is not None else wrap
+
+
+def trace_module(
+    module: Any,
+    *,
+    prefix: Optional[str] = None,
+    capture_io: bool = True,
+    include_private: bool = False,
+) -> int:
+    """Trace every function DEFINED IN ``module`` (in place), APM-style. One call
+    instruments all of your app's functions in a module:
+
+        import myapp.services as svc
+        evalkit.trace_module(svc)
+
+    Skips imported functions (only wraps those defined in the module) and, by
+    default, names starting with ``_``. Returns the number of functions wrapped.
+    """
+    import types as _types
+    inst = _get_instance()
+    mod_name = getattr(module, "__name__", "")
+    label = prefix or mod_name.split(".")[-1]
+    count = 0
+    for attr_name, member in list(vars(module).items()):
+        if not isinstance(member, _types.FunctionType):
+            continue
+        if getattr(member, "__module__", None) != mod_name:
+            continue  # only functions defined here, not imports
+        if not include_private and attr_name.startswith("_"):
+            continue
+        if getattr(member, "_evalkit_traced", False):
+            continue
+        wrapped = inst.trace_function(f"{label}.{attr_name}", capture_io=capture_io)(member)
+        try:
+            wrapped._evalkit_traced = True  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        setattr(module, attr_name, wrapped)
+        count += 1
+    return count
+
+
+def trace_package(
+    package: Any,
+    *,
+    prefix: Optional[str] = None,
+    capture_io: bool = True,
+    include_private: bool = False,
+) -> int:
+    """Recursively trace every function in every module of a package, APM-style.
+    Framework-agnostic — works for FastAPI / Flask / Django / any Python app:
+
+        import myapp
+        evalkit.trace_package(myapp)   # traces functions across all of myapp.*
+
+    Imports each submodule (so import side effects run) and wraps its functions
+    with trace_function. Returns the total number of functions wrapped.
+    """
+    import importlib
+    import pkgutil
+
+    total = trace_module(
+        package, prefix=prefix, capture_io=capture_io, include_private=include_private
+    )
+    pkg_path = getattr(package, "__path__", None)
+    pkg_name = getattr(package, "__name__", "")
+    if not pkg_path:
+        return total  # a plain module, not a package
+    for mod_info in pkgutil.walk_packages(pkg_path, prefix=pkg_name + "."):
+        try:
+            mod = importlib.import_module(mod_info.name)
+        except Exception:
+            continue
+        try:
+            total += trace_module(
+                mod, prefix=prefix, capture_io=capture_io, include_private=include_private
+            )
+        except Exception:
+            continue
+    return total

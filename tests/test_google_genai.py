@@ -43,15 +43,13 @@ class TestGoogleGenAI(unittest.TestCase):
         self.assertTrue(llm.events)
         self.assertEqual(llm.events[0].attributes["gen_ai.tool.name"], "get_weather")
 
-    def test_tool_call_child_span_emitted(self):
+    def test_client_side_tool_no_child_span(self):
+        # Client-side function tool -> event only, no empty zero-duration child span.
         m = install_fake_genai(self.client, response=GenAIResp(tool=("get_weather", {"city": "london"})))
         m.generate_content(model="g", contents="weather?")
         self.client.flush()
-        llm = [e for e in self.captured if e.span_type == "llm_call"][0]
         tools = [e for e in self.captured if e.span_type == "tool_call"]
-        self.assertEqual(len(tools), 1)
-        self.assertEqual(tools[0].operation, "get_weather")
-        self.assertEqual(tools[0].parent_span_id, llm.span_id)
+        self.assertEqual(len(tools), 0)
 
     def test_streaming(self):
         chunks = [GenAIResp(text="Hel"), GenAIResp(text="lo!", pin=0, pout=7)]

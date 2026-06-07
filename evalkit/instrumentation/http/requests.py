@@ -11,7 +11,7 @@ from ...core.types import TraceEnvelope
 from ...utils.headers import make_traceparent, path_from_url, sanitize_headers
 
 _SKIP = {"/v1/ingest", "/health", "/healthz"}
-_BODY_MAX = 4096
+_BODY_MAX = 10 * 1024 * 1024  # default; overridden from client options at patch time
 
 
 def _should_skip(url: str) -> bool:
@@ -20,6 +20,8 @@ def _should_skip(url: str) -> bool:
 
 def patch_requests(client: EvalKitClient) -> None:
     """Patch requests.Session.request to trace every outgoing HTTP call."""
+    global _BODY_MAX
+    _BODY_MAX = client._opts.max_body_bytes
     try:
         import requests
     except ImportError:

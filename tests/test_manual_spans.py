@@ -89,6 +89,114 @@ class TestManualSpans(unittest.TestCase):
         self.assertEqual(len(spans), 1)
         self.assertEqual(spans[0].status, "ERROR")
 
+    def test_trace_tool_emits_tool_call_span(self):
+        @self.client.trace_tool("search_web")
+        def search_web(query):
+            return {"results": [query]}
+
+        out = search_web("weather")
+        self.assertEqual(out, {"results": ["weather"]})
+        self.client.flush()
+        tools = [e for e in self.captured if e.span_type == "tool_call"]
+        self.assertEqual(len(tools), 1)
+        attrs = tools[0].attributes or {}
+        self.assertEqual(attrs.get("tool.name"), "search_web")
+        self.assertIn("tool.arguments", attrs)
+        self.assertIn("tool.result", attrs)
+        self.assertIn("weather", attrs["tool.result"])
+
+    def test_traced_class_decorator(self):
+        @evalkit.traced(prefix="svc")
+        class Service:
+            def place(self, n):
+                return n + 1
+
+            def cancel(self, n):
+                return n - 1
+
+        s = Service()
+        self.assertEqual(s.place(1), 2)
+        self.assertEqual(s.cancel(5), 4)
+        self.client.flush()
+        ops = {e.operation for e in self.captured if e.span_type == "function_call"}
+        self.assertIn("svc.place", ops)
+        self.assertIn("svc.cancel", ops)
+
+    def test_trace_module_wraps_only_own_functions(self):
+        import types as _types
+        import json as _json
+
+        mod = _types.ModuleType("ek_fake_svc")
+
+        def add(a, b):
+            return a + b
+
+        def mul(a, b):
+            return a * b
+
+        add.__module__ = "ek_fake_svc"
+        mul.__module__ = "ek_fake_svc"
+        mod.add = add
+        mod.mul = mul
+        mod.dumps = _json.dumps  # imported FunctionType -> must be skipped (different __module__)
+
+        count = evalkit.trace_module(mod)
+        self.assertEqual(count, 2, "should wrap only the 2 functions defined in this module")
+
+        # behaviour preserved
+        self.assertEqual(mod.add(2, 3), 5)
+        self.assertEqual(mod.mul(2, 3), 6)
+        self.client.flush()
+
+        fns = [e for e in self.captured if e.span_type == "function_call"]
+        ops = {e.operation for e in fns}
+        self.assertIn("ek_fake_svc.add", ops)
+        self.assertIn("ek_fake_svc.mul", ops)
+        self.assertNotIn("ek_fake_svc.dumps", ops)
+        # I/O captured on at least one
+        add_span = next(e for e in fns if e.operation == "ek_fake_svc.add")
+        self.assertIn("function.args", add_span.attributes or {})
+        self.assertIn("function.result", add_span.attributes or {})
+
+    def test_trace_package_recurses_real_submodules(self):
+        import os
+        import sys
+        import shutil
+        import tempfile
+
+        tmp = tempfile.mkdtemp()
+        pkgdir = os.path.join(tmp, "ek_fake_pkg")
+        os.makedirs(pkgdir)
+        with open(os.path.join(pkgdir, "__init__.py"), "w") as f:
+            f.write("")
+        with open(os.path.join(pkgdir, "services.py"), "w") as f:
+            f.write(
+                "def place(order):\n"
+                "    return {'placed': order}\n\n"
+                "def cancel(order_id):\n"
+                "    return order_id\n"
+            )
+        sys.path.insert(0, tmp)
+        try:
+            import ek_fake_pkg  # noqa: F401
+            n = evalkit.trace_package(ek_fake_pkg)
+            self.assertGreaterEqual(n, 2, "should wrap functions across the package's submodules")
+
+            import ek_fake_pkg.services as svc
+            # wrapping preserved behaviour
+            self.assertEqual(svc.place("o-1"), {"placed": "o-1"})
+            self.assertEqual(svc.cancel("c-1"), "c-1")
+            self.client.flush()
+
+            ops = {e.operation for e in self.captured if e.span_type == "function_call"}
+            self.assertIn("services.place", ops)
+            self.assertIn("services.cancel", ops)
+        finally:
+            sys.path.remove(tmp)
+            sys.modules.pop("ek_fake_pkg", None)
+            sys.modules.pop("ek_fake_pkg.services", None)
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_start_http_trace_attributes(self):
         tid, end, ctx = self.client.start_http_trace(
             "GET /api/data",

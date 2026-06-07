@@ -6,10 +6,12 @@ from ..core.client import EvalKitClient
 from ..core.context import _current_span
 from ..utils.headers import parse_traceparent, sanitize_headers
 
-_BODY_MAX = 4096
+_BODY_MAX = 10 * 1024 * 1024  # default; overridden from client options at instrument time
 
 
 def instrument_flask(app: Any, client: EvalKitClient) -> None:
+    global _BODY_MAX
+    _BODY_MAX = client._opts.max_body_bytes
     try:
         from flask import g, request as flask_request
     except ImportError:

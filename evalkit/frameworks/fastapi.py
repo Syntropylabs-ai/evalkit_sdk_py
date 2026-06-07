@@ -7,7 +7,7 @@ from ..core.client import EvalKitClient
 from ..core.context import SpanContext, _current_span
 from ..utils.headers import parse_traceparent, sanitize_headers
 
-_BODY_MAX = 4096
+_BODY_MAX = 10 * 1024 * 1024  # default; overridden from client options per request
 
 
 class EvalKitMiddleware:
@@ -34,6 +34,7 @@ class EvalKitMiddleware:
         return _ek._get_instance()
 
     async def __call__(self, scope: Any, receive: Callable, send: Callable) -> None:
+        global _BODY_MAX
         if scope["type"] not in ("http",):
             await self._app(scope, receive, send)
             return
@@ -43,6 +44,7 @@ class EvalKitMiddleware:
         except Exception:
             await self._app(scope, receive, send)
             return
+        _BODY_MAX = client._opts.max_body_bytes
         method = scope.get("method", "GET")
         path = scope.get("path", "/")
         query = scope.get("query_string", b"").decode()

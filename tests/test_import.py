@@ -4,7 +4,7 @@ from tests.helpers import evalkit
 
 class TestImport(unittest.TestCase):
     def test_version(self):
-        self.assertEqual(evalkit.__version__, "0.1.24")
+        self.assertEqual(evalkit.__version__, "0.1.25")
 
     def test_public_api(self):
         for name in (

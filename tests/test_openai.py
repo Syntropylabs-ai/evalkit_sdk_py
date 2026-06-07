@@ -30,15 +30,18 @@ class TestOpenAI(unittest.TestCase):
         self.assertEqual(llm[0].tokens_out, 8)
         self.assertEqual(llm[0].status, "OK")
 
-    def test_sync_tool_call_span(self):
+    def test_sync_tool_call_event(self):
+        # Client-side function tools surface as a gen_ai.tool.call event on the
+        # llm_call span (no result -> no child tool_call span; wrap execution for that).
         fc = install_fake_openai_sync(self.client, OResp(tool=("search", '{"q":"weather"}')))
         fc.create(model="gpt-4o", messages=[{"role": "user", "content": "weather?"}])
         self.client.flush()
         llm = [e for e in self.captured if e.span_type == "llm_call"]
+        self.assertEqual(len(llm), 1)
+        self.assertTrue(llm[0].events)
+        self.assertEqual(llm[0].events[0].attributes["gen_ai.tool.name"], "search")
         tools = [e for e in self.captured if e.span_type == "tool_call"]
-        self.assertEqual(len(tools), 1)
-        self.assertEqual(tools[0].operation, "search")
-        self.assertEqual(tools[0].parent_span_id, llm[0].span_id)
+        self.assertEqual(len(tools), 0, "client-side tool must not emit an empty child span")
 
     def test_sync_error_emits_error_span(self):
         from evalkit.instrumentation.auto import _patch_openai_class_sync
@@ -116,14 +119,17 @@ class TestOpenAIResponsesAPI(unittest.TestCase):
         self.assertEqual(llm[0].tokens_in, 6)
         self.assertEqual(llm[0].tokens_out, 9)
 
-    def test_responses_tool_call_span(self):
+    def test_responses_tool_call_event(self):
+        # A function_call output item is a client-side tool (no result) -> event only.
         resp = ORespResult(tool=("get_weather", '{"city":"Paris"}'))
         fc = install_fake_openai_responses_sync(self.client, resp)
         fc.create(model="gpt-4o", input="Weather in Paris?")
         self.client.flush()
+        llm = [e for e in self.captured if e.span_type == "llm_call"][0]
+        self.assertTrue(llm.events)
+        self.assertEqual(llm.events[0].attributes["gen_ai.tool.name"], "get_weather")
         tools = [e for e in self.captured if e.span_type == "tool_call"]
-        self.assertEqual(len(tools), 1)
-        self.assertEqual(tools[0].operation, "get_weather")
+        self.assertEqual(len(tools), 0)
 
 
 if __name__ == "__main__":

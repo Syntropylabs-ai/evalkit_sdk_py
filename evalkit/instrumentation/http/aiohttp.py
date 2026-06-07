@@ -10,7 +10,7 @@ from ...core.context import _current_span, get_or_create_ambient_trace_id
 from ...core.types import TraceEnvelope
 from ...utils.headers import make_traceparent, path_from_url, sanitize_headers
 
-_BODY_MAX = 8192
+_BODY_MAX = 10 * 1024 * 1024  # default; overridden from client options at patch time
 _SKIP = {"/v1/ingest", "/health", "/healthz"}
 
 
@@ -20,6 +20,8 @@ def _should_skip(url: str) -> bool:
 
 def patch_aiohttp(client: EvalKitClient) -> None:
     """Patch aiohttp.ClientSession._request to trace every outgoing HTTP call."""
+    global _BODY_MAX
+    _BODY_MAX = client._opts.max_body_bytes
     try:
         import aiohttp
     except ImportError:

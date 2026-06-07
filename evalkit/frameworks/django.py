@@ -7,7 +7,7 @@ from ..core.client import EvalKitClient
 from ..core.context import _current_span
 from ..utils.headers import parse_traceparent
 
-_BODY_MAX = 4096
+_BODY_MAX = 10 * 1024 * 1024  # default; overridden from client options per request
 
 _SENSITIVE_META = {
     "HTTP_AUTHORIZATION", "HTTP_COOKIE", "HTTP_X_API_KEY",
@@ -55,9 +55,11 @@ class EvalKitDjangoMiddleware:
         return self._client
 
     def __call__(self, request: Any) -> Any:
+        global _BODY_MAX
         # Tracing setup must never break the request — fall back to untraced.
         try:
             client = self._get_client()
+            _BODY_MAX = client._opts.max_body_bytes
 
             method = request.method or "GET"
             path = request.path or "/"
