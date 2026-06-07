@@ -65,6 +65,7 @@ def _exc_attrs(exc: BaseException) -> Dict[str, Any]:
 
 class EvalKitClient:
     def __init__(self, opts: EvalKitOptions) -> None:
+        import atexit
         self._opts = opts
         self._exporter = _Exporter(opts)
         self._queue: List[TraceEnvelope] = []
@@ -73,6 +74,7 @@ class EvalKitClient:
         self._flush_now = threading.Event()
         self._thread = threading.Thread(target=self._flush_loop, daemon=True)
         self._thread.start()
+        atexit.register(self.flush)
 
     def _meta_attrs(self) -> Dict[str, Any]:
         attrs: Dict[str, Any] = {"evalkit.sdk_version": SDK_VERSION}

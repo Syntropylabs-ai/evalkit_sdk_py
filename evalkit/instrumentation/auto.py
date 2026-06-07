@@ -975,7 +975,8 @@ def _patch_openai_responses_sync(ek: "EvalKitClient", cls) -> None:
                                     tokens_out_box[0] = getattr(usage, "output_tokens", 0) or 0
                                     end_ts3 = _now_iso()
                                     for item in getattr(resp, "output", []):
-                                        if getattr(item, "type", None) == "function_call":
+                                        itype = getattr(item, "type", None)
+                                        if itype == "function_call":
                                             tool_events_box.append(SpanEvent(
                                                 name="gen_ai.tool.call", timestamp=end_ts3,
                                                 attributes={
@@ -984,9 +985,30 @@ def _patch_openai_responses_sync(ek: "EvalKitClient", cls) -> None:
                                                     "gen_ai.tool.call.arguments": getattr(item, "arguments", ""),
                                                 },
                                             ))
+                                        elif itype and itype.endswith("_call"):
+                                            action = getattr(item, "action", None)
+                                            q = (getattr(action, "query", "") or "") if action else ""
+                                            tool_events_box.append(SpanEvent(
+                                                name="gen_ai.tool.call", timestamp=end_ts3,
+                                                attributes={
+                                                    "gen_ai.tool.call.id": getattr(item, "id", ""),
+                                                    "gen_ai.tool.name": itype[:-5],
+                                                    "gen_ai.tool.call.arguments": q,
+                                                },
+                                            ))
                             yield event
                     finally:
                         _emit_responses_span()
+
+                def __enter__(self_inner):
+                    if hasattr(raw_stream, "__enter__"):
+                        raw_stream.__enter__()
+                    return self_inner
+
+                def __exit__(self_inner, exc_type, exc_val, exc_tb):
+                    _emit_responses_span()
+                    if hasattr(raw_stream, "__exit__"):
+                        return raw_stream.__exit__(exc_type, exc_val, exc_tb)
 
                 def __getattr__(self_inner, name):
                     return getattr(raw_stream, name)
@@ -1023,13 +1045,25 @@ def _patch_openai_responses_sync(ek: "EvalKitClient", cls) -> None:
             total_tokens = getattr(usage, "total_tokens", 0) or 0
             events = []
             for item in getattr(result, "output", []):
-                if getattr(item, "type", None) == "function_call":
+                itype = getattr(item, "type", None)
+                if itype == "function_call":
                     events.append(SpanEvent(
                         name="gen_ai.tool.call", timestamp=end_ts,
                         attributes={
                             "gen_ai.tool.call.id": getattr(item, "call_id", "") or getattr(item, "id", ""),
                             "gen_ai.tool.name": getattr(item, "name", ""),
                             "gen_ai.tool.call.arguments": getattr(item, "arguments", ""),
+                        },
+                    ))
+                elif itype and itype.endswith("_call"):
+                    action = getattr(item, "action", None)
+                    q = (getattr(action, "query", "") or "") if action else ""
+                    events.append(SpanEvent(
+                        name="gen_ai.tool.call", timestamp=end_ts,
+                        attributes={
+                            "gen_ai.tool.call.id": getattr(item, "id", ""),
+                            "gen_ai.tool.name": itype[:-5],
+                            "gen_ai.tool.call.arguments": q,
                         },
                     ))
             ek.enqueue(TraceEnvelope(
