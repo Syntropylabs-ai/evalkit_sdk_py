@@ -93,19 +93,9 @@ def _patch_openai_class_sync(ek: "EvalKitClient", cls, provider: str = "openai")
             _current_span.reset(token)
         end_ts = _now_iso()
         latency = int(time.time() * 1000 - start_ms)
-        # Trace extraction must NEVER break the caller's request. Some callers
-        # (e.g. litellm via `chat.completions.with_raw_response.create`) get back a
-        # LegacyAPIResponse / APIResponse (openai SDK v2) with no `.choices`.
-        # Try to parse it before giving up so we still emit a span.
+       
         if not hasattr(result, "choices"):
-            try:
-                parsed = result.parse()
-                if hasattr(parsed, "choices"):
-                    result = parsed
-                else:
-                    return result
-            except Exception:
-                return result
+            return result
         try:
             choice = result.choices[0] if result.choices else None
             completion = (choice.message.content or "") if choice else ""
@@ -199,19 +189,8 @@ def _patch_openai_class_async(ek: "EvalKitClient", cls, provider: str = "openai"
             _current_span.reset(token)
         end_ts = _now_iso()
         latency = int(time.time() * 1000 - start_ms)
-        # Trace extraction must NEVER break the caller's request. Some callers
-        # (e.g. litellm via `chat.completions.with_raw_response.create`) get back a
-        # LegacyAPIResponse / APIResponse (openai SDK v2) with no `.choices`.
-        # Try to parse it before giving up so we still emit a span.
         if not hasattr(result, "choices"):
-            try:
-                parsed = result.parse()
-                if hasattr(parsed, "choices"):
-                    result = parsed
-                else:
-                    return result
-            except Exception:
-                return result
+            return result
         try:
             choice = result.choices[0] if result.choices else None
             completion = (choice.message.content or "") if choice else ""

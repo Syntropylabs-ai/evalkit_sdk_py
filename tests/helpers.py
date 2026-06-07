@@ -23,6 +23,7 @@ def fresh(capture: list):
             subscription_key="tk_test",
             base_url="http://127.0.0.1:1",
             service_name="test",
+            function_tracing=False,  # don't install the import hook during tests
         )
     _CLIENT._exporter.export = lambda batch: (capture.extend(batch), True)[1]
     return _CLIENT

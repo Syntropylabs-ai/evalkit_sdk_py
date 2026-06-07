@@ -72,8 +72,27 @@ finally:
 
 ## Tracing your own functions & tools (APM)
 
-Auto-instrumentation covers libraries (LLM / HTTP / DB). For **your** code, opt in
-with one decorator — a function, a tool, a whole class, or an entire module:
+**Function tracing is automatic.** `init()` traces every function in your app's own
+source tree (the directory of the file that called `init()`) as each module imports —
+one `function_call` span per call, input/output/latency, no per-module wiring.
+Third-party libraries are never wrapped; only module-level functions are (class
+methods are left alone), and signatures are preserved so framework introspection
+(FastAPI `Depends`, etc.) keeps working.
+
+```python
+# Nothing to wire — just init():
+evalkit.init(subscription_key="tk_live_…", service_name="my-api")
+# every function your app defines is now traced as it imports.
+
+# Disable it:
+#   EVALKIT_FUNCTION_TRACE=false        (env)
+#   evalkit.init(..., function_tracing=False)
+# Trace extra sibling packages outside the caller's dir:
+#   evalkit.init(..., trace_packages=["support_bot", "workers"])
+```
+
+For finer control you can still **opt in explicitly** — a function, a tool, a whole
+class, or a module/package:
 
 ```python
 import evalkit

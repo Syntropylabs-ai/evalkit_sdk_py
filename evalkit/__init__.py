@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, Generator, Optional, Tuple
+from typing import Any, Callable, Dict, Generator, List, Optional, Tuple
 
 from ._version import SDK_VERSION
 from .core.client import EvalKitClient
@@ -114,6 +115,8 @@ def init(
     environment: Optional[str] = None,
     app_version: Optional[str] = None,
     device_id: Optional[str] = None,
+    function_tracing: bool = True,
+    trace_packages: Optional[List[str]] = None,
 ) -> EvalKitClient:
     global _instance
     if _instance is not None:
@@ -135,7 +138,37 @@ def init(
     _instance = EvalKitClient(opts)
     from .instrumentation.auto import setup_auto_instrumentation
     setup_auto_instrumentation(_instance)
+
+    # Automatic function tracing (APM): trace your app's own functions as they are
+    # imported — no per-module wiring. On by default; disable with
+    # EVALKIT_FUNCTION_TRACE=false or init(function_tracing=False).
+    if function_tracing and os.environ.get("EVALKIT_FUNCTION_TRACE", "true") != "false":
+        try:
+            _install_function_tracing(_instance, trace_packages)
+        except Exception:
+            pass  # instrumentation must never break init()
     return _instance
+
+
+def _install_function_tracing(client: EvalKitClient, trace_packages: Optional[List[str]]) -> None:
+    """Resolve the caller's source directory and install the import-time tracer."""
+    import inspect
+
+    from .instrumentation.functrace import install_function_tracer
+
+    root_dir: Optional[str] = None
+    for frame_info in inspect.stack()[1:]:
+        mod = inspect.getmodule(frame_info.frame)
+        name = getattr(mod, "__name__", "") or ""
+        if name.startswith("evalkit"):
+            continue
+        f = frame_info.filename
+        if f and os.path.isfile(f):
+            root_dir = os.path.dirname(os.path.realpath(f))
+            break
+    if not root_dir:
+        root_dir = os.getcwd()
+    install_function_tracer(client, root_dir, extra_packages=trace_packages or ())
 
 
 def auto_instrument(
