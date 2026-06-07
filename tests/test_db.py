@@ -296,6 +296,57 @@ class TestPyMongo(unittest.TestCase):
         self.assertEqual(db[0].attributes.get("db.sql.table"), "orders")
 
 
+class TestAsyncSQLAlchemy(unittest.TestCase):
+    def setUp(self):
+        reset_context()
+        self.captured = []
+        self.client = fresh(self.captured)
+
+    def test_async_sqlalchemy_engine_db_query(self):
+        try:
+            from sqlalchemy.ext.asyncio import create_async_engine
+        except ImportError:
+            self.skipTest("sqlalchemy[asyncio] not installed")
+
+        async def run():
+            engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+            evalkit.patch_async_sqlalchemy_engine(engine)
+            tid, end, ctx = self.client.start_trace("async-req")
+            with evalkit.with_trace(ctx):
+                async with engine.begin() as conn:
+                    from sqlalchemy import text
+                    await conn.execute(text("SELECT 1"))
+            end("OK")
+            await engine.dispose()
+
+        try:
+            asyncio.run(run())
+        except Exception as exc:
+            # aiosqlite may not be installed — skip gracefully
+            if "aiosqlite" in str(exc) or "No module" in str(exc):
+                self.skipTest("aiosqlite not installed")
+            raise
+
+        self.client.flush()
+        db = [e for e in self.captured if e.span_type == "db_query"]
+        self.assertTrue(db, "expected a db_query span from async engine")
+        self.assertIn("db.statement", db[0].attributes)
+
+    def test_patch_async_engine_idempotent(self):
+        from evalkit.instrumentation.db.sqlalchemy import patch_sqlalchemy_async
+
+        # Simulate an already-instrumented async engine: the guard must bail out
+        # without calling patch_sqlalchemy (which requires a real Engine target).
+        class FakeAsyncEngine:
+            _evalkit_instrumented = True  # pre-set — already patched
+            sync_engine = None  # would be None if guard somehow missed
+
+        engine = FakeAsyncEngine()
+        # Must not raise even though sync_engine is None
+        patch_sqlalchemy_async(self.client, engine)
+        self.assertTrue(engine._evalkit_instrumented)
+
+
 class TestDBNoCrash(unittest.TestCase):
     def setUp(self):
         reset_context()

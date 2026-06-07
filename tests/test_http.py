@@ -89,5 +89,64 @@ class TestHttpxHTTP(unittest.TestCase):
         self.assertEqual(http[0].trace_id, tid)
 
 
+class TestAiohttpHTTP(unittest.TestCase):
+    def setUp(self):
+        reset_context()
+        self.captured = []
+        self.client = fresh(self.captured)
+
+    def test_aiohttp_emits_http_call_span(self):
+        try:
+            import aiohttp
+        except ImportError:
+            self.skipTest("aiohttp not installed")
+
+        from evalkit.instrumentation.http.aiohttp import patch_aiohttp
+        patch_aiohttp(self.client)
+
+        srv = _start_server()
+        port = srv.server_address[1]
+
+        async def run():
+            tid, end, ctx = self.client.start_trace("aiohttp-req")
+            with evalkit.with_trace(ctx):
+                async with aiohttp.ClientSession() as sess:
+                    async with sess.get(f"http://127.0.0.1:{port}/test") as resp:
+                        await resp.read()
+            end("OK")
+            return tid
+
+        try:
+            tid = asyncio.run(run())
+        finally:
+            srv.shutdown()
+
+        self.client.flush()
+        http = [
+            e for e in self.captured
+            if e.span_type == "http_call" and "127.0.0.1" in (e.attributes or {}).get("http.url", "")
+        ]
+        self.assertTrue(http, "expected an http_call span from aiohttp")
+        self.assertEqual(http[0].trace_id, tid)
+        self.assertIn("http.method", http[0].attributes)
+        self.assertEqual(http[0].attributes["http.status_code"], 200)
+
+    def test_aiohttp_patch_idempotent(self):
+        try:
+            import aiohttp
+        except ImportError:
+            self.skipTest("aiohttp not installed")
+
+        from evalkit.instrumentation.http.aiohttp import patch_aiohttp
+        orig = aiohttp.ClientSession._request
+        patch_aiohttp(self.client)
+        patched_once = aiohttp.ClientSession._request
+        patch_aiohttp(self.client)
+        # second call must be a no-op — same function object
+        self.assertIs(aiohttp.ClientSession._request, patched_once)
+        # cleanup
+        aiohttp.ClientSession._request = orig
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

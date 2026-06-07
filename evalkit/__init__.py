@@ -26,8 +26,9 @@ from .instrumentation.llm.claude_agent_sdk import patch_claude_agent_sdk as _pat
 
 from .instrumentation.http.requests import patch_requests
 from .instrumentation.http.httpx import patch_httpx
+from .instrumentation.http.aiohttp import patch_aiohttp as _patch_aiohttp
 
-from .instrumentation.db.sqlalchemy import patch_sqlalchemy
+from .instrumentation.db.sqlalchemy import patch_sqlalchemy, patch_sqlalchemy_async
 
 from .instrumentation.runtime.logging import EvalKitLoggingHandler, EvalKitLogFilter, install_logging_handler
 
@@ -56,6 +57,7 @@ __all__ = [
     "EvalKitDjangoMiddleware",
     "create_litestar_middleware",
     "patch_sqlalchemy_engine",
+    "patch_async_sqlalchemy_engine",
     "patch_openai_client",
     "patch_anthropic_client",
     "patch_bedrock_client",
@@ -154,6 +156,10 @@ def instrument_flask(app: Any) -> None:
 
 def patch_sqlalchemy_engine(engine: Any) -> None:
     patch_sqlalchemy(_get_instance(), engine)
+
+
+def patch_async_sqlalchemy_engine(async_engine: Any) -> None:
+    patch_sqlalchemy_async(_get_instance(), async_engine)
 
 
 def patch_openai_client(

@@ -132,3 +132,20 @@ def patch_sqlalchemy(client: EvalKitClient, engine: Any) -> None:
         ))
 
     engine._evalkit_instrumented = True
+
+
+def patch_sqlalchemy_async(client: EvalKitClient, async_engine: Any) -> None:
+    """
+    Instrument an async SQLAlchemy engine (created with create_async_engine).
+
+    Delegates to patch_sqlalchemy on the underlying sync engine — SQLAlchemy's
+    cursor-level events fire synchronously inside greenlet_spawn even for async
+    drivers, so this captures all queries including those from AsyncSession.
+    """
+    if getattr(async_engine, "_evalkit_instrumented", False):
+        return
+    sync_engine = getattr(async_engine, "sync_engine", None)
+    if sync_engine is None:
+        return
+    patch_sqlalchemy(client, sync_engine)
+    async_engine._evalkit_instrumented = True

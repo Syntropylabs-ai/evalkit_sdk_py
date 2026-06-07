@@ -45,15 +45,29 @@ def create_litestar_middleware(client: "EvalKitClient | None" = None) -> Any:
             if tp:
                 upstream_trace_id, upstream_span_id = parse_traceparent(tp)
 
-            first_msg = await receive()
-            first_body = first_msg.get("body", b"")
-            first_msg_consumed = False
+            _chunks: list[bytes] = []
+            _msgs: list[Any] = []
+            _total_len = 0
+            while True:
+                _msg = await receive()
+                _msgs.append(_msg)
+                _chunk = _msg.get("body", b"")
+                if _chunk and _total_len < _BODY_MAX:
+                    _take = _BODY_MAX - _total_len
+                    _chunks.append(_chunk[:_take])
+                    _total_len += len(_chunk)
+                if not _msg.get("more_body", False):
+                    break
+            first_body = b"".join(_chunks)
+
+            _msg_idx = 0
 
             async def receive_replay() -> Any:
-                nonlocal first_msg_consumed
-                if not first_msg_consumed:
-                    first_msg_consumed = True
-                    return first_msg
+                nonlocal _msg_idx
+                if _msg_idx < len(_msgs):
+                    m = _msgs[_msg_idx]
+                    _msg_idx += 1
+                    return m
                 return await receive()
 
             body_json: Any = None

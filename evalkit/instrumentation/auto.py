@@ -1152,6 +1152,7 @@ def setup_auto_instrumentation(
     logging: bool = True,
     requests: bool = True,
     httpx: bool = True,
+    aiohttp: bool = True,
 ) -> None:
     try:
         from .runtime.threads import patch_threads
@@ -1175,6 +1176,12 @@ def setup_auto_instrumentation(
         try:
             from .http.httpx import patch_httpx
             patch_httpx(client)
+        except Exception:
+            pass
+    if aiohttp:
+        try:
+            from .http.aiohttp import patch_aiohttp
+            patch_aiohttp(client)
         except Exception:
             pass
 
