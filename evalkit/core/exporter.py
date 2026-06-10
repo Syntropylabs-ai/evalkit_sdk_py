@@ -5,7 +5,7 @@ import logging
 import time
 import urllib.error
 import urllib.request
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from .types import EvalKitOptions, TraceEnvelope
 
@@ -16,6 +16,66 @@ _log = logging.getLogger("evalkit")
 # disables itself. An invalid subscription key never becomes valid by retrying,
 # so hammering the ingest endpoint every flush just spams logs and wastes CPU.
 _AUTH_FAIL_LIMIT = 3
+
+# Hard ceiling on a single span's serialized size, kept under Kafka's default
+# 1 MiB message limit. An oversized span (e.g. a captured base64 image body from
+# an image-generation response) is trimmed — and dropped if still too big —
+# instead of being sent and rejected with "Message Size Too Large". Tracing must
+# never ship a payload the backend can't accept.
+_MAX_SPAN_BYTES = 900 * 1024
+
+
+def _event_size(d: Dict[str, Any]) -> int:
+    try:
+        return len(json.dumps(d))
+    except Exception:
+        return _MAX_SPAN_BYTES + 1
+
+
+def _fit_event(d: Dict[str, Any], limit: int = _MAX_SPAN_BYTES) -> Optional[Dict[str, Any]]:
+    """Trim a span dict to <= limit bytes so it can always be ingested. Drops the
+    heaviest fields first (raw HTTP/GenAI bodies → prompt/completion → every large
+    string attribute); returns None to skip the span if even a metadata-only
+    skeleton won't fit."""
+    if _event_size(d) <= limit:
+        return d
+
+    def note(n: int) -> str:
+        return f"…[dropped {n} bytes — exceeded trace span size limit]"
+
+    attrs = d.get("attributes")
+    if isinstance(attrs, dict):
+        for k in ("http.response.body", "http.request.body", "gen_ai.response.body",
+                  "gen_ai.request.body", "response.body", "request.body"):
+            v = attrs.get(k)
+            if isinstance(v, str) and len(v) > 1024:
+                attrs[k] = note(len(v))
+    if _event_size(d) <= limit:
+        return d
+
+    for k in ("prompt", "completion"):
+        v = d.get(k)
+        if isinstance(v, str) and len(v) > 1024:
+            d[k] = note(len(v))
+    sm = d.get("statusMessage")
+    if isinstance(sm, str) and len(sm) > 4096:
+        d["statusMessage"] = sm[:4096]
+    if _event_size(d) <= limit:
+        return d
+
+    if isinstance(attrs, dict):
+        for k, v in list(attrs.items()):
+            if isinstance(v, str) and len(v) > 512:
+                attrs[k] = v[:512] + "…"
+    if _event_size(d) <= limit:
+        return d
+
+    # Last resort: metadata-only skeleton.
+    d["attributes"] = {"trace.truncated": True}
+    d.pop("events", None)
+    d.pop("prompt", None)
+    d.pop("completion", None)
+    return d if _event_size(d) <= limit else None
 
 
 class _Exporter:
@@ -29,8 +89,17 @@ class _Exporter:
     def export(self, envelopes: List[TraceEnvelope]) -> bool:
         if self._disabled:
             return False
-        body = json.dumps({"events": [e.to_dict() for e in envelopes]}).encode()
-        return self._fetch_with_retry(body, len(envelopes))
+        # Trim/drop oversized spans so we never POST a payload Kafka will reject
+        # with "Message Size Too Large" (e.g. a multi-MB base64 image body).
+        events = []
+        for e in envelopes:
+            fitted = _fit_event(e.to_dict())
+            if fitted is not None:
+                events.append(fitted)
+        if not events:
+            return True
+        body = json.dumps({"events": events}).encode()
+        return self._fetch_with_retry(body, len(events))
 
     def _on_auth_failure(self, code: int, detail: str) -> None:
         self._auth_failures += 1
