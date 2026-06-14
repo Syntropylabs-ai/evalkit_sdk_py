@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional
 
 from ..._version import SDK_VERSION
 from ...core.client import EvalKitClient, _new_span_id, _now_iso
-from ...core.context import _current_span, get_or_create_ambient_trace_id
+from ...core.context import _current_span, _in_http_span, get_or_create_ambient_trace_id
 from ...core.types import TraceEnvelope
 from ...utils.headers import make_traceparent, path_from_url, sanitize_headers
 
@@ -60,6 +60,12 @@ def patch_httpx(client: EvalKitClient) -> None:
             if _should_skip(url):
                 return _orig_sync(self, request, **kwargs)
 
+            # If an outer HTTP instrumentation is already tracing this call (one
+            # client delegating to another — e.g. httpx → aiohttp transport), don't
+            # emit a second http_call span for the same network request.
+            if _in_http_span.get():
+                return _orig_sync(self, request, **kwargs)
+
             ctx = _current_span.get()
             trace_id = ctx.trace_id if ctx else get_or_create_ambient_trace_id()
             parent_span_id = ctx.span_id if ctx else None
@@ -74,9 +80,11 @@ def patch_httpx(client: EvalKitClient) -> None:
                 pass
             req_headers = sanitize_headers(dict(request.headers))
 
+            _http_token = _in_http_span.set(True)
             try:
                 resp = _orig_sync(self, request, **kwargs)
             except Exception as e:
+                _in_http_span.reset(_http_token)
                 end_ts = _now_iso()
                 _emit_http_span(
                     client, trace_id, parent_span_id, span_id, method, url, None, str(e),
@@ -84,6 +92,7 @@ def patch_httpx(client: EvalKitClient) -> None:
                     req_headers=req_headers, req_body=_req_body(request),
                 )
                 raise
+            _in_http_span.reset(_http_token)
 
             end_ts = _now_iso()
             resp_headers = sanitize_headers(dict(resp.headers))
@@ -106,6 +115,11 @@ def patch_httpx(client: EvalKitClient) -> None:
             if _should_skip(url):
                 return await _orig_async(self, request, **kwargs)
 
+            # See traced_sync_send: skip if an outer HTTP wrapper is already tracing
+            # this call (e.g. litellm routes httpx through its aiohttp transport).
+            if _in_http_span.get():
+                return await _orig_async(self, request, **kwargs)
+
             ctx = _current_span.get()
             trace_id = ctx.trace_id if ctx else get_or_create_ambient_trace_id()
             parent_span_id = ctx.span_id if ctx else None
@@ -120,9 +134,11 @@ def patch_httpx(client: EvalKitClient) -> None:
                 pass
             req_headers = sanitize_headers(dict(request.headers))
 
+            _http_token = _in_http_span.set(True)
             try:
                 resp = await _orig_async(self, request, **kwargs)
             except Exception as e:
+                _in_http_span.reset(_http_token)
                 end_ts = _now_iso()
                 _emit_http_span(
                     client, trace_id, parent_span_id, span_id, method, url, None, str(e),
@@ -130,6 +146,7 @@ def patch_httpx(client: EvalKitClient) -> None:
                     req_headers=req_headers, req_body=_req_body(request),
                 )
                 raise
+            _in_http_span.reset(_http_token)
 
             end_ts = _now_iso()
             resp_headers = sanitize_headers(dict(resp.headers))

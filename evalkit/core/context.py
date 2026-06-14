@@ -17,6 +17,13 @@ _current_span: ContextVar[Optional[SpanContext]] = ContextVar(
     "evalkit_span", default=None
 )
 
+# True while an HTTP instrumentation (httpx/aiohttp/requests) is already tracing a
+# call on this execution context. Some HTTP clients delegate to another under the
+# hood — e.g. litellm routes the OpenAI SDK's httpx client through a custom aiohttp
+# transport — which would otherwise emit TWO http_call spans for ONE network call.
+# The outermost HTTP wrapper sets this; nested wrappers see it and skip emitting.
+_in_http_span: ContextVar[bool] = ContextVar("evalkit_in_http_span", default=False)
+
 
 @dataclass
 class SimulationContext:

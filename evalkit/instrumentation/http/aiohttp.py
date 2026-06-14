@@ -6,7 +6,7 @@ from typing import Any, Optional
 
 from ..._version import SDK_VERSION
 from ...core.client import EvalKitClient, _new_span_id, _now_iso
-from ...core.context import _current_span, get_or_create_ambient_trace_id
+from ...core.context import _current_span, _in_http_span, get_or_create_ambient_trace_id
 from ...core.types import TraceEnvelope
 from ...utils.headers import make_traceparent, path_from_url, sanitize_headers
 
@@ -42,6 +42,12 @@ def patch_aiohttp(client: EvalKitClient) -> None:
         if _should_skip(url):
             return await orig_request(self, method, str_or_url, **kwargs)
 
+        # Skip if an outer HTTP wrapper already traced this call — e.g. litellm
+        # routes the OpenAI SDK's httpx client through this aiohttp transport, so
+        # the httpx wrapper already emitted the span for this same request.
+        if _in_http_span.get():
+            return await orig_request(self, method, str_or_url, **kwargs)
+
         ctx = _current_span.get()
         trace_id = ctx.trace_id if ctx else get_or_create_ambient_trace_id()
         parent_span_id: Optional[str] = ctx.span_id if ctx else None
@@ -67,9 +73,11 @@ def patch_aiohttp(client: EvalKitClient) -> None:
             if isinstance(d, (str, bytes)):
                 req_body = (d if isinstance(d, str) else d.decode("utf-8", errors="replace"))[:_BODY_MAX]
 
+        _http_token = _in_http_span.set(True)
         try:
             resp = await orig_request(self, method, str_or_url, **kwargs)
         except Exception as e:
+            _in_http_span.reset(_http_token)
             end_ts = _now_iso()
             latency = int(time.time() * 1000 - start_ms)
             attrs: dict = {
@@ -92,6 +100,7 @@ def patch_aiohttp(client: EvalKitClient) -> None:
                 app_version=client._opts.app_version, sdk_version=SDK_VERSION,
             ))
             raise
+        _in_http_span.reset(_http_token)
 
         end_ts = _now_iso()
         latency = int(time.time() * 1000 - start_ms)
