@@ -33,6 +33,9 @@ def generate_scenarios(
     provider: Optional[str] = None,
     api_key: Optional[str] = None,
     temperature: Optional[float] = None,
+    reasoning_effort: Optional[str] = None,
+    max_completion_tokens: Optional[int] = None,
+    max_tokens: Optional[int] = None,
     api_url: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     from .. import _get_instance
@@ -59,6 +62,12 @@ def generate_scenarios(
         body["apiKey"] = api_key
     if temperature is not None:
         body["temperature"] = temperature
+    if reasoning_effort is not None:
+        body["reasoningEffort"] = reasoning_effort
+    if max_completion_tokens is not None:
+        body["maxCompletionTokens"] = max_completion_tokens
+    if max_tokens is not None:
+        body["maxTokens"] = max_tokens
 
     url = base + "/scenarios/generate"
     payload = json.dumps(body, default=str)

@@ -9,7 +9,7 @@ from .core.client import EvalKitClient
 from .core.context import SpanContext, _current_span, get_or_create_ambient_trace_id
 from .core.types import EvalKitOptions, SpanEvent, TraceEnvelope
 from .evaluate import evaluate
-from .simulation import AgentTurnResult, SimContext, generate_scenarios, simulate_user, with_simulation
+from .simulation import AgentTurnResult, SimContext, evaluate_simulation, generate_scenarios, simulate_user, with_simulation
 
 from .instrumentation.llm.openai import patch_openai
 from .instrumentation.llm.openai_async import patch_async_openai
@@ -49,6 +49,7 @@ __all__ = [
     "evaluate",
     "generate_scenarios",
     "simulate_user",
+    "evaluate_simulation",
     "with_simulation",
     "SimContext",
     "AgentTurnResult",

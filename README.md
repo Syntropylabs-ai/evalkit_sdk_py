@@ -1,47 +1,57 @@
-# EvalKit Python SDK
+# EvalKit — Python SDK
 
-LLM observability and tracing for Python apps. One `init()` call auto-instruments
-your LLM clients, HTTP calls, database queries, and logging — then streams traces to
+Tracing and evaluation for LLM apps. A single `init()` call auto-instruments your
+LLM clients, HTTP calls, database queries, and logging, then streams traces to
 [Syntropy Labs](https://syntropylabs.ai).
-
-## Installation
 
 ```bash
 pip install syntropylabs-evalkit
 ```
 
-Optional provider extras:
+> Installs as `syntropylabs-evalkit`; you import it as `evalkit`.
 
-```bash
-pip install "syntropylabs-evalkit[openai]"      # OpenAI
-pip install "syntropylabs-evalkit[anthropic]"   # Anthropic
-pip install "syntropylabs-evalkit[all]"         # everything
-```
+## Contents
 
-> The PyPI package is `syntropylabs-evalkit`, but you import it as `evalkit`.
+- [Quick start](#quick-start)
+- [What gets traced](#what-gets-traced)
+- [Web frameworks](#web-frameworks)
+- [Trace your own code](#trace-your-own-code)
+- [Manual spans](#manual-spans)
+- [Offline evaluation](#offline-evaluation)
+- [Scenario simulation](#scenario-simulation)
+- [Configuration](#configuration)
 
-## Quickstart
+## Quick start
 
 ```python
 import evalkit
 
 evalkit.init(
-    subscription_key="sk_...",       # your Syntropy Labs key
+    subscription_key="tk_live_...",   # Dashboard → Settings → Tracing
     service_name="my-service",
 )
 
-# That's it — your OpenAI / Anthropic / HTTP / DB calls are now traced automatically.
+# Every OpenAI / Anthropic / HTTP / DB call from here on is traced automatically.
 from openai import OpenAI
 
-client = OpenAI()
-resp = client.chat.completions.create(
+resp = OpenAI().chat.completions.create(
     model="gpt-4o",
     messages=[{"role": "user", "content": "Hello!"}],
 )
 ```
 
-`init()` sets up auto-instrumentation for you. Context (including trace IDs)
-propagates automatically across threads — no manual wiring required.
+Call `init()` once, as early as possible. Trace context (including trace IDs)
+propagates across threads and async tasks automatically — no manual wiring.
+
+## What gets traced
+
+| Category    | Captured automatically                                                |
+| ----------- | --------------------------------------------------------------------- |
+| LLM clients | OpenAI, Anthropic, Bedrock, Cohere, Google (GenAI / Vertex), Mistral  |
+| Frameworks  | LangChain / LangGraph, LiteLLM, Claude Agent SDK                      |
+| HTTP        | `requests`, `httpx`, `aiohttp` — method, URL, status, latency         |
+| Databases   | SQLAlchemy, psycopg, asyncpg, PyMongo, Redis — query text + latency   |
+| Your code   | Every function in your app's source tree (APM) — on by default        |
 
 ## Web frameworks
 
@@ -51,96 +61,68 @@ from evalkit import EvalKitMiddleware
 app.add_middleware(EvalKitMiddleware)
 
 # Flask
-import evalkit
 evalkit.instrument_flask(app)
 
 # Django — add to MIDDLEWARE
 "evalkit.EvalKitDjangoMiddleware"
 ```
 
-## Manual spans
+## Trace your own code
+
+Function tracing is **on by default**: `init()` wraps every function in your app's
+own source tree as it imports — one `function_call` span each, with input, output,
+and latency. Third-party libraries are never touched.
 
 ```python
-import evalkit
+# Disable it
+evalkit.init(..., function_tracing=False)   # or env EVALKIT_FUNCTION_TRACE=false
 
-end, ctx = evalkit.start_span("my-operation", {"key": "value"})
-try:
-    ...  # your work
-finally:
-    end("ok")
+# Trace sibling packages outside the caller's directory
+evalkit.init(..., trace_packages=["support_bot", "workers"])
 ```
 
-## Tracing your own functions & tools (APM)
-
-**Function tracing is automatic.** `init()` traces every function in your app's own
-source tree (the directory of the file that called `init()`) as each module imports —
-one `function_call` span per call, input/output/latency, no per-module wiring.
-Third-party libraries are never wrapped; only module-level functions are (class
-methods are left alone), and signatures are preserved so framework introspection
-(FastAPI `Depends`, etc.) keeps working.
+Need finer control? Opt in explicitly — a function, a tool, a class, or a module:
 
 ```python
-# Nothing to wire — just init():
-evalkit.init(subscription_key="tk_live_…", service_name="my-api")
-# every function your app defines is now traced as it imports.
-
-# Disable it:
-#   EVALKIT_FUNCTION_TRACE=false        (env)
-#   evalkit.init(..., function_tracing=False)
-# Trace extra sibling packages outside the caller's dir:
-#   evalkit.init(..., trace_packages=["support_bot", "workers"])
-```
-
-For finer control you can still **opt in explicitly** — a function, a tool, a whole
-class, or a module/package:
-
-```python
-import evalkit
-
-# One function -> function_call span (input / output / latency)
-@evalkit.trace_function()
+@evalkit.trace_function()           # → function_call span
 def do_work(x):
     return x * 2
 
-# One tool -> tool_call span (renders in the Input/Output panels + tool metrics)
-@evalkit.trace_tool()
+@evalkit.trace_tool()               # → tool_call span (counts toward tool metrics)
 def search_web(query: str):
     return run_search(query)
 
-# Every method of a class, APM-style
-@evalkit.traced
+@evalkit.traced                     # → every method of the class
 class OrderService:
     def place(self, order): ...
     def cancel(self, id): ...
 
-# Every function defined in a module — one call
-import myapp.services as svc
-evalkit.trace_module(svc)
-
-# Or your WHOLE app at once (recurses every submodule) — any framework:
 import myapp
-evalkit.trace_package(myapp)
+evalkit.trace_package(myapp)        # → every function across the whole package
 ```
 
-> **Client-side tools you run yourself** only show their output if you wrap them with
-> `trace_tool` — the SDK sees the model's *request* but never your function's return
-> value. Server-side tools (OpenAI `web_search`, …) and LangChain tools are captured
-> automatically. Call `init()` before the decorated class/module is imported.
+> A client-side tool the model calls only shows its **output** if you wrap it with
+> `trace_tool` — the SDK sees the model's request, not your function's return value.
+> Server-side tools (e.g. OpenAI `web_search`) and LangChain tools are automatic.
 
-## SQLAlchemy
+## Manual spans
 
 ```python
-import evalkit
-evalkit.patch_sqlalchemy_engine(engine)
+end, ctx = evalkit.start_span("my-operation", {"key": "value"})
+try:
+    ...  # your work
+    end("ok")
+except Exception:
+    end("error")
+    raise
 ```
 
-## Evaluation
+## Offline evaluation
 
-Score agent outputs locally — no judge-model cost, results appear as `eval_result` spans:
+Deterministic, local scoring — no judge-model cost. Results are pushed as an
+`eval_result` span.
 
 ```python
-import evalkit
-
 scores = evalkit.evaluate(
     output="Your return window is 30 days.",
     input="What is the return policy?",
@@ -148,52 +130,89 @@ scores = evalkit.evaluate(
     tool_calls=[{"name": "search_knowledge_base"}],
     constraints={"required_terms": ["return", "30"]},
 )
-# → {"tool_trajectory_f1": 1.0, "required_terms": 1.0, ...}
+# → {"tool_trajectory": 1.0, "tool_f1": 1.0, "tool_correctness": 1.0,
+#    "response_match": 1.0, "constraint_compliance": 1.0}
 ```
+
+`evaluate()` returns only the metrics applicable to the inputs you pass: tool metrics
+from `tool_calls` / `expected_tools`, `response_match` / `constraint_compliance` from
+`constraints`, and `contextual_precision` / `contextual_recall` from
+`retrieved_context` / `expected_context`.
 
 ## Scenario simulation
 
-Generate realistic synthetic-user scenarios from your agent's system prompt and tool list, then run each scenario against your real agent and score the results automatically:
+Generate synthetic-user scenarios from your agent's prompt and tools, replay each one
+against your real agent, then grade the run with LLM-as-judge evaluators.
+
+**1. Generate** scenarios (bring your own key for the generation call):
 
 ```python
-import evalkit
-
-evalkit.init(subscription_key="tk_live_...", service_name="my-agent")
-
-# Step 1 — generate scenarios server-side (BYOK: your own key for the generation call)
 scenarios = evalkit.generate_scenarios(
     agent_instructions=SYSTEM_PROMPT,
     tools=["search_kb", "lookup_order", "create_ticket"],
     count=5,
-    provider="anthropic",           # "openai" or "google" also supported
-    api_key="sk-ant-...",           # BYOK key for generation model
+    provider="anthropic",                 # or "openai" / "google"
+    api_key="sk-ant-...",
     model="claude-haiku-4-5-20251001",
 )
+```
 
-# Step 2 — simulate each scenario against your real agent and score it
+**2. Simulate** — replay each scenario against your real agent:
+
+```python
 def entrypoint(ctx: evalkit.SimContext) -> evalkit.AgentTurnResult:
-    # ctx.message    — the synthetic user's turn message
-    # ctx.session_id — stable per-scenario, use it to keep multi-turn context
+    # ctx.message    — the synthetic user's message for this turn
+    # ctx.session_id — stable per scenario; use it to keep multi-turn context
     reply, tools_used = run_my_agent(ctx.session_id, ctx.message)
-    return evalkit.AgentTurnResult(
-        text=reply,
-        tool_calls=[{"name": t} for t in tools_used],
-    )
+    return evalkit.AgentTurnResult(text=reply, tool_calls=[{"name": t} for t in tools_used])
 
 report = evalkit.simulate_user(entrypoint, scenarios, tags=["ci"])
-# Results appear in Dashboard → Simulations
-print("Simulation ID:", report["simulation_id"])
+print(report["simulation_id"], report["run_id"])
+```
+
+**3. Evaluate** the run against an evaluator collection (BYOK judge). Per-scenario,
+per-criterion scores come back with reasons, and also appear in the dashboard:
+
+```python
+result = evalkit.evaluate_simulation(
+    report["simulation_id"],
+    collection_id="665f0c...",            # Dashboard → Evaluators → Collections
+    provider="openai",
+    model="gpt-4o",
+    api_key="sk-...",
+    max_tokens=1024,                      # optional judge output cap
+    # run_id="run_...",                   # optional; defaults to the latest run
+)
+
+print(result["aggregate"])                # {"averageScore": ..., "passRate": ...}
+for scn in result["scenarios"]:
+    print(scn["name"], scn["overallScore"], scn["passed"])
+    for m in scn["metrics"]:
+        print("  -", m["ruleName"], m["score"], m["reason"])
 ```
 
 ### Out-of-process agents (Claude Agent SDK)
 
-The Claude Agent SDK runs the Anthropic call in a subprocess, so the normal in-process patch can't observe it. EvalKit wraps `claude_agent_sdk.query()` and `ClaudeSDKClient.receive_response()` instead, reading token/cost/latency from the `ResultMessage` the SDK already returns. This happens automatically via `init()` when `claude_agent_sdk` is installed. To call it explicitly:
+The Claude Agent SDK runs the model call in a subprocess, so the in-process patch
+can't see it. EvalKit instead wraps `claude_agent_sdk.query()` and
+`ClaudeSDKClient.receive_response()`, reading token/cost/latency from the
+`ResultMessage`. This is automatic via `init()` when `claude_agent_sdk` is installed;
+call `evalkit.patch_claude_agent_sdk()` explicitly if you install it later.
+
+## Configuration
 
 ```python
-evalkit.patch_claude_agent_sdk()
+evalkit.init(
+    subscription_key="tk_live_...",
+    service_name="my-service",
+    base_url="https://api.syntropylabs.ai",   # trace ingest (default)
+    api_url="https://api.syntropylabs.ai",    # control plane (default)
+    environment="production",                 # production | staging | development
+    debug=False,                              # log exports to stdout
+    function_tracing=True,                    # auto-trace your functions (default)
+    trace_packages=None,                      # extra sibling packages to trace
+)
 ```
-
-## Flushing
 
 Traces are batched and exported in the background. Flush before exit if needed:
 
