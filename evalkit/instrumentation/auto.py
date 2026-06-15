@@ -1386,6 +1386,11 @@ def setup_auto_instrumentation(
     _try_patch_langchain(client)
     _try_patch_databases(client)
     _try_patch_claude_agent_sdk(client)
+    try:
+        from .mcp import patch_mcp
+        patch_mcp(client)
+    except Exception:
+        pass
 
 
 def _try_patch_claude_agent_sdk(ek: "EvalKitClient") -> None:

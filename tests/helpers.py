@@ -26,6 +26,8 @@ def fresh(capture: list):
             function_tracing=False,  # don't install the import hook during tests
         )
     _CLIENT._exporter.export = lambda batch: (capture.extend(batch), True)[1]
+    with _CLIENT._lock:
+        _CLIENT._queue.clear()
     return _CLIENT
 
 
