@@ -39,53 +39,63 @@ def patch_mcp(client: EvalKitClient) -> None:
     orig = ClientSession.call_tool
 
     async def traced_call_tool(self: Any, name: str, arguments: Any = None, *args: Any, **kwargs: Any) -> Any:
-        ctx = _current_span.get()
-        trace_id = ctx.trace_id if ctx else get_or_create_ambient_trace_id()
-        parent_span_id = ctx.span_id if ctx else None
-        span_id = _new_span_id()
-        start_ms = time.time() * 1000
-        ts = _now_iso()
-        attrs: dict = {
-            **client._meta_attrs(),
-            "evalkit.span_type": "tool_call",
-            "gen_ai.tool.name": str(name),
-            "mcp.tool.name": str(name),
-        }
-        if arguments is not None:
-            try:
-                attrs["gen_ai.tool.call.arguments"] = json.dumps(arguments, default=str)[:8192]
-            except Exception:
-                pass
+        # Tracing must never break the tool call: if setup throws, run untraced.
+        try:
+            ctx = _current_span.get()
+            trace_id = ctx.trace_id if ctx else get_or_create_ambient_trace_id()
+            parent_span_id = ctx.span_id if ctx else None
+            span_id = _new_span_id()
+            start_ms = time.time() * 1000
+            ts = _now_iso()
+            attrs: dict = {
+                **client._meta_attrs(),
+                "evalkit.span_type": "tool_call",
+                "gen_ai.tool.name": str(name),
+                "mcp.tool.name": str(name),
+            }
+            if arguments is not None:
+                try:
+                    attrs["gen_ai.tool.call.arguments"] = json.dumps(arguments, default=str)[:8192]
+                except Exception:
+                    pass
+        except Exception:
+            return await orig(self, name, arguments, *args, **kwargs)
 
         try:
             result = await orig(self, name, arguments, *args, **kwargs)
         except Exception as e:
-            attrs["error.message"] = str(e)
+            try:
+                attrs["error.message"] = str(e)
+                client.enqueue(TraceEnvelope(
+                    trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
+                    span_type="tool_call", status="ERROR", status_message=str(e),
+                    operation=str(name), service_name=client._opts.service_name,
+                    attributes=attrs, latency_ms=int(time.time() * 1000 - start_ms),
+                    start_time=ts, end_time=_now_iso(), created_at=ts,
+                    environment=client._opts.environment, app_version=client._opts.app_version,
+                    sdk_version=SDK_VERSION,
+                ))
+            except Exception:
+                pass
+            raise
+
+        try:
+            is_error = bool(getattr(result, "isError", False))
+            try:
+                attrs["gen_ai.tool.call.result"] = _result_text(result)[:8192]
+            except Exception:
+                pass
             client.enqueue(TraceEnvelope(
                 trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                span_type="tool_call", status="ERROR", status_message=str(e),
+                span_type="tool_call", status="ERROR" if is_error else "OK",
                 operation=str(name), service_name=client._opts.service_name,
                 attributes=attrs, latency_ms=int(time.time() * 1000 - start_ms),
                 start_time=ts, end_time=_now_iso(), created_at=ts,
                 environment=client._opts.environment, app_version=client._opts.app_version,
                 sdk_version=SDK_VERSION,
             ))
-            raise
-
-        is_error = bool(getattr(result, "isError", False))
-        try:
-            attrs["gen_ai.tool.call.result"] = _result_text(result)[:8192]
         except Exception:
             pass
-        client.enqueue(TraceEnvelope(
-            trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-            span_type="tool_call", status="ERROR" if is_error else "OK",
-            operation=str(name), service_name=client._opts.service_name,
-            attributes=attrs, latency_ms=int(time.time() * 1000 - start_ms),
-            start_time=ts, end_time=_now_iso(), created_at=ts,
-            environment=client._opts.environment, app_version=client._opts.app_version,
-            sdk_version=SDK_VERSION,
-        ))
         return result
 
     traced_call_tool._evalkit = True  # type: ignore[attr-defined]

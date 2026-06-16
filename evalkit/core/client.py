@@ -56,11 +56,21 @@ def _exc_attrs(exc: BaseException) -> Dict[str, Any]:
     dashboard can display file + line info for any error span.
     """
     import traceback as _tb
-    return {
+    attrs = {
         "exception.type": type(exc).__qualname__,
         "exception.message": str(exc),
         "exception.stacktrace": _tb.format_exc(),
     }
+    try:
+        frames = _tb.extract_tb(exc.__traceback__)
+        frame = next((f for f in reversed(frames)
+                      if "site-packages" not in f.filename and "/evalkit/" not in f.filename), None) \
+            or (frames[-1] if frames else None)
+        if frame is not None:
+            attrs["error.source"] = f"{frame.filename}:{frame.lineno}"
+    except Exception:
+        pass
+    return attrs
 
 
 class EvalKitClient:
@@ -410,40 +420,58 @@ class EvalKitClient:
             if asyncio.iscoroutinefunction(fn):
                 @functools.wraps(fn)
                 async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
-                    attrs = _mk_attrs(args, kwargs)
-                    end, ctx = self.start_span(span_name, attrs)
-                    token = _current_span.set(ctx)
+                    try:
+                        attrs = _mk_attrs(args, kwargs)
+                        end, ctx = self.start_span(span_name, attrs)
+                        token = _current_span.set(ctx)
+                    except Exception:
+                        return await fn(*args, **kwargs)  # tracing must never break the host
                     try:
                         result = await fn(*args, **kwargs)
-                        if capture_io:
+                        if capture_io and result is not None:
                             attrs["function.result"] = _safe_io(result)
                         end("OK")
                         return result
                     except Exception as exc:
-                        attrs.update(_exc_attrs(exc))
-                        end("ERROR")
+                        try:
+                            attrs.update(_exc_attrs(exc))
+                            end("ERROR")
+                        except Exception:
+                            pass
                         raise
                     finally:
-                        _current_span.reset(token)
+                        try:
+                            _current_span.reset(token)
+                        except Exception:
+                            pass
                 return async_wrapper  # type: ignore[return-value]
             else:
                 @functools.wraps(fn)
                 def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
-                    attrs = _mk_attrs(args, kwargs)
-                    end, ctx = self.start_span(span_name, attrs)
-                    token = _current_span.set(ctx)
+                    try:
+                        attrs = _mk_attrs(args, kwargs)
+                        end, ctx = self.start_span(span_name, attrs)
+                        token = _current_span.set(ctx)
+                    except Exception:
+                        return fn(*args, **kwargs)  # tracing must never break the host
                     try:
                         result = fn(*args, **kwargs)
-                        if capture_io:
+                        if capture_io and result is not None:
                             attrs["function.result"] = _safe_io(result)
                         end("OK")
                         return result
                     except Exception as exc:
-                        attrs.update(_exc_attrs(exc))
-                        end("ERROR")
+                        try:
+                            attrs.update(_exc_attrs(exc))
+                            end("ERROR")
+                        except Exception:
+                            pass
                         raise
                     finally:
-                        _current_span.reset(token)
+                        try:
+                            _current_span.reset(token)
+                        except Exception:
+                            pass
                 return sync_wrapper  # type: ignore[return-value]
 
         return decorator
@@ -480,40 +508,58 @@ class EvalKitClient:
             if asyncio.iscoroutinefunction(fn):
                 @functools.wraps(fn)
                 async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
-                    attrs = _mk_attrs(args, kwargs)
-                    end, ctx = self.start_span(tool_name, attrs)
-                    token = _current_span.set(ctx)
+                    try:
+                        attrs = _mk_attrs(args, kwargs)
+                        end, ctx = self.start_span(tool_name, attrs)
+                        token = _current_span.set(ctx)
+                    except Exception:
+                        return await fn(*args, **kwargs)  # tracing must never break the host
                     try:
                         result = await fn(*args, **kwargs)
-                        if capture_io:
+                        if capture_io and result is not None:
                             attrs["tool.result"] = _safe_io(result)
                         end("OK")
                         return result
                     except Exception as exc:
-                        attrs.update(_exc_attrs(exc))
-                        end("ERROR")
+                        try:
+                            attrs.update(_exc_attrs(exc))
+                            end("ERROR")
+                        except Exception:
+                            pass
                         raise
                     finally:
-                        _current_span.reset(token)
+                        try:
+                            _current_span.reset(token)
+                        except Exception:
+                            pass
                 return async_wrapper  # type: ignore[return-value]
             else:
                 @functools.wraps(fn)
                 def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
-                    attrs = _mk_attrs(args, kwargs)
-                    end, ctx = self.start_span(tool_name, attrs)
-                    token = _current_span.set(ctx)
+                    try:
+                        attrs = _mk_attrs(args, kwargs)
+                        end, ctx = self.start_span(tool_name, attrs)
+                        token = _current_span.set(ctx)
+                    except Exception:
+                        return fn(*args, **kwargs)  # tracing must never break the host
                     try:
                         result = fn(*args, **kwargs)
-                        if capture_io:
+                        if capture_io and result is not None:
                             attrs["tool.result"] = _safe_io(result)
                         end("OK")
                         return result
                     except Exception as exc:
-                        attrs.update(_exc_attrs(exc))
-                        end("ERROR")
+                        try:
+                            attrs.update(_exc_attrs(exc))
+                            end("ERROR")
+                        except Exception:
+                            pass
                         raise
                     finally:
-                        _current_span.reset(token)
+                        try:
+                            _current_span.reset(token)
+                        except Exception:
+                            pass
                 return sync_wrapper  # type: ignore[return-value]
 
         return decorator
