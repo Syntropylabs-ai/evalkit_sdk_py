@@ -24,7 +24,7 @@ from ...core.client import EvalKitClient, _new_span_id, _now_iso
 from ...core.context import (
     SpanContext,
     _ambient_trace_id,
-    _current_span,
+    _current_span, current_span_ctx,
     get_or_create_ambient_trace_id,
 )
 from ...core.types import SpanEvent, TraceEnvelope
@@ -164,7 +164,7 @@ def _resolve_trace(ek: EvalKitClient):
     single trace instead of each fragmenting into its own. Pins the ambient id so
     sequential sibling calls in the same execution context join too.
     """
-    ctx_parent = _current_span.get()
+    ctx_parent = current_span_ctx()
     if ctx_parent is not None:
         trace_id = ctx_parent.trace_id
     else:

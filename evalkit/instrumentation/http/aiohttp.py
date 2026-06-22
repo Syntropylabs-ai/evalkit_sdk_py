@@ -6,7 +6,7 @@ from typing import Any, Optional
 
 from ..._version import SDK_VERSION
 from ...core.client import EvalKitClient, _new_span_id, _now_iso
-from ...core.context import _current_span, _in_http_span, get_or_create_ambient_trace_id
+from ...core.context import _current_span, current_span_ctx, _in_http_span, get_or_create_ambient_trace_id
 from ...core.types import TraceEnvelope
 from ...utils.headers import make_traceparent, path_from_url, sanitize_headers
 
@@ -48,7 +48,7 @@ def patch_aiohttp(client: EvalKitClient) -> None:
         if _in_http_span.get():
             return await orig_request(self, method, str_or_url, **kwargs)
 
-        ctx = _current_span.get()
+        ctx = current_span_ctx()
         trace_id = ctx.trace_id if ctx else get_or_create_ambient_trace_id()
         parent_span_id: Optional[str] = ctx.span_id if ctx else None
         span_id = _new_span_id()

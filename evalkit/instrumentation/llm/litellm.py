@@ -18,7 +18,7 @@ from ...core.client import _exc_attrs, _new_span_id, _now_iso
 from ...core.context import (
     SpanContext,
     _ambient_trace_id,
-    _current_span,
+    _current_span, current_span_ctx,
     get_or_create_ambient_trace_id,
 )
 from ...core.types import TraceEnvelope
@@ -77,7 +77,7 @@ def _patch_sync(ek: "EvalKitClient", litellm: Any) -> None:
     original = fn
 
     def traced(*args: Any, **kwargs: Any) -> Any:
-        ctx_parent = _current_span.get()
+        ctx_parent = current_span_ctx()
         trace_id = ctx_parent.trace_id if ctx_parent else get_or_create_ambient_trace_id()
         _ambient_trace_id.set(trace_id)
         span_id = _new_span_id()
@@ -143,7 +143,7 @@ def _patch_async(ek: "EvalKitClient", litellm: Any) -> None:
     original = fn
 
     async def traced_async(*args: Any, **kwargs: Any) -> Any:
-        ctx_parent = _current_span.get()
+        ctx_parent = current_span_ctx()
         trace_id = ctx_parent.trace_id if ctx_parent else get_or_create_ambient_trace_id()
         _ambient_trace_id.set(trace_id)
         span_id = _new_span_id()

@@ -6,7 +6,7 @@ from typing import Any
 
 from .._version import SDK_VERSION
 from ..core.client import EvalKitClient, _new_span_id, _now_iso
-from ..core.context import _current_span, get_or_create_ambient_trace_id
+from ..core.context import _current_span, current_span_ctx, get_or_create_ambient_trace_id
 from ..core.types import TraceEnvelope
 
 
@@ -41,7 +41,7 @@ def patch_mcp(client: EvalKitClient) -> None:
     async def traced_call_tool(self: Any, name: str, arguments: Any = None, *args: Any, **kwargs: Any) -> Any:
         # Tracing must never break the tool call: if setup throws, run untraced.
         try:
-            ctx = _current_span.get()
+            ctx = current_span_ctx()
             trace_id = ctx.trace_id if ctx else get_or_create_ambient_trace_id()
             parent_span_id = ctx.span_id if ctx else None
             span_id = _new_span_id()

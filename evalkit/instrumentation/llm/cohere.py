@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 
 from ..._version import SDK_VERSION
 from ...core.client import EvalKitClient, _new_span_id, _now_iso
-from ...core.context import SpanContext, _current_span, get_or_create_ambient_trace_id
+from ...core.context import SpanContext, _current_span, current_span_ctx, get_or_create_ambient_trace_id
 from ...core.types import TraceEnvelope
 
 
@@ -20,7 +20,7 @@ def patch_cohere(client: EvalKitClient, cohere_client: Any) -> None:
     original_chat = cohere_client.chat
 
     def traced_chat(**kwargs: Any) -> Any:
-        ctx_parent = _current_span.get()
+        ctx_parent = current_span_ctx()
         trace_id = ctx_parent.trace_id if ctx_parent else get_or_create_ambient_trace_id()
         span_id = _new_span_id()
         parent_span_id = ctx_parent.span_id if ctx_parent else None

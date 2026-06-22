@@ -6,7 +6,7 @@ from typing import Optional
 
 from ..._version import SDK_VERSION
 from ...core.client import EvalKitClient, _new_span_id, _now_iso
-from ...core.context import _current_span, get_or_create_ambient_ctx
+from ...core.context import _current_span, current_span_ctx, get_or_create_ambient_ctx
 from ...core.types import TraceEnvelope
 
 
@@ -21,7 +21,7 @@ class EvalKitLogFilter(logging.Filter):
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
-        ctx = _current_span.get() or get_or_create_ambient_ctx()
+        ctx = current_span_ctx() or get_or_create_ambient_ctx()
         record.trace_id = ctx.trace_id  # type: ignore[attr-defined]
         record.span_id  = ctx.span_id   # type: ignore[attr-defined]
         return True
@@ -50,7 +50,7 @@ class EvalKitLoggingHandler(logging.Handler):
         self._client = client
 
     def emit(self, record: logging.LogRecord) -> None:
-        ctx = _current_span.get() or get_or_create_ambient_ctx()
+        ctx = current_span_ctx() or get_or_create_ambient_ctx()
 
         try:
             level = self._LEVEL_MAP.get(record.levelno, "INFO")

@@ -139,10 +139,14 @@ def init(
     _instance = EvalKitClient(opts)
     from .instrumentation.auto import setup_auto_instrumentation
     setup_auto_instrumentation(_instance)
+ 
+    try:
+        from .core.otel_provider import setup_otel
+        setup_otel(_instance)
+    except Exception:
+        pass
 
-    # Automatic function tracing (APM): trace your app's own functions as they are
-    # imported — no per-module wiring. On by default; disable with
-    # EVALKIT_FUNCTION_TRACE=false or init(function_tracing=False).
+
     if function_tracing and os.environ.get("EVALKIT_FUNCTION_TRACE", "true") != "false":
         try:
             _install_function_tracing(_instance, trace_packages)

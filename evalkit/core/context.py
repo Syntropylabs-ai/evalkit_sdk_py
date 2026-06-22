@@ -50,8 +50,36 @@ _ambient_trace_id: ContextVar[Optional[str]] = ContextVar(
 )
 
 
+_otel_available: Optional[bool] = None
+
+
+def _otel_span_ctx() -> Optional[SpanContext]:
+    global _otel_available
+    if _otel_available is False:
+        return None
+    try:
+        from opentelemetry import trace as _ot
+        _otel_available = True
+        sc = _ot.get_current_span().get_span_context()
+        if sc and sc.is_valid:
+            return SpanContext(trace_id=format(sc.trace_id, "032x"), span_id=format(sc.span_id, "016x"))
+    except Exception:
+        _otel_available = False
+        return None
+    return None
+
+
+def current_span_ctx() -> Optional[SpanContext]:
+    return _current_span.get() or _otel_span_ctx()
+
+
 def get_or_create_ambient_trace_id() -> str:
-    """Return the ambient trace_id for this execution context, creating one if needed."""
+    """Return the ambient trace_id for this execution context, creating one if needed.
+    If an OpenTelemetry span is active, join its trace so hand-rolled and OTel-
+    auto-instrumented spans land in one trace."""
+    otel = _otel_span_ctx()
+    if otel is not None:
+        return otel.trace_id
     from ..core.client import _new_trace_id  # local import avoids cycle
     tid = _ambient_trace_id.get()
     if tid is None:

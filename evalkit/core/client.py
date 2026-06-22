@@ -13,7 +13,7 @@ from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, TypeVa
 F = TypeVar("F", bound=Callable[..., Any])
 
 from .._version import SDK_VERSION
-from .context import SpanContext, _ambient_trace_id, _current_span, get_or_create_ambient_trace_id
+from .context import SpanContext, _ambient_trace_id, _current_span, current_span_ctx, get_or_create_ambient_trace_id
 from .exporter import _Exporter
 from .types import EvalKitOptions, TraceEnvelope
 
@@ -230,7 +230,7 @@ class EvalKitClient:
         # Join existing trace as a child span if one is active (e.g. tool called within request).
         # With no active span, fall back to the context's ambient trace so sibling spans in the
         # same execution context share ONE trace instead of each minting a new id.
-        parent = _current_span.get()
+        parent = current_span_ctx()
         trace_id = parent.trace_id if parent else get_or_create_ambient_trace_id()
         _ambient_trace_id.set(trace_id)
         parent_span_id = parent.span_id if parent else None
@@ -358,7 +358,7 @@ class EvalKitClient:
     ) -> Tuple[Callable[[str], None], SpanContext]:
         # No explicit parent and no active span → join the context's ambient trace so
         # orphan custom spans (tool calls, helpers) don't each start a separate trace.
-        parent = parent_ctx or _current_span.get()
+        parent = parent_ctx or current_span_ctx()
         trace_id = parent.trace_id if parent else get_or_create_ambient_trace_id()
         span_id = _new_span_id()
         parent_span_id = parent.span_id if parent else None

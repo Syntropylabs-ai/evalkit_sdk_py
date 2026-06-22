@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from ..._version import SDK_VERSION
 from ...core.client import _new_span_id, _now_iso
-from ...core.context import _ambient_trace_id, _current_span, get_or_create_ambient_trace_id
+from ...core.context import _ambient_trace_id, _current_span, current_span_ctx, get_or_create_ambient_trace_id
 from ...core.types import SpanEvent, TraceEnvelope
 
 if TYPE_CHECKING:
@@ -169,7 +169,7 @@ def _build_handler(client: "EvalKitClient"):
                     session_id = parent.get("session_id")
                     device_id = parent.get("device_id")
                 else:
-                    ctx = _current_span.get()
+                    ctx = current_span_ctx()
                     if ctx is not None:
                         trace_id = ctx.trace_id
                         parent_span_id = ctx.span_id

@@ -6,7 +6,7 @@ from typing import Any, Optional
 
 from ..._version import SDK_VERSION
 from ...core.client import EvalKitClient, _new_span_id, _now_iso
-from ...core.context import _current_span
+from ...core.context import _current_span, current_span_ctx
 from ...core.types import TraceEnvelope
 
 _BODY_MAX = 2048
@@ -33,7 +33,7 @@ def patch_sqlalchemy(client: EvalKitClient, engine: Any) -> None:
         conn: Any, cursor: Any, statement: str, parameters: Any,
         context: Any, executemany: bool,
     ) -> None:
-        ctx = _current_span.get()
+        ctx = current_span_ctx()
         if ctx is None:
             return
         span_id = _new_span_id()

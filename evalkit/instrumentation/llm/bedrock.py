@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional
 
 from ..._version import SDK_VERSION
 from ...core.client import EvalKitClient, _new_span_id, _new_trace_id, _now_iso
-from ...core.context import SpanContext, _current_span
+from ...core.context import SpanContext, _current_span, current_span_ctx
 from ...core.types import TraceEnvelope
 
 
@@ -21,7 +21,7 @@ def patch_bedrock(client: EvalKitClient, bedrock_runtime_client: Any) -> None:
     original_converse = bedrock_runtime_client.converse
 
     def traced_converse(**kwargs: Any) -> Any:
-        ctx_parent = _current_span.get()
+        ctx_parent = current_span_ctx()
         trace_id = ctx_parent.trace_id if ctx_parent else _new_trace_id()
         span_id = _new_span_id()
         parent_span_id = ctx_parent.span_id if ctx_parent else None

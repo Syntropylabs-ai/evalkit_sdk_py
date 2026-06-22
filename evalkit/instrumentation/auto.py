@@ -36,14 +36,14 @@ def _patch_openai_class_sync(ek: "EvalKitClient", cls, provider: str = "openai")
         return
     import time
     from ..core.client import _new_span_id, _now_iso
-    from ..core.context import SpanContext, _current_span, get_or_create_ambient_trace_id
+    from ..core.context import SpanContext, _current_span, current_span_ctx, get_or_create_ambient_trace_id
     from ..core.types import SpanEvent, TraceEnvelope
     from .._version import SDK_VERSION
 
     original = cls.create
 
     def traced(self, *args, **kwargs):
-        ctx_parent = _current_span.get()
+        ctx_parent = current_span_ctx()
         trace_id = ctx_parent.trace_id if ctx_parent else get_or_create_ambient_trace_id()
         span_id = _new_span_id()
         parent_span_id = ctx_parent.span_id if ctx_parent else None
@@ -131,14 +131,14 @@ def _patch_openai_class_async(ek: "EvalKitClient", cls, provider: str = "openai"
         return
     import time
     from ..core.client import _new_span_id, _now_iso
-    from ..core.context import SpanContext, _current_span, get_or_create_ambient_trace_id
+    from ..core.context import SpanContext, _current_span, current_span_ctx, get_or_create_ambient_trace_id
     from ..core.types import SpanEvent, TraceEnvelope
     from .._version import SDK_VERSION
 
     original = cls.create
 
     async def traced_async(self, *args, **kwargs):
-        ctx_parent = _current_span.get()
+        ctx_parent = current_span_ctx()
         trace_id = ctx_parent.trace_id if ctx_parent else get_or_create_ambient_trace_id()
         span_id = _new_span_id()
         parent_span_id = ctx_parent.span_id if ctx_parent else None
@@ -255,12 +255,12 @@ def _patch_anthropic_stream_sync(ek: "EvalKitClient", cls) -> None:
     import json as _json
     import time
     from ..core.client import _new_span_id, _now_iso
-    from ..core.context import SpanContext, _current_span, get_or_create_ambient_trace_id
+    from ..core.context import SpanContext, _current_span, current_span_ctx, get_or_create_ambient_trace_id
     from ..core.types import SpanEvent, TraceEnvelope
     from .._version import SDK_VERSION
 
     def traced_stream(self, *args, **kwargs):
-        ctx_parent = _current_span.get()
+        ctx_parent = current_span_ctx()
         trace_id = ctx_parent.trace_id if ctx_parent else get_or_create_ambient_trace_id()
         span_id = _new_span_id()
         parent_span_id = ctx_parent.span_id if ctx_parent else None
@@ -333,12 +333,12 @@ def _patch_anthropic_stream_async(ek: "EvalKitClient", cls) -> None:
     import json as _json
     import time
     from ..core.client import _new_span_id, _now_iso
-    from ..core.context import SpanContext, _current_span, get_or_create_ambient_trace_id
+    from ..core.context import SpanContext, _current_span, current_span_ctx, get_or_create_ambient_trace_id
     from ..core.types import SpanEvent, TraceEnvelope
     from .._version import SDK_VERSION
 
     def traced_stream_async(self, *args, **kwargs):
-        ctx_parent = _current_span.get()
+        ctx_parent = current_span_ctx()
         trace_id = ctx_parent.trace_id if ctx_parent else get_or_create_ambient_trace_id()
         span_id = _new_span_id()
         parent_span_id = ctx_parent.span_id if ctx_parent else None
@@ -409,14 +409,14 @@ def _patch_anthropic_class_sync(ek: "EvalKitClient", cls) -> None:
         return
     import time
     from ..core.client import _new_span_id, _now_iso
-    from ..core.context import SpanContext, _current_span, get_or_create_ambient_trace_id
+    from ..core.context import SpanContext, _current_span, current_span_ctx, get_or_create_ambient_trace_id
     from ..core.types import SpanEvent, TraceEnvelope
     from .._version import SDK_VERSION
 
     original = cls.create
 
     def traced(self, *args, **kwargs):
-        ctx_parent = _current_span.get()
+        ctx_parent = current_span_ctx()
         trace_id = ctx_parent.trace_id if ctx_parent else get_or_create_ambient_trace_id()
         span_id = _new_span_id()
         parent_span_id = ctx_parent.span_id if ctx_parent else None
@@ -510,14 +510,14 @@ def _patch_anthropic_class_async(ek: "EvalKitClient", cls) -> None:
         return
     import time
     from ..core.client import _new_span_id, _now_iso
-    from ..core.context import SpanContext, _current_span, get_or_create_ambient_trace_id
+    from ..core.context import SpanContext, _current_span, current_span_ctx, get_or_create_ambient_trace_id
     from ..core.types import SpanEvent, TraceEnvelope
     from .._version import SDK_VERSION
 
     original = cls.create
 
     async def traced_async(self, *args, **kwargs):
-        ctx_parent = _current_span.get()
+        ctx_parent = current_span_ctx()
         trace_id = ctx_parent.trace_id if ctx_parent else get_or_create_ambient_trace_id()
         span_id = _new_span_id()
         parent_span_id = ctx_parent.span_id if ctx_parent else None
@@ -641,14 +641,14 @@ def _patch_google_genai_legacy_class(ek: "EvalKitClient", cls) -> None:
         return
     import time
     from ..core.client import _new_span_id, _now_iso
-    from ..core.context import SpanContext, _current_span, get_or_create_ambient_trace_id
+    from ..core.context import SpanContext, _current_span, current_span_ctx, get_or_create_ambient_trace_id
     from ..core.types import TraceEnvelope
     from .._version import SDK_VERSION
 
     original = cls.generate_content
 
     def traced(self, *args, **kwargs):
-        ctx_parent = _current_span.get()
+        ctx_parent = current_span_ctx()
         trace_id = ctx_parent.trace_id if ctx_parent else get_or_create_ambient_trace_id()
         span_id = _new_span_id()
         parent_span_id = ctx_parent.span_id if ctx_parent else None
@@ -720,14 +720,14 @@ def _patch_cohere_class(ek: "EvalKitClient", cls) -> None:
         return
     import time
     from ..core.client import _new_span_id, _now_iso
-    from ..core.context import SpanContext, _current_span, get_or_create_ambient_trace_id
+    from ..core.context import SpanContext, _current_span, current_span_ctx, get_or_create_ambient_trace_id
     from ..core.types import TraceEnvelope
     from .._version import SDK_VERSION
 
     original = cls.chat
 
     def traced(self, *args, **kwargs):
-        ctx_parent = _current_span.get()
+        ctx_parent = current_span_ctx()
         trace_id = ctx_parent.trace_id if ctx_parent else get_or_create_ambient_trace_id()
         span_id = _new_span_id()
         parent_span_id = ctx_parent.span_id if ctx_parent else None
@@ -807,14 +807,14 @@ def _patch_openai_responses_sync(ek: "EvalKitClient", cls) -> None:
         return
     import time
     from ..core.client import _new_span_id, _now_iso
-    from ..core.context import SpanContext, _current_span, get_or_create_ambient_trace_id
+    from ..core.context import SpanContext, _current_span, current_span_ctx, get_or_create_ambient_trace_id
     from ..core.types import SpanEvent, TraceEnvelope
     from .._version import SDK_VERSION
 
     original = cls.create
 
     def traced(self, *args, **kwargs):
-        ctx_parent = _current_span.get()
+        ctx_parent = current_span_ctx()
         trace_id = ctx_parent.trace_id if ctx_parent else get_or_create_ambient_trace_id()
         span_id = _new_span_id()
         parent_span_id = ctx_parent.span_id if ctx_parent else None
@@ -991,14 +991,14 @@ def _patch_openai_responses_async(ek: "EvalKitClient", cls) -> None:
         return
     import time
     from ..core.client import _new_span_id, _now_iso
-    from ..core.context import SpanContext, _current_span, get_or_create_ambient_trace_id
+    from ..core.context import SpanContext, _current_span, current_span_ctx, get_or_create_ambient_trace_id
     from ..core.types import SpanEvent, TraceEnvelope
     from .._version import SDK_VERSION
 
     original = cls.create
 
     async def traced_async(self, *args, **kwargs):
-        ctx_parent = _current_span.get()
+        ctx_parent = current_span_ctx()
         trace_id = ctx_parent.trace_id if ctx_parent else get_or_create_ambient_trace_id()
         span_id = _new_span_id()
         parent_span_id = ctx_parent.span_id if ctx_parent else None
@@ -1131,7 +1131,7 @@ def _patch_bedrock_class(ek: "EvalKitClient", cls) -> None:
         return
     import time
     from ..core.client import _new_span_id, _now_iso
-    from ..core.context import SpanContext, _current_span, get_or_create_ambient_trace_id
+    from ..core.context import SpanContext, _current_span, current_span_ctx, get_or_create_ambient_trace_id
     from ..core.types import TraceEnvelope
     from .._version import SDK_VERSION
 
@@ -1143,7 +1143,7 @@ def _patch_bedrock_class(ek: "EvalKitClient", cls) -> None:
         if service_name != "bedrock-runtime" or operation_name != "Converse":
             return original(self, operation_name, api_params)
 
-        ctx_parent = _current_span.get()
+        ctx_parent = current_span_ctx()
         trace_id = ctx_parent.trace_id if ctx_parent else get_or_create_ambient_trace_id()
         span_id = _new_span_id()
         parent_span_id = ctx_parent.span_id if ctx_parent else None
@@ -1229,7 +1229,7 @@ def _patch_mistral_class_sync(ek: "EvalKitClient", cls) -> None:
     )
     import time
     from ..core.client import _new_span_id, _now_iso
-    from ..core.context import SpanContext, _current_span, get_or_create_ambient_trace_id
+    from ..core.context import SpanContext, _current_span, current_span_ctx, get_or_create_ambient_trace_id
     from ..core.types import TraceEnvelope
     from .._version import SDK_VERSION
 
@@ -1245,7 +1245,7 @@ def _patch_mistral_class_sync(ek: "EvalKitClient", cls) -> None:
     original = complete_fn
 
     def traced(self, **kwargs):
-        ctx_parent = _current_span.get()
+        ctx_parent = current_span_ctx()
         trace_id = ctx_parent.trace_id if ctx_parent else get_or_create_ambient_trace_id()
         span_id = _new_span_id()
         parent_span_id = ctx_parent.span_id if ctx_parent else None
@@ -1304,6 +1304,15 @@ def _patch_mistral_class_async(ek: "EvalKitClient", cls) -> None:
 # ── Database drivers (raw drivers + NoSQL; SQLAlchemy is patched per-engine) ──
 
 def _try_patch_databases(ek: "EvalKitClient") -> None:
+    import importlib
+    import importlib.util
+    _otel_pkg = {
+        "redis": "opentelemetry.instrumentation.redis",
+        "pymongo": "opentelemetry.instrumentation.pymongo",
+        "asyncpg": "opentelemetry.instrumentation.asyncpg",
+        "psycopg": "opentelemetry.instrumentation.psycopg",
+        "pymysql": "opentelemetry.instrumentation.pymysql",
+    }
     for mod_name, fn_name in (
         ("redis", "patch_redis"),
         ("pymongo", "patch_pymongo"),
@@ -1312,7 +1321,11 @@ def _try_patch_databases(ek: "EvalKitClient") -> None:
         ("pymysql", "patch_pymysql"),
     ):
         try:
-            import importlib
+            if importlib.util.find_spec(_otel_pkg[mod_name]) is not None:
+                continue
+        except Exception:
+            pass
+        try:
             mod = importlib.import_module(f".db.{mod_name}", __package__)
             getattr(mod, fn_name)(ek)
         except Exception:
@@ -1354,19 +1367,27 @@ def setup_auto_instrumentation(
             install_logging_handler(client)
         except Exception:
             pass
-    if requests:
+    import importlib.util as _ilu
+
+    def _otel_has(pkg: str) -> bool:
+        try:
+            return _ilu.find_spec(pkg) is not None
+        except Exception:
+            return False
+
+    if requests and not _otel_has("opentelemetry.instrumentation.requests"):
         try:
             from .http.requests import patch_requests
             patch_requests(client)
         except Exception:
             pass
-    if httpx:
+    if httpx and not _otel_has("opentelemetry.instrumentation.httpx"):
         try:
             from .http.httpx import patch_httpx
             patch_httpx(client)
         except Exception:
             pass
-    if aiohttp:
+    if aiohttp and not _otel_has("opentelemetry.instrumentation.aiohttp_client"):
         try:
             from .http.aiohttp import patch_aiohttp
             patch_aiohttp(client)

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "syntropylabs-evalkit"
-version = "0.1.32"
+version = "0.2.0"
 description = "EvalKit Python SDK — LLM observability and tracing"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -43,6 +43,7 @@ bedrock = ["boto3>=1.28.0"]
 litellm = ["litellm>=1.0.0"]
 langchain = ["langchain-core>=0.2.0"]
 langgraph = ["langgraph>=0.1.0", "langchain-core>=0.2.0"]
+otel = ["opentelemetry-sdk>=1.20.0", "opentelemetry-instrumentation>=0.41b0"]
 # Install every supported integration at once:  pip install "syntropylabs-evalkit[all]"
 all = [
     "openai>=1.0.0",

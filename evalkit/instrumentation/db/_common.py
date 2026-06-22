@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict, Optional
 
 from ..._version import SDK_VERSION
 from ...core.client import _new_span_id, _now_iso
-from ...core.context import _current_span, get_or_create_ambient_trace_id
+from ...core.context import _current_span, current_span_ctx, get_or_create_ambient_trace_id
 from ...core.types import TraceEnvelope
 
 _STMT_MAX = 2048
@@ -37,7 +37,7 @@ def start_db(
     table: Optional[str] = None,
 ) -> Callable[..., None]:
     """Open a db_query span. Returns an `end(status, error, extra, rows)` closure."""
-    ctx = _current_span.get()
+    ctx = current_span_ctx()
     trace_id = ctx.trace_id if ctx else get_or_create_ambient_trace_id()
     parent_span_id = ctx.span_id if ctx else None
     span_id = _new_span_id()
