@@ -1306,6 +1306,11 @@ def _patch_mistral_class_async(ek: "EvalKitClient", cls) -> None:
 def _try_patch_databases(ek: "EvalKitClient") -> None:
     import importlib
     import importlib.util
+    try:
+        from ..core.otel_provider import otel_active
+        bridge = otel_active()
+    except Exception:
+        bridge = False
     _otel_pkg = {
         "redis": "opentelemetry.instrumentation.redis",
         "pymongo": "opentelemetry.instrumentation.pymongo",
@@ -1321,7 +1326,7 @@ def _try_patch_databases(ek: "EvalKitClient") -> None:
         ("pymysql", "patch_pymysql"),
     ):
         try:
-            if importlib.util.find_spec(_otel_pkg[mod_name]) is not None:
+            if bridge and importlib.util.find_spec(_otel_pkg[mod_name]) is not None:
                 continue
         except Exception:
             pass
@@ -1369,25 +1374,33 @@ def setup_auto_instrumentation(
             pass
     import importlib.util as _ilu
 
-    def _otel_has(pkg: str) -> bool:
+    try:
+        from ..core.otel_provider import otel_active
+        _bridge = otel_active()
+    except Exception:
+        _bridge = False
+
+    def _otel_covers(pkg: str) -> bool:
+        if not _bridge:
+            return False
         try:
             return _ilu.find_spec(pkg) is not None
         except Exception:
             return False
 
-    if requests and not _otel_has("opentelemetry.instrumentation.requests"):
+    if requests and not _otel_covers("opentelemetry.instrumentation.requests"):
         try:
             from .http.requests import patch_requests
             patch_requests(client)
         except Exception:
             pass
-    if httpx and not _otel_has("opentelemetry.instrumentation.httpx"):
+    if httpx and not _otel_covers("opentelemetry.instrumentation.httpx"):
         try:
             from .http.httpx import patch_httpx
             patch_httpx(client)
         except Exception:
             pass
-    if aiohttp and not _otel_has("opentelemetry.instrumentation.aiohttp_client"):
+    if aiohttp and not _otel_covers("opentelemetry.instrumentation.aiohttp_client"):
         try:
             from .http.aiohttp import patch_aiohttp
             patch_aiohttp(client)

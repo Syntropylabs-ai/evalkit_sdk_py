@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "syntropylabs-evalkit"
-version = "0.2.0"
+version = "0.2.2"
 description = "EvalKit Python SDK — LLM observability and tracing"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -12,7 +12,24 @@ license = "LicenseRef-Proprietary"
 license-files = ["LICENSE"]
 authors = [{ name = "Syntropy Labs" }]
 keywords = ["llm", "observability", "tracing", "evaluation", "openai", "anthropic", "ai", "agents"]
-dependencies = []
+dependencies = [
+    "opentelemetry-sdk>=1.20.0",
+    "opentelemetry-instrumentation>=0.41b0",
+    "opentelemetry-instrumentation-requests>=0.41b0",
+    "opentelemetry-instrumentation-httpx>=0.41b0",
+    "opentelemetry-instrumentation-aiohttp-client>=0.41b0",
+    "opentelemetry-instrumentation-urllib3>=0.41b0",
+    "opentelemetry-instrumentation-redis>=0.41b0",
+    "opentelemetry-instrumentation-pymongo>=0.41b0",
+    "opentelemetry-instrumentation-psycopg>=0.41b0",
+    "opentelemetry-instrumentation-asyncpg>=0.41b0",
+    "opentelemetry-instrumentation-pymysql>=0.41b0",
+    "opentelemetry-instrumentation-sqlalchemy>=0.41b0",
+    "opentelemetry-instrumentation-fastapi>=0.41b0",
+    "opentelemetry-instrumentation-flask>=0.41b0",
+    "opentelemetry-instrumentation-asgi>=0.41b0",
+    "opentelemetry-instrumentation-wsgi>=0.41b0",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",

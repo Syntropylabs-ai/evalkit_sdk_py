@@ -10,6 +10,10 @@ _log = logging.getLogger("evalkit")
 
 _started = False  # set_tracer_provider may only run once per process
 
+
+def otel_active() -> bool:
+    return _started
+
 _SKIP_INSTRUMENTORS = {
     "openai", "anthropic", "google-generativeai", "google-genai", "google_genai",
     "vertexai", "cohere", "mistralai", "groq", "bedrock", "langchain", "litellm",

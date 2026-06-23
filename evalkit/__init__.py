@@ -137,14 +137,15 @@ def init(
         device_id=device_id,
     )
     _instance = EvalKitClient(opts)
-    from .instrumentation.auto import setup_auto_instrumentation
-    setup_auto_instrumentation(_instance)
- 
+
     try:
         from .core.otel_provider import setup_otel
         setup_otel(_instance)
     except Exception:
         pass
+
+    from .instrumentation.auto import setup_auto_instrumentation
+    setup_auto_instrumentation(_instance)
 
 
     if function_tracing and os.environ.get("EVALKIT_FUNCTION_TRACE", "true") != "false":

@@ -204,16 +204,18 @@ class EvalKitClient:
             except Exception as exc:
                 _log.debug("flush error: %s", exc)
 
-    def _drain(self) -> None:
+    def _drain(self) -> bool:
         with self._lock:
             if not self._queue:
-                return
+                return True
             batch = self._queue[:]
             self._queue.clear()
-        self._exporter.export(batch)
+        return self._exporter.export(batch)
 
-    def flush(self) -> None:
-        self._drain()
+    def flush(self) -> bool:
+        """Drain + export pending spans now. Returns True if the export succeeded
+        (or nothing was queued) — handy for short-lived scripts / serverless."""
+        return self._drain()
 
     def destroy(self) -> None:
         self._stop_event.set()
