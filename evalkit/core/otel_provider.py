@@ -45,11 +45,27 @@ def _infer_span_type(attrs: Dict[str, Any], scope: str) -> str:
     return "function_call"
 
 
+def _count_foreign_llm() -> bool:
+    import os
+    return os.environ.get("EVALKIT_COUNT_FOREIGN_LLM", "").strip().lower() in ("1", "true", "yes")
+
+
 def _readable_to_envelope(span: Any) -> TraceEnvelope:
     ctx = span.get_span_context()
     attrs: Dict[str, Any] = dict(span.attributes or {})
     scope = getattr(getattr(span, "instrumentation_scope", None), "name", "") or ""
-    span_type = _infer_span_type(attrs, scope)
+    _explicit = attrs.get("evalkit.span_type")
+    span_type = str(_explicit) if _explicit else _infer_span_type(attrs, scope)
+
+    _foreign_llm = (
+        any(k in attrs for k in ("gen_ai.system", "gen_ai.request.model", "gen_ai.response.model",
+                                  "gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens"))
+        and "evalkit.span_type" not in attrs
+        and "evalkit.sdk_version" not in attrs
+        and not _count_foreign_llm()
+    )
+    if _foreign_llm:
+        span_type = "function_call"
     parent = getattr(span, "parent", None)
     status = "OK"
     try:
@@ -67,8 +83,8 @@ def _readable_to_envelope(span: Any) -> TraceEnvelope:
         operation=span.name,
         model=attrs.get("gen_ai.response.model") or attrs.get("gen_ai.request.model"),
         provider=attrs.get("gen_ai.system"),
-        tokens_in=attrs.get("gen_ai.usage.input_tokens"),
-        tokens_out=attrs.get("gen_ai.usage.output_tokens"),
+        tokens_in=None if _foreign_llm else attrs.get("gen_ai.usage.input_tokens"),
+        tokens_out=None if _foreign_llm else attrs.get("gen_ai.usage.output_tokens"),
         attributes={k: v for k, v in attrs.items()} or None,
         start_time=_ns_to_iso(getattr(span, "start_time", None)),
         end_time=_ns_to_iso(getattr(span, "end_time", None)),
