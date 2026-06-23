@@ -27,6 +27,27 @@ def with_simulation(sim: SimulationContext):
         _current_simulation.reset(token)
 
 
+@contextmanager
+def _scenario_trace(name: str):
+    """One OpenTelemetry parent span per scenario so a framework's own OTel spans
+    (e.g. Google ADK invocations) and EvalKit's native spans share ONE trace per
+    scenario instead of each turn starting a new root. start_trace() called inside
+    joins this span's trace id. No-op when the OTel SDK isn't active."""
+    span_cm = None
+    try:
+        from ..core.otel_provider import otel_active
+        if otel_active():
+            from opentelemetry import trace as _ot
+            span_cm = _ot.get_tracer("evalkit").start_as_current_span(f"scenario:{name}")
+    except Exception:
+        span_cm = None
+    if span_cm is None:
+        yield
+        return
+    with span_cm:
+        yield
+
+
 def _run_coro_blocking(coro: Any) -> Any:
     """Run a coroutine to completion from sync code, even if an event loop is
     already running in this thread (in which case we run it on a private loop in
@@ -175,69 +196,71 @@ def _result(scenario_id: str, name: str, status: str, turns: int, scores: Dict[s
 
 
 def _run_scenario(client: Any, entrypoint: Entrypoint, scenario: Dict[str, Any], **cfg: Any) -> Dict[str, Any]:
-    name, scenario_id, ctx, sim, turn_messages, end_trace = _begin_scenario(client, scenario, cfg)
+    with _scenario_trace(scenario.get("name", "scenario")):
+        name, scenario_id, ctx, sim, turn_messages, end_trace = _begin_scenario(client, scenario, cfg)
 
-    status, error, turns = "OK", None, 0
-    texts: List[str] = []
-    explicit_tools: List[Dict[str, Any]] = []
-    scores: Dict[str, float] = {}
+        status, error, turns = "OK", None, 0
+        texts: List[str] = []
+        explicit_tools: List[Dict[str, Any]] = []
+        scores: Dict[str, float] = {}
 
-    with with_simulation(sim):
-        try:
-            for i, msg in enumerate(turn_messages):
-                sim.turn = i + 1
-                ctx.turn = i + 1
-                ctx.message = msg
-                result = _resolve(entrypoint(ctx))
-                if isinstance(result, AgentTurnResult):
-                    texts.append(result.text)
-                    explicit_tools.extend(result.tool_calls or [])
-                else:
-                    texts.append(str(result))
-                turns += 1
+        with with_simulation(sim):
+            try:
+                for i, msg in enumerate(turn_messages):
+                    sim.turn = i + 1
+                    ctx.turn = i + 1
+                    ctx.message = msg
+                    result = _resolve(entrypoint(ctx))
+                    if isinstance(result, AgentTurnResult):
+                        texts.append(result.text)
+                        explicit_tools.extend(result.tool_calls or [])
+                    else:
+                        texts.append(str(result))
+                    turns += 1
 
-            scores, _ = _finish_scenario(scenario, scenario_id, name, sim, texts, explicit_tools, cfg["metrics"])
-        except Exception as exc:
-            status, error = "ERROR", str(exc)
-            _log.warning("[evalkit] scenario '%s' failed: %s", name, exc)
-        finally:
-            end_trace(status)
+                scores, _ = _finish_scenario(scenario, scenario_id, name, sim, texts, explicit_tools, cfg["metrics"])
+            except Exception as exc:
+                status, error = "ERROR", str(exc)
+                _log.warning("[evalkit] scenario '%s' failed: %s", name, exc)
+            finally:
+                end_trace(status)
 
-    return _result(scenario_id, name, status, turns, scores, error)
+        return _result(scenario_id, name, status, turns, scores, error)
 
 
 async def _run_scenario_async(client: Any, entrypoint: Entrypoint, scenario: Dict[str, Any], **cfg: Any) -> Dict[str, Any]:
-    name, scenario_id, ctx, sim, turn_messages, end_trace = _begin_scenario(client, scenario, cfg)
+    with _scenario_trace(scenario.get("name", "scenario")):
+        name, scenario_id, ctx, sim, turn_messages, end_trace = _begin_scenario(client, scenario, cfg)
 
-    status, error, turns = "OK", None, 0
-    texts: List[str] = []
-    explicit_tools: List[Dict[str, Any]] = []
-    scores: Dict[str, float] = {}
+        status, error, turns = "OK", None, 0
+        texts: List[str] = []
+        explicit_tools: List[Dict[str, Any]] = []
+        scores: Dict[str, float] = {}
 
-    with with_simulation(sim):
-        try:
-            for i, msg in enumerate(turn_messages):
-                sim.turn = i + 1
-                ctx.turn = i + 1
-                ctx.message = msg
-                result = entrypoint(ctx)
-                if inspect.isawaitable(result):
-                    result = await result
-                if isinstance(result, AgentTurnResult):
-                    texts.append(result.text)
-                    explicit_tools.extend(result.tool_calls or [])
-                else:
-                    texts.append(str(result))
-                turns += 1
+        with with_simulation(sim):
+            try:
+                for i, msg in enumerate(turn_messages):
+                    sim.turn = i + 1
+                    ctx.turn = i + 1
+                    ctx.message = msg
+                    result = entrypoint(ctx)
+                    if inspect.isawaitable(result):
+                        result = await result
+                    if isinstance(result, AgentTurnResult):
+                        texts.append(result.text)
+                        explicit_tools.extend(result.tool_calls or [])
+                    else:
+                        texts.append(str(result))
+                    turns += 1
 
-            scores, _ = _finish_scenario(scenario, scenario_id, name, sim, texts, explicit_tools, cfg["metrics"])
-        except Exception as exc:
-            status, error = "ERROR", str(exc)
-            _log.warning("[evalkit] scenario '%s' failed: %s", name, exc)
-        finally:
-            end_trace(status)
+                scores, _ = _finish_scenario(scenario, scenario_id, name, sim, texts, explicit_tools, cfg["metrics"])
+            except Exception as exc:
+                status, error = "ERROR", str(exc)
+                _log.warning("[evalkit] scenario '%s' failed: %s", name, exc)
+            finally:
+                end_trace(status)
 
-    return _result(scenario_id, name, status, turns, scores, error)
+        return _result(scenario_id, name, status, turns, scores, error)
 
 
 def simulate_user(
