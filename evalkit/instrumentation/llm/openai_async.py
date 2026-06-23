@@ -9,6 +9,7 @@ from ...core.context import SpanContext, _current_span, current_span_ctx, get_or
 from ...core.types import SpanEvent, TraceEnvelope
 from .._streaming import _AsyncStreamTracer
 from .._toolcalls import from_openai_chat
+from ._bodies import _dump, _safe_body
 from .openai import _messages_to_text
 
 _PROMPT_MAX = 32768
@@ -39,11 +40,15 @@ def patch_async_openai(
         temperature = kwargs.get("temperature")
         max_tokens = kwargs.get("max_tokens")
         prompt_text = _messages_to_text(messages)[:_PROMPT_MAX]
+        request_body = _safe_body(_dump(kwargs))
 
         if kwargs.get("stream"):
             def on_stream_done(completion: str, tokens_in: int, tokens_out: int) -> None:
                 end_ts = _now_iso()
                 latency = int(time.time() * 1000 - start_ms)
+                stream_attrs = {**client._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True}
+                if request_body:
+                    stream_attrs["gen_ai.request.body"] = request_body
                 client.enqueue(TraceEnvelope(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                     span_type="llm_call", status="OK",
@@ -52,7 +57,7 @@ def patch_async_openai(
                     prompt=prompt_text, completion=completion[:_COMPLETION_MAX],
                     tokens_in=tokens_in, tokens_out=tokens_out,
                     latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
-                    attributes={**client._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True},
+                    attributes=stream_attrs,
                     environment=client._opts.environment, app_version=client._opts.app_version,
                     sdk_version=SDK_VERSION,
                 ))
@@ -72,7 +77,8 @@ def patch_async_openai(
                 operation="chat.completions.create",
                 service_name=client._opts.service_name, provider="openai", model=model,
                 prompt=prompt_text, latency_ms=latency, start_time=ts, end_time=end_ts,
-                created_at=ts, attributes={**client._meta_attrs(), "gen_ai.request.model": model},
+                created_at=ts, attributes={**client._meta_attrs(), "gen_ai.request.model": model,
+                            **({"gen_ai.request.body": request_body} if request_body else {})},
                 environment=client._opts.environment, app_version=client._opts.app_version,
                 sdk_version=SDK_VERSION,
             ))
@@ -103,6 +109,11 @@ def patch_async_openai(
             attrs["gen_ai.request.max_tokens"] = max_tokens
         if choice and getattr(choice, "finish_reason", None):
             attrs["gen_ai.response.finish_reasons"] = [choice.finish_reason]
+        if request_body:
+            attrs["gen_ai.request.body"] = request_body
+        response_body = _safe_body(_dump(result))
+        if response_body:
+            attrs["gen_ai.response.body"] = response_body
 
         client.enqueue(TraceEnvelope(
             trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,

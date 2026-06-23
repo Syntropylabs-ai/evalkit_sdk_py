@@ -8,6 +8,7 @@ from ...core.client import EvalKitClient, _new_span_id, _new_trace_id, _now_iso
 from ...core.context import SpanContext, _current_span, current_span_ctx, get_or_create_ambient_trace_id
 from ...core.types import SpanEvent, TraceEnvelope
 from .._toolcalls import from_openai_chat
+from ._bodies import _dump, _safe_body
 
 _PROMPT_MAX = 32768
 _COMPLETION_MAX = 32768
@@ -79,6 +80,7 @@ def patch_mistral(
         temperature = kwargs.get("temperature")
         max_tokens = kwargs.get("max_tokens")
         prompt_text = _extract_mistral_prompt(messages)[:_PROMPT_MAX]
+        request_body = _safe_body(_dump(kwargs))
 
         span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
         token = _current_span.set(span_ctx)
@@ -94,7 +96,8 @@ def patch_mistral(
                 service_name=client._opts.service_name, provider="mistral", model=model,
                 prompt=prompt_text, latency_ms=latency, start_time=ts, end_time=end_ts,
                 created_at=ts,
-                attributes={**client._meta_attrs(), "gen_ai.request.model": model},
+                attributes={**client._meta_attrs(), "gen_ai.request.model": model,
+                            **({"gen_ai.request.body": request_body} if request_body else {})},
                 environment=client._opts.environment, app_version=client._opts.app_version,
                 sdk_version=SDK_VERSION,
             ))
@@ -124,6 +127,11 @@ def patch_mistral(
             finish = getattr(choices[0], "finish_reason", None)
             if finish:
                 attrs["gen_ai.response.finish_reasons"] = [str(finish)]
+        if request_body:
+            attrs["gen_ai.request.body"] = request_body
+        response_body = _safe_body(_dump(result))
+        if response_body:
+            attrs["gen_ai.response.body"] = response_body
 
         client.enqueue(TraceEnvelope(
             trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
@@ -170,6 +178,7 @@ def patch_async_mistral(
         temperature = kwargs.get("temperature")
         max_tokens = kwargs.get("max_tokens")
         prompt_text = _extract_mistral_prompt(messages)[:_PROMPT_MAX]
+        request_body = _safe_body(_dump(kwargs))
 
         span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
         token = _current_span.set(span_ctx)
@@ -185,7 +194,8 @@ def patch_async_mistral(
                 service_name=client._opts.service_name, provider="mistral", model=model,
                 prompt=prompt_text, latency_ms=latency, start_time=ts, end_time=end_ts,
                 created_at=ts,
-                attributes={**client._meta_attrs(), "gen_ai.request.model": model},
+                attributes={**client._meta_attrs(), "gen_ai.request.model": model,
+                            **({"gen_ai.request.body": request_body} if request_body else {})},
                 environment=client._opts.environment, app_version=client._opts.app_version,
                 sdk_version=SDK_VERSION,
             ))
@@ -210,6 +220,11 @@ def patch_async_mistral(
             attrs["gen_ai.request.temperature"] = temperature
         if max_tokens is not None:
             attrs["gen_ai.request.max_tokens"] = max_tokens
+        if request_body:
+            attrs["gen_ai.request.body"] = request_body
+        response_body = _safe_body(_dump(result))
+        if response_body:
+            attrs["gen_ai.response.body"] = response_body
 
         client.enqueue(TraceEnvelope(
             trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,

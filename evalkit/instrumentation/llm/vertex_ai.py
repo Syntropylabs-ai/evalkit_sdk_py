@@ -8,6 +8,7 @@ from ...core.client import EvalKitClient, _new_span_id, _now_iso
 from ...core.context import SpanContext, _current_span, current_span_ctx, get_or_create_ambient_trace_id
 from ...core.types import SpanEvent, TraceEnvelope
 from .._toolcalls import from_anthropic_blocks
+from ._bodies import _dump, _safe_body
 
 
 # ── Anthropic on Vertex AI ────────────────────────────────────────────────────
@@ -49,6 +50,7 @@ def patch_anthropic_vertex(
             parts.append(f"system: {system}")
         parts.extend(f"{m.get('role', '')}: {m.get('content', '')}" for m in messages)
         prompt_text = "\n".join(parts)
+        request_body = _safe_body(_dump(kwargs))
 
         span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
         token = _current_span.set(span_ctx)
@@ -64,7 +66,8 @@ def patch_anthropic_vertex(
                 service_name=client._opts.service_name, provider="anthropic-vertex", model=model,
                 prompt=prompt_text, latency_ms=latency, start_time=ts, end_time=end_ts,
                 created_at=ts,
-                attributes={**client._meta_attrs(), "gen_ai.request.model": model},
+                attributes={**client._meta_attrs(), "gen_ai.request.model": model,
+                            **({"gen_ai.request.body": request_body} if request_body else {})},
                 environment=client._opts.environment, app_version=client._opts.app_version,
                 sdk_version=SDK_VERSION,
             ))
@@ -98,6 +101,11 @@ def patch_anthropic_vertex(
         stop_reason = getattr(result, "stop_reason", None)
         if stop_reason:
             attrs["gen_ai.response.finish_reasons"] = [stop_reason]
+        if request_body:
+            attrs["gen_ai.request.body"] = request_body
+        response_body = _safe_body(_dump(result))
+        if response_body:
+            attrs["gen_ai.response.body"] = response_body
 
         client.enqueue(TraceEnvelope(
             trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
@@ -151,6 +159,7 @@ def patch_vertex_generative_model(
             max_tokens = generation_config.get("max_output_tokens")
 
         prompt_text = _vertex_contents_to_text(contents)
+        request_body = _safe_body({"contents": _dump(contents), **({"config": _dump(kwargs)} if kwargs else {})})
 
         span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
         token = _current_span.set(span_ctx)
@@ -166,7 +175,8 @@ def patch_vertex_generative_model(
                 service_name=client._opts.service_name, provider="vertex-ai", model=model_name,
                 prompt=prompt_text, latency_ms=latency, start_time=ts, end_time=end_ts,
                 created_at=ts,
-                attributes={**client._meta_attrs(), "gen_ai.request.model": model_name},
+                attributes={**client._meta_attrs(), "gen_ai.request.model": model_name,
+                            **({"gen_ai.request.body": request_body} if request_body else {})},
                 environment=client._opts.environment, app_version=client._opts.app_version,
                 sdk_version=SDK_VERSION,
             ))
@@ -205,6 +215,11 @@ def patch_vertex_generative_model(
             attrs["gen_ai.request.temperature"] = temperature
         if max_tokens is not None:
             attrs["gen_ai.request.max_tokens"] = max_tokens
+        if request_body:
+            attrs["gen_ai.request.body"] = request_body
+        response_body = _safe_body(_dump(result))
+        if response_body:
+            attrs["gen_ai.response.body"] = response_body
 
         client.enqueue(TraceEnvelope(
             trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,

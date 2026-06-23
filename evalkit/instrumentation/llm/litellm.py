@@ -24,6 +24,7 @@ from ...core.context import (
 from ...core.types import TraceEnvelope
 from .._streaming import _AsyncStreamTracer, _SyncStreamTracer
 from .._toolcalls import from_openai_chat
+from ._bodies import _dump, _safe_body
 
 if TYPE_CHECKING:
     from ...core.client import EvalKitClient
@@ -87,15 +88,20 @@ def _patch_sync(ek: "EvalKitClient", litellm: Any) -> None:
         model = str(kwargs.get("model") or (args[0] if args else "unknown"))
         prompt = _messages_to_prompt(kwargs.get("messages", []))
 
+        request_body = _safe_body(_dump(kwargs))
+
         if kwargs.get("stream"):
             def on_done(completion: str, tin: int, tout: int) -> None:
+                stream_attrs = {**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True}
+                if request_body:
+                    stream_attrs["gen_ai.request.body"] = request_body
                 ek.enqueue(TraceEnvelope(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                     span_type="llm_call", status="OK", operation="litellm.completion",
                     service_name=ek._opts.service_name, provider="litellm", model=model,
                     prompt=prompt, completion=completion, tokens_in=tin, tokens_out=tout,
                     latency_ms=int(time.time() * 1000 - start_ms), start_time=ts, end_time=_now_iso(),
-                    created_at=ts, attributes={**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True},
+                    created_at=ts, attributes=stream_attrs,
                     environment=ek._opts.environment, app_version=ek._opts.app_version, sdk_version=SDK_VERSION,
                 ))
             return _SyncStreamTracer(original(*args, **kwargs), on_done)
@@ -110,7 +116,8 @@ def _patch_sync(ek: "EvalKitClient", litellm: Any) -> None:
                 span_type="llm_call", status="ERROR", status_message=str(exc), operation="litellm.completion",
                 service_name=ek._opts.service_name, provider="litellm", model=model, prompt=prompt,
                 latency_ms=int(time.time() * 1000 - start_ms), start_time=ts, end_time=_now_iso(), created_at=ts,
-                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_exc_attrs(exc)},
+                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_exc_attrs(exc),
+                            **({"gen_ai.request.body": request_body} if request_body else {})},
                 environment=ek._opts.environment, app_version=ek._opts.app_version, sdk_version=SDK_VERSION,
             ))
             raise
@@ -120,6 +127,11 @@ def _patch_sync(ek: "EvalKitClient", litellm: Any) -> None:
         end_ts = _now_iso()
         tin, tout = _usage(result)
         attrs = {**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.usage.total_tokens": tin + tout}
+        if request_body:
+            attrs["gen_ai.request.body"] = request_body
+        response_body = _safe_body(_dump(result))
+        if response_body:
+            attrs["gen_ai.response.body"] = response_body
         ek.enqueue(TraceEnvelope(
             trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
             span_type="llm_call", status="OK", operation="litellm.completion",
@@ -153,15 +165,20 @@ def _patch_async(ek: "EvalKitClient", litellm: Any) -> None:
         model = str(kwargs.get("model") or (args[0] if args else "unknown"))
         prompt = _messages_to_prompt(kwargs.get("messages", []))
 
+        request_body = _safe_body(_dump(kwargs))
+
         if kwargs.get("stream"):
             def on_done(completion: str, tin: int, tout: int) -> None:
+                stream_attrs = {**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True}
+                if request_body:
+                    stream_attrs["gen_ai.request.body"] = request_body
                 ek.enqueue(TraceEnvelope(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                     span_type="llm_call", status="OK", operation="litellm.acompletion",
                     service_name=ek._opts.service_name, provider="litellm", model=model,
                     prompt=prompt, completion=completion, tokens_in=tin, tokens_out=tout,
                     latency_ms=int(time.time() * 1000 - start_ms), start_time=ts, end_time=_now_iso(),
-                    created_at=ts, attributes={**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True},
+                    created_at=ts, attributes=stream_attrs,
                     environment=ek._opts.environment, app_version=ek._opts.app_version, sdk_version=SDK_VERSION,
                 ))
             raw = await original(*args, **kwargs)
@@ -177,7 +194,8 @@ def _patch_async(ek: "EvalKitClient", litellm: Any) -> None:
                 span_type="llm_call", status="ERROR", status_message=str(exc), operation="litellm.acompletion",
                 service_name=ek._opts.service_name, provider="litellm", model=model, prompt=prompt,
                 latency_ms=int(time.time() * 1000 - start_ms), start_time=ts, end_time=_now_iso(), created_at=ts,
-                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_exc_attrs(exc)},
+                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_exc_attrs(exc),
+                            **({"gen_ai.request.body": request_body} if request_body else {})},
                 environment=ek._opts.environment, app_version=ek._opts.app_version, sdk_version=SDK_VERSION,
             ))
             raise
@@ -187,6 +205,11 @@ def _patch_async(ek: "EvalKitClient", litellm: Any) -> None:
         end_ts = _now_iso()
         tin, tout = _usage(result)
         attrs = {**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.usage.total_tokens": tin + tout}
+        if request_body:
+            attrs["gen_ai.request.body"] = request_body
+        response_body = _safe_body(_dump(result))
+        if response_body:
+            attrs["gen_ai.response.body"] = response_body
         ek.enqueue(TraceEnvelope(
             trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
             span_type="llm_call", status="OK", operation="litellm.acompletion",

@@ -8,6 +8,7 @@ from ..._version import SDK_VERSION
 from ...core.client import EvalKitClient, _new_span_id, _new_trace_id, _now_iso
 from ...core.context import SpanContext, _current_span, current_span_ctx
 from ...core.types import TraceEnvelope
+from ._bodies import _dump, _safe_body
 
 
 def patch_bedrock(client: EvalKitClient, bedrock_runtime_client: Any) -> None:
@@ -48,6 +49,7 @@ def patch_bedrock(client: EvalKitClient, bedrock_runtime_client: Any) -> None:
             )
             prompt_parts.append(f"{role}: {text}")
         prompt_text = "\n".join(prompt_parts)
+        request_body = _safe_body(_dump(kwargs))
 
         span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
         token = _current_span.set(span_ctx)
@@ -63,7 +65,8 @@ def patch_bedrock(client: EvalKitClient, bedrock_runtime_client: Any) -> None:
                 service_name=client._opts.service_name, provider="bedrock", model=model_id,
                 prompt=prompt_text, latency_ms=latency, start_time=ts, end_time=end_ts,
                 created_at=ts,
-                attributes={**client._meta_attrs(), "gen_ai.request.model": model_id},
+                attributes={**client._meta_attrs(), "gen_ai.request.model": model_id,
+                            **({"gen_ai.request.body": request_body} if request_body else {})},
                 environment=client._opts.environment, app_version=client._opts.app_version,
                 sdk_version=SDK_VERSION,
             ))
@@ -98,6 +101,11 @@ def patch_bedrock(client: EvalKitClient, bedrock_runtime_client: Any) -> None:
             attrs["gen_ai.request.max_tokens"] = max_tokens
         if stop_reason:
             attrs["gen_ai.response.finish_reasons"] = [stop_reason]
+        if request_body:
+            attrs["gen_ai.request.body"] = request_body
+        response_body = _safe_body(_dump(result))
+        if response_body:
+            attrs["gen_ai.response.body"] = response_body
 
         client.enqueue(TraceEnvelope(
             trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,

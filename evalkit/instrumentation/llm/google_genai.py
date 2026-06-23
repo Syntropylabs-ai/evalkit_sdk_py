@@ -176,6 +176,44 @@ def _resolve_trace(ek: EvalKitClient):
     return trace_id, parent_span_id, session_id, device_id
 
 
+def _dump(o: Any) -> Any:
+    if isinstance(o, (list, tuple)):
+        return [_dump(x) for x in o]
+    if hasattr(o, "model_dump"):
+        try:
+            return o.model_dump(exclude_none=True)
+        except Exception:
+            return str(o)
+    return o
+
+
+def _safe_body(obj: Any, limit: int = 16384) -> Optional[str]:
+    """Best-effort JSON of a request/response object for the trace body. Never raises;
+    truncated to keep the span small (the exporter's fitEvent drops it first anyway)."""
+    if obj is None:
+        return None
+    import json as _json
+    try:
+        s = _json.dumps(obj, default=str)
+    except Exception:
+        try:
+            s = str(obj)
+        except Exception:
+            return None
+    return s if len(s) <= limit else s[:limit] + "…"
+
+
+def _request_body(contents: Any, config: Any) -> Optional[str]:
+    body: Dict[str, Any] = {"contents": _dump(contents)}
+    if config is not None:
+        body["config"] = _dump(config)
+    return _safe_body(body)
+
+
+def _response_body(result: Any) -> Optional[str]:
+    return _safe_body(_dump(result))
+
+
 def _build_envelope(
     client: EvalKitClient,
     *,
@@ -196,6 +234,8 @@ def _build_envelope(
     status_message: Optional[str] = None,
     events: Optional[List[SpanEvent]] = None,
     attrs: Optional[Dict[str, Any]] = None,
+    request_body: Optional[str] = None,
+    response_body: Optional[str] = None,
 ) -> TraceEnvelope:
     base_attrs: Dict[str, Any] = {
         **client._meta_attrs(),
@@ -203,6 +243,10 @@ def _build_envelope(
         "gen_ai.response.model": model,
         "gen_ai.usage.total_tokens": tokens_in + tokens_out,
     }
+    if request_body:
+        base_attrs["gen_ai.request.body"] = request_body
+    if response_body:
+        base_attrs["gen_ai.response.body"] = response_body
     if attrs:
         base_attrs.update(attrs)
 
@@ -284,6 +328,8 @@ def _patch_sync_models(ek: EvalKitClient, gm: Any) -> None:
                 tokens_in=tokens_in, tokens_out=tokens_out,
                 latency=latency, ts=ts, end_ts=end_ts, events=events,
                 session_id=session_id, device_id=device_id,
+                request_body=_request_body(contents, config),
+                response_body=_response_body(result),
             ))
             return result
 
@@ -408,6 +454,8 @@ def _patch_async_models(ek: EvalKitClient, gm: Any) -> None:
                 tokens_in=tokens_in, tokens_out=tokens_out,
                 latency=latency, ts=ts, end_ts=end_ts, events=events,
                 session_id=session_id, device_id=device_id,
+                request_body=_request_body(contents, config),
+                response_body=_response_body(result),
             ))
             return result
 

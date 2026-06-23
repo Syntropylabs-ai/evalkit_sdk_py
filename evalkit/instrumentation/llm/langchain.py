@@ -24,6 +24,7 @@ from ..._version import SDK_VERSION
 from ...core.client import _new_span_id, _now_iso
 from ...core.context import _ambient_trace_id, _current_span, current_span_ctx, get_or_create_ambient_trace_id
 from ...core.types import SpanEvent, TraceEnvelope
+from ._bodies import _dump, _safe_body
 
 if TYPE_CHECKING:
     from ...core.client import EvalKitClient
@@ -278,25 +279,36 @@ def _build_handler(client: "EvalKitClient"):
             model = _model_from(serialized, kwargs)
             provider = _provider_from_serialized(serialized)
             prompt = _truncate("\n".join(str(p) for p in (prompts or [])))
+            attrs = {"evalkit.framework": "langchain", "gen_ai.request.model": model}
+            request_body = _safe_body({"prompts": _dump(prompts), "invocation_params": _dump(kwargs.get("invocation_params"))})
+            if request_body:
+                attrs["gen_ai.request.body"] = request_body
             self._start(run_id, parent_run_id, "llm_call", "llm.generate",
-                        attrs={"evalkit.framework": "langchain", "gen_ai.request.model": model},
-                        model=model, provider=provider, prompt=prompt)
+                        attrs=attrs, model=model, provider=provider, prompt=prompt)
 
         def on_chat_model_start(self, serialized, messages, *, run_id, parent_run_id=None, **kwargs):
             model = _model_from(serialized, kwargs)
             provider = _provider_from_serialized(serialized)
             prompt = _messages_to_prompt(messages)
+            attrs = {"evalkit.framework": "langchain", "gen_ai.request.model": model}
+            request_body = _safe_body({"messages": _dump(messages), "invocation_params": _dump(kwargs.get("invocation_params"))})
+            if request_body:
+                attrs["gen_ai.request.body"] = request_body
             self._start(run_id, parent_run_id, "llm_call", "chat.generate",
-                        attrs={"evalkit.framework": "langchain", "gen_ai.request.model": model},
-                        model=model, provider=provider, prompt=prompt)
+                        attrs=attrs, model=model, provider=provider, prompt=prompt)
 
         def on_llm_end(self, response, *, run_id, **kwargs):
             completion = _llm_result_completion(response)
             tokens_in, tokens_out = _llm_result_tokens(response)
-            extra = {"gen_ai.usage.total_tokens": tokens_in + tokens_out} if (tokens_in or tokens_out) else None
+            extra: Dict[str, Any] = {}
+            if tokens_in or tokens_out:
+                extra["gen_ai.usage.total_tokens"] = tokens_in + tokens_out
+            response_body = _safe_body(_dump(response))
+            if response_body:
+                extra["gen_ai.response.body"] = response_body
             self._end(run_id, status="OK", completion=completion,
                       tokens_in=tokens_in or None, tokens_out=tokens_out or None,
-                      extra_attrs=extra)
+                      extra_attrs=extra or None)
 
         def on_llm_error(self, error, *, run_id, **kwargs):
             self._end(run_id, status="ERROR", status_message=str(error))

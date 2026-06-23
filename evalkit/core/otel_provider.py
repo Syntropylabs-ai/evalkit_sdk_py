@@ -30,6 +30,14 @@ def _ns_to_iso(ns: Optional[int]) -> Optional[str]:
         return None
 
 
+def _latency_ms(span: Any) -> Optional[int]:
+    start = getattr(span, "start_time", None)
+    end = getattr(span, "end_time", None)
+    if start and end and end >= start:
+        return int((end - start) / 1_000_000)
+    return None
+
+
 def _infer_span_type(attrs: Dict[str, Any], scope: str) -> str:
     if any(k in attrs for k in ("gen_ai.request.model", "gen_ai.system", "gen_ai.response.model")):
         return "llm_call"
@@ -85,6 +93,7 @@ def _readable_to_envelope(span: Any) -> TraceEnvelope:
         provider=attrs.get("gen_ai.system"),
         tokens_in=None if _foreign_llm else attrs.get("gen_ai.usage.input_tokens"),
         tokens_out=None if _foreign_llm else attrs.get("gen_ai.usage.output_tokens"),
+        latency_ms=_latency_ms(span),
         attributes={k: v for k, v in attrs.items()} or None,
         start_time=_ns_to_iso(getattr(span, "start_time", None)),
         end_time=_ns_to_iso(getattr(span, "end_time", None)),

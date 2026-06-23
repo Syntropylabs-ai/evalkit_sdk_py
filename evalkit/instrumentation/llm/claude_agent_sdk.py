@@ -23,6 +23,7 @@ from ...core.client import _new_span_id, _now_iso
 from ...core.context import SpanContext, _current_span, current_span_ctx, get_or_create_ambient_trace_id
 from ...core.types import SpanEvent, TraceEnvelope
 from .._toolcalls import from_anthropic_blocks
+from ._bodies import _dump, _safe_body
 
 if TYPE_CHECKING:
     from ...core.client import EvalKitClient
@@ -104,6 +105,13 @@ async def _traced_gen(
                 if num_turns is not None:
                     attrs["llm.num_turns"] = str(num_turns)
 
+                request_body = _safe_body({"prompt": prompt, "model": model})
+                if request_body:
+                    attrs["gen_ai.request.body"] = request_body
+                response_body = _safe_body(_dump(message))
+                if response_body:
+                    attrs["gen_ai.response.body"] = response_body
+
                 ek.enqueue(TraceEnvelope(
                     trace_id=trace_id,
                     span_id=span_id,
@@ -134,6 +142,7 @@ async def _traced_gen(
     except Exception as exc:
         end_ts = _now_iso()
         latency = int(time.time() * 1000 - start_ms)
+        err_request_body = _safe_body({"prompt": prompt, "model": model})
         ek.enqueue(TraceEnvelope(
             trace_id=trace_id,
             span_id=span_id,
@@ -150,7 +159,8 @@ async def _traced_gen(
             start_time=ts,
             end_time=_now_iso(),
             created_at=ts,
-            attributes={**ek._meta_attrs()},
+            attributes={**ek._meta_attrs(),
+                        **({"gen_ai.request.body": err_request_body} if err_request_body else {})},
             environment=ek._opts.environment,
             app_version=ek._opts.app_version,
             sdk_version=SDK_VERSION,
