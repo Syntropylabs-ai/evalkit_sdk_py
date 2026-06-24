@@ -24,6 +24,14 @@ from .instrumentation.llm.mistral import patch_mistral, patch_async_mistral
 from .instrumentation.llm.langchain import patch_langchain as _patch_langchain
 from .instrumentation.llm.litellm import patch_litellm as _patch_litellm
 from .instrumentation.llm.claude_agent_sdk import patch_claude_agent_sdk as _patch_claude_agent_sdk
+from .instrumentation.llm.google_live import (
+    trace_google_live as _trace_google_live,
+    patch_google_genai_live as _patch_google_genai_live,
+)
+from .instrumentation.llm.openai_realtime import (
+    trace_openai_realtime as _trace_openai_realtime,
+    patch_openai_realtime as _patch_openai_realtime,
+)
 
 from .instrumentation.http.requests import patch_requests
 from .instrumentation.http.httpx import patch_httpx
@@ -71,6 +79,10 @@ __all__ = [
     "patch_langchain",
     "patch_litellm",
     "patch_claude_agent_sdk",
+    "trace_google_live",
+    "trace_openai_realtime",
+    "patch_google_genai_live",
+    "patch_openai_realtime",
     "patch_mistral_client",
     "patch_async_openai_client",
     "patch_async_anthropic_client",
@@ -275,6 +287,51 @@ def patch_mistral_client(
     parent_ctx: Optional[SpanContext] = None,
 ) -> None:
     patch_mistral(_get_instance(), mistral_client, parent_ctx)
+
+
+def trace_google_live(
+    genai_client: Any,
+    *,
+    model: Optional[str] = None,
+    config: Any = None,
+) -> Any:
+    """Explicit drop-in for ``client.aio.live.connect(model=, config=)`` (Gemini Live).
+
+    Returns an async context manager that opens a ``voice.session`` trace and emits
+    ``voice.turn`` / ``tool_call`` spans as the WebSocket streams. Use::
+
+        async with evalkit.trace_google_live(genai_client, model=..., config=...) as session:
+            ...
+    """
+    return _trace_google_live(_get_instance(), genai_client, model=model, config=config)
+
+
+def trace_openai_realtime(
+    openai_client: Any,
+    *,
+    model: Optional[str] = None,
+) -> Any:
+    """Explicit drop-in for ``client.beta.realtime.connect(model=)`` (OpenAI Realtime).
+
+    Returns an async context manager that opens a ``voice.session`` trace and emits
+    ``voice.turn`` / ``tool_call`` spans as the WebSocket streams. Use::
+
+        async with evalkit.trace_openai_realtime(openai_client, model=...) as connection:
+            ...
+    """
+    return _trace_openai_realtime(_get_instance(), openai_client, model=model)
+
+
+def patch_google_genai_live() -> None:
+    """Best-effort: auto-wrap ``Live.connect`` so plain Gemini Live connects are
+    traced. Called automatically by ``init()`` when ``google.genai`` is installed."""
+    _patch_google_genai_live(_get_instance())
+
+
+def patch_openai_realtime() -> None:
+    """Best-effort: auto-wrap ``AsyncRealtime.connect`` so plain OpenAI Realtime
+    connects are traced. Called automatically by ``init()`` when ``openai`` is installed."""
+    _patch_openai_realtime(_get_instance())
 
 
 def patch_async_openai_client(

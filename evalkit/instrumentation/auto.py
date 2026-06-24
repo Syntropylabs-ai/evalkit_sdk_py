@@ -1420,6 +1420,8 @@ def setup_auto_instrumentation(
     _try_patch_langchain(client)
     _try_patch_databases(client)
     _try_patch_claude_agent_sdk(client)
+    _try_patch_google_live(client)
+    _try_patch_openai_realtime(client)
     try:
         from .mcp import patch_mcp
         patch_mcp(client)
@@ -1431,5 +1433,31 @@ def _try_patch_claude_agent_sdk(ek: "EvalKitClient") -> None:
     try:
         from .llm.claude_agent_sdk import patch_claude_agent_sdk
         patch_claude_agent_sdk(ek)
+    except Exception:
+        pass
+
+
+# ── Realtime / voice over WebSocket (Gemini Live, OpenAI Realtime) ────────────
+
+def _try_patch_google_live(ek: "EvalKitClient") -> None:
+    try:
+        from google.genai import live as _live  # noqa: F401
+    except ImportError:
+        return
+    try:
+        from .llm.google_live import patch_google_genai_live
+        patch_google_genai_live(ek)
+    except Exception:
+        pass
+
+
+def _try_patch_openai_realtime(ek: "EvalKitClient") -> None:
+    try:
+        import openai  # noqa: F401
+    except ImportError:
+        return
+    try:
+        from .llm.openai_realtime import patch_openai_realtime
+        patch_openai_realtime(ek)
     except Exception:
         pass
