@@ -82,6 +82,13 @@ def _readable_to_envelope(span: Any) -> TraceEnvelope:
             status = "ERROR"
     except Exception:
         pass
+    svc_name = None
+    try:
+        res = getattr(span, "resource", None)
+        if res is not None:
+            svc_name = (res.attributes or {}).get("service.name")
+    except Exception:
+        pass
     return TraceEnvelope(
         trace_id=format(ctx.trace_id, "032x"),
         span_id=format(ctx.span_id, "016x"),
@@ -89,6 +96,7 @@ def _readable_to_envelope(span: Any) -> TraceEnvelope:
         span_type=span_type,  # type: ignore[arg-type]
         status=status,  # type: ignore[arg-type]
         operation=span.name,
+        service_name=svc_name,
         model=attrs.get("gen_ai.response.model") or attrs.get("gen_ai.request.model"),
         provider=attrs.get("gen_ai.system"),
         tokens_in=None if _foreign_llm else attrs.get("gen_ai.usage.input_tokens"),
@@ -148,6 +156,8 @@ def setup_otel(client: Any) -> bool:
         def export(self, spans) -> "SpanExportResult":
             for sp in spans:
                 try:
+                    if (getattr(sp, "attributes", None) or {}).get("asgi.event.type") is not None:
+                        continue
                     client.enqueue(_readable_to_envelope(sp))
                 except Exception as exc:
                     _log.debug("otel→envelope failed: %s", exc)
