@@ -5,7 +5,7 @@ import unittest
 from tests.helpers import fresh, reset_context
 
 
-def _make_fake_botocore(*, fail=False):
+def _make_fake_botocore(*, fail=False, content=None):
     botocore_mod = types.ModuleType("botocore")
     client_mod = types.ModuleType("botocore.client")
 
@@ -23,7 +23,7 @@ def _make_fake_botocore(*, fail=False):
                 if fail:
                     raise RuntimeError("throttled")
                 return {
-                    "output": {"message": {"content": [{"text": "Bedrock says hello"}]}},
+                    "output": {"message": {"content": content or [{"text": "Bedrock says hello"}]}},
                     "usage": {"inputTokens": 8, "outputTokens": 15},
                 }
             return {}
@@ -44,8 +44,8 @@ class TestBedrock(unittest.TestCase):
         for n in self._injected:
             sys.modules.pop(n, None)
 
-    def _install(self, *, fail=False):
-        botocore_mod, client_mod, FakeBC = _make_fake_botocore(fail=fail)
+    def _install(self, *, fail=False, content=None):
+        botocore_mod, client_mod, FakeBC = _make_fake_botocore(fail=fail, content=content)
         sys.modules["botocore"] = botocore_mod
         sys.modules["botocore.client"] = client_mod
         self._injected += ["botocore", "botocore.client"]
@@ -67,6 +67,34 @@ class TestBedrock(unittest.TestCase):
         self.assertEqual(llm[0].tokens_in, 8)
         self.assertEqual(llm[0].tokens_out, 15)
         self.assertEqual(llm[0].status, "OK")
+
+    def test_reasoning_content_captured(self):
+        FakeBC = self._install(content=[
+            {"reasoningContent": {"reasoningText": {"text": "Thinking step by step..."}}},
+            {"text": "Bedrock says hello"},
+        ])
+        FakeBC()._make_api_call("Converse", {
+            "modelId": "anthropic.claude-3-7-sonnet-20250219-v1:0",
+            "messages": [{"role": "user", "content": [{"text": "hello"}]}],
+        })
+        self.client.flush()
+        llm = [e for e in self.captured if e.span_type == "llm_call"]
+        self.assertEqual(llm[0].attributes.get("gen_ai.response.thinking"), "Thinking step by step...")
+        self.assertNotIn("gen_ai.response.has_redacted_thinking", llm[0].attributes)
+
+    def test_redacted_reasoning_flagged(self):
+        FakeBC = self._install(content=[
+            {"reasoningContent": {"redactedContent": "opaque-blob"}},
+            {"text": "Bedrock says hello"},
+        ])
+        FakeBC()._make_api_call("Converse", {
+            "modelId": "anthropic.claude-3-7-sonnet-20250219-v1:0",
+            "messages": [{"role": "user", "content": [{"text": "hello"}]}],
+        })
+        self.client.flush()
+        llm = [e for e in self.captured if e.span_type == "llm_call"]
+        self.assertTrue(llm[0].attributes.get("gen_ai.response.has_redacted_thinking"))
+        self.assertNotIn("gen_ai.response.thinking", llm[0].attributes)
 
     def test_non_converse_no_span(self):
         FakeBC = self._install()

@@ -45,9 +45,10 @@ class _FC:
 
 
 class _Part:
-    def __init__(self, text=None, function_call=None):
+    def __init__(self, text=None, function_call=None, thought=False):
         self.text = text
         self.function_call = function_call
+        self.thought = thought
 
 
 class _Content:
@@ -61,20 +62,23 @@ class _Candidate:
 
 
 class _GenAIUsage:
-    def __init__(self, pin, pout):
+    def __init__(self, pin, pout, thoughts=0):
         self.prompt_token_count = pin
         self.candidates_token_count = pout
+        self.thoughts_token_count = thoughts
 
 
 class GenAIResp:
-    def __init__(self, text="", tool=None, pin=3, pout=5):
+    def __init__(self, text="", tool=None, pin=3, pout=5, thinking=None, thoughts_tokens=0):
         parts = []
+        if thinking:
+            parts.append(_Part(text=thinking, thought=True))
         if text:
             parts.append(_Part(text=text))
         if tool:
             parts.append(_Part(function_call=_FC(tool[0], tool[1])))
         self.candidates = [_Candidate(parts)]
-        self.usage_metadata = _GenAIUsage(pin, pout)
+        self.usage_metadata = _GenAIUsage(pin, pout, thoughts=thoughts_tokens)
         self.text = text
 
 
@@ -98,12 +102,21 @@ def install_fake_genai(client, *, response=None, stream_chunks=None):
 # ── Anthropic fakes ───────────────────────────────────────────────────────────
 
 class ABlock:
-    def __init__(self, type, text=None, name=None, id=None, input=None):
+    """Mirrors the real SDK: each block type only carries its own fields
+    (a ThinkingBlock has no `.text`, a TextBlock has no `.thinking`, etc.) —
+    tests that rely on `hasattr(block, "text")` to distinguish block types
+    need that to hold here too."""
+
+    def __init__(self, type, text=None, name=None, id=None, input=None, thinking=None):
         self.type = type
-        self.text = text
-        self.name = name
-        self.id = id
-        self.input = input
+        if type == "text":
+            self.text = text
+        if type == "tool_use":
+            self.name = name
+            self.id = id
+            self.input = input
+        if type == "thinking":
+            self.thinking = thinking
 
 
 class AUsage:
@@ -113,8 +126,14 @@ class AUsage:
 
 
 class AResp:
-    def __init__(self, text="hi", tool=None):
-        self.content = [ABlock("text", text=text)] if text else []
+    def __init__(self, text="hi", tool=None, thinking=None, redacted_thinking=False):
+        self.content = []
+        if thinking:
+            self.content.append(ABlock("thinking", thinking=thinking))
+        if redacted_thinking:
+            self.content.append(ABlock("redacted_thinking"))
+        if text:
+            self.content.append(ABlock("text", text=text))
         if tool:
             self.content.append(ABlock("tool_use", name=tool[0], id="t1", input=tool[1]))
         self.usage = AUsage(3, 5)
@@ -134,11 +153,19 @@ def install_fake_anthropic(client, resp):
 
 # ── OpenAI fakes ──────────────────────────────────────────────────────────────
 
+class OCompletionTokensDetails:
+    def __init__(self, reasoning_tokens):
+        self.reasoning_tokens = reasoning_tokens
+
+
 class OUsage:
-    def __init__(self, pin, pout):
+    def __init__(self, pin, pout, reasoning_tokens=0):
         self.prompt_tokens = pin
         self.completion_tokens = pout
         self.total_tokens = pin + pout
+        self.completion_tokens_details = (
+            OCompletionTokensDetails(reasoning_tokens) if reasoning_tokens else None
+        )
 
 
 class OFunction:
@@ -167,10 +194,10 @@ class OChoice:
 
 
 class OResp:
-    def __init__(self, content="The answer", tool=None, pin=5, pout=8):
+    def __init__(self, content="The answer", tool=None, pin=5, pout=8, reasoning_tokens=0):
         tc = [OToolCall(tool[0], tool[1])] if tool else None
         self.choices = [OChoice(content, tc)]
-        self.usage = OUsage(pin, pout)
+        self.usage = OUsage(pin, pout, reasoning_tokens=reasoning_tokens)
         self.model = "gpt-4o-mini"
         self.id = "chatcmpl-test"
 

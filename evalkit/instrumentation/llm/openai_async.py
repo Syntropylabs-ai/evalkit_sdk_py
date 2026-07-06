@@ -43,12 +43,20 @@ def patch_async_openai(
         request_body = _safe_body(_dump(kwargs))
 
         if kwargs.get("stream"):
-            def on_stream_done(completion: str, tokens_in: int, tokens_out: int) -> None:
+            def on_stream_done(
+                completion: str, tokens_in: int, tokens_out: int,
+                thinking: str, reasoning_tokens: int, has_redacted_thinking: bool,
+                ttft_ms: Optional[int],
+            ) -> None:
                 end_ts = _now_iso()
                 latency = int(time.time() * 1000 - start_ms)
                 stream_attrs = {**client._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True}
                 if request_body:
                     stream_attrs["gen_ai.request.body"] = request_body
+                if reasoning_tokens:
+                    stream_attrs["gen_ai.usage.reasoning_tokens"] = reasoning_tokens
+                if ttft_ms is not None:
+                    stream_attrs["gen_ai.server.time_to_first_token_ms"] = ttft_ms
                 client.enqueue(TraceEnvelope(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                     span_type="llm_call", status="OK",
@@ -62,7 +70,7 @@ def patch_async_openai(
                     sdk_version=SDK_VERSION,
                 ))
             raw = await original_create(*args, **kwargs)
-            return _AsyncStreamTracer(raw, on_stream_done)
+            return _AsyncStreamTracer(raw, on_stream_done, start_ms=start_ms)
 
         span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
         token = _current_span.set(span_ctx)
@@ -93,6 +101,8 @@ def patch_async_openai(
         usage = result.usage
         tokens_in = getattr(usage, "prompt_tokens", 0) or 0
         tokens_out = getattr(usage, "completion_tokens", 0) or 0
+        completion_details = getattr(usage, "completion_tokens_details", None)
+        reasoning_tokens = getattr(completion_details, "reasoning_tokens", 0) or 0
 
         events: List[SpanEvent] = from_openai_chat(result, end_ts)
 
@@ -109,6 +119,8 @@ def patch_async_openai(
             attrs["gen_ai.request.max_tokens"] = max_tokens
         if choice and getattr(choice, "finish_reason", None):
             attrs["gen_ai.response.finish_reasons"] = [choice.finish_reason]
+        if reasoning_tokens:
+            attrs["gen_ai.usage.reasoning_tokens"] = reasoning_tokens
         if request_body:
             attrs["gen_ai.request.body"] = request_body
         response_body = _safe_body(_dump(result))

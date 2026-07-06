@@ -11,7 +11,7 @@ Degrades to a no-op if litellm is not installed and never raises into the caller
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 from ..._version import SDK_VERSION
 from ...core.client import _exc_attrs, _new_span_id, _now_iso
@@ -57,6 +57,22 @@ def _usage(result: Any):
     )
 
 
+def _reasoning_tokens(result: Any) -> int:
+    usage = getattr(result, "usage", None)
+    details = getattr(usage, "completion_tokens_details", None)
+    return getattr(details, "reasoning_tokens", 0) or 0
+
+
+def _reasoning_content(result: Any) -> str:
+    """DeepSeek-R1 and other reasoning models routed through litellm normalize
+    their chain-of-thought onto `message.reasoning_content`."""
+    try:
+        choice = result.choices[0]
+        return getattr(choice.message, "reasoning_content", None) or ""
+    except Exception:
+        return ""
+
+
 def _tool_events(result: Any, ts: str):
     return from_openai_chat(result, ts)
 
@@ -91,10 +107,18 @@ def _patch_sync(ek: "EvalKitClient", litellm: Any) -> None:
         request_body = _safe_body(_dump(kwargs))
 
         if kwargs.get("stream"):
-            def on_done(completion: str, tin: int, tout: int) -> None:
+            def on_done(
+                completion: str, tin: int, tout: int,
+                thinking: str, reasoning_tokens: int, has_redacted_thinking: bool,
+                ttft_ms: Optional[int],
+            ) -> None:
                 stream_attrs = {**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True}
                 if request_body:
                     stream_attrs["gen_ai.request.body"] = request_body
+                if reasoning_tokens:
+                    stream_attrs["gen_ai.usage.reasoning_tokens"] = reasoning_tokens
+                if ttft_ms is not None:
+                    stream_attrs["gen_ai.server.time_to_first_token_ms"] = ttft_ms
                 ek.enqueue(TraceEnvelope(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                     span_type="llm_call", status="OK", operation="litellm.completion",
@@ -104,7 +128,7 @@ def _patch_sync(ek: "EvalKitClient", litellm: Any) -> None:
                     created_at=ts, attributes=stream_attrs,
                     environment=ek._opts.environment, app_version=ek._opts.app_version, sdk_version=SDK_VERSION,
                 ))
-            return _SyncStreamTracer(original(*args, **kwargs), on_done)
+            return _SyncStreamTracer(original(*args, **kwargs), on_done, start_ms=start_ms)
 
         span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
         token = _current_span.set(span_ctx)
@@ -126,7 +150,13 @@ def _patch_sync(ek: "EvalKitClient", litellm: Any) -> None:
 
         end_ts = _now_iso()
         tin, tout = _usage(result)
+        reasoning_tokens = _reasoning_tokens(result)
+        reasoning_content = _reasoning_content(result)
         attrs = {**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.usage.total_tokens": tin + tout}
+        if reasoning_tokens:
+            attrs["gen_ai.usage.reasoning_tokens"] = reasoning_tokens
+        if reasoning_content:
+            attrs["gen_ai.response.thinking"] = reasoning_content
         if request_body:
             attrs["gen_ai.request.body"] = request_body
         response_body = _safe_body(_dump(result))
@@ -168,10 +198,18 @@ def _patch_async(ek: "EvalKitClient", litellm: Any) -> None:
         request_body = _safe_body(_dump(kwargs))
 
         if kwargs.get("stream"):
-            def on_done(completion: str, tin: int, tout: int) -> None:
+            def on_done(
+                completion: str, tin: int, tout: int,
+                thinking: str, reasoning_tokens: int, has_redacted_thinking: bool,
+                ttft_ms: Optional[int],
+            ) -> None:
                 stream_attrs = {**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True}
                 if request_body:
                     stream_attrs["gen_ai.request.body"] = request_body
+                if reasoning_tokens:
+                    stream_attrs["gen_ai.usage.reasoning_tokens"] = reasoning_tokens
+                if ttft_ms is not None:
+                    stream_attrs["gen_ai.server.time_to_first_token_ms"] = ttft_ms
                 ek.enqueue(TraceEnvelope(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                     span_type="llm_call", status="OK", operation="litellm.acompletion",
@@ -182,7 +220,7 @@ def _patch_async(ek: "EvalKitClient", litellm: Any) -> None:
                     environment=ek._opts.environment, app_version=ek._opts.app_version, sdk_version=SDK_VERSION,
                 ))
             raw = await original(*args, **kwargs)
-            return _AsyncStreamTracer(raw, on_done)
+            return _AsyncStreamTracer(raw, on_done, start_ms=start_ms)
 
         span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
         token = _current_span.set(span_ctx)
@@ -204,7 +242,13 @@ def _patch_async(ek: "EvalKitClient", litellm: Any) -> None:
 
         end_ts = _now_iso()
         tin, tout = _usage(result)
+        reasoning_tokens = _reasoning_tokens(result)
+        reasoning_content = _reasoning_content(result)
         attrs = {**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.usage.total_tokens": tin + tout}
+        if reasoning_tokens:
+            attrs["gen_ai.usage.reasoning_tokens"] = reasoning_tokens
+        if reasoning_content:
+            attrs["gen_ai.response.thinking"] = reasoning_content
         if request_body:
             attrs["gen_ai.request.body"] = request_body
         response_body = _safe_body(_dump(result))

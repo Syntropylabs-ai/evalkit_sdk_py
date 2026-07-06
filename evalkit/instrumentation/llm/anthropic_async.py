@@ -10,7 +10,7 @@ from ...core.types import SpanEvent, TraceEnvelope
 from .._streaming import _AsyncStreamTracer
 from .._toolcalls import from_anthropic_blocks
 from ._bodies import _dump, _safe_body
-from .anthropic import _build_prompt
+from .anthropic import _build_prompt, _extract_thinking
 
 _PROMPT_MAX = 32768
 _COMPLETION_MAX = 32768
@@ -44,12 +44,22 @@ def patch_async_anthropic(
         request_body = _safe_body(_dump(kwargs))
 
         if kwargs.get("stream"):
-            def on_stream_done(completion: str, tokens_in: int, tokens_out: int) -> None:
+            def on_stream_done(
+                completion: str, tokens_in: int, tokens_out: int,
+                thinking: str, reasoning_tokens: int, has_redacted_thinking: bool,
+                ttft_ms: Optional[int],
+            ) -> None:
                 end_ts = _now_iso()
                 latency = int(time.time() * 1000 - start_ms)
                 stream_attrs = {**client._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True}
                 if request_body:
                     stream_attrs["gen_ai.request.body"] = request_body
+                if thinking:
+                    stream_attrs["gen_ai.response.thinking"] = thinking[:_COMPLETION_MAX]
+                if has_redacted_thinking:
+                    stream_attrs["gen_ai.response.has_redacted_thinking"] = True
+                if ttft_ms is not None:
+                    stream_attrs["gen_ai.server.time_to_first_token_ms"] = ttft_ms
                 client.enqueue(TraceEnvelope(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                     span_type="llm_call", status="OK",
@@ -63,7 +73,7 @@ def patch_async_anthropic(
                     sdk_version=SDK_VERSION,
                 ))
             raw = await original_create(*args, **kwargs)
-            return _AsyncStreamTracer(raw, on_stream_done, is_anthropic=True)
+            return _AsyncStreamTracer(raw, on_stream_done, is_anthropic=True, start_ms=start_ms)
 
         span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
         token = _current_span.set(span_ctx)
@@ -92,6 +102,7 @@ def patch_async_anthropic(
         latency = int(time.time() * 1000 - start_ms)
 
         text_content = ""
+        thinking_text, has_redacted_thinking = _extract_thinking(getattr(result, "content", []))
         for block in getattr(result, "content", []):
             if getattr(block, "type", None) == "text":
                 text_content += getattr(block, "text", "")
@@ -114,6 +125,10 @@ def patch_async_anthropic(
         stop_reason = getattr(result, "stop_reason", None)
         if stop_reason:
             attrs["gen_ai.response.finish_reasons"] = [stop_reason]
+        if thinking_text:
+            attrs["gen_ai.response.thinking"] = thinking_text[:_COMPLETION_MAX]
+        if has_redacted_thinking:
+            attrs["gen_ai.response.has_redacted_thinking"] = True
         if request_body:
             attrs["gen_ai.request.body"] = request_body
         response_body = _safe_body(_dump(result))

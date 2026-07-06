@@ -23,6 +23,12 @@ from .instrumentation.llm.google_genai import patch_google_genai as _patch_googl
 from .instrumentation.llm.mistral import patch_mistral, patch_async_mistral
 from .instrumentation.llm.langchain import patch_langchain as _patch_langchain
 from .instrumentation.llm.litellm import patch_litellm as _patch_litellm
+from .instrumentation.llm.ollama import patch_ollama as _patch_ollama
+from .instrumentation.vectordb.pinecone import patch_pinecone as _patch_pinecone
+from .instrumentation.vectordb.qdrant import patch_qdrant as _patch_qdrant
+from .instrumentation.vectordb.chroma import patch_chroma as _patch_chroma
+from .instrumentation.vectordb.weaviate import patch_weaviate as _patch_weaviate
+from .instrumentation.llm.llamaindex import patch_llamaindex as _patch_llamaindex
 from .instrumentation.llm.claude_agent_sdk import patch_claude_agent_sdk as _patch_claude_agent_sdk
 from .instrumentation.llm.google_live import (
     trace_google_live as _trace_google_live,
@@ -78,6 +84,12 @@ __all__ = [
     "patch_google_genai",
     "patch_langchain",
     "patch_litellm",
+    "patch_ollama",
+    "patch_pinecone",
+    "patch_qdrant",
+    "patch_chroma",
+    "patch_weaviate",
+    "patch_llamaindex",
     "patch_claude_agent_sdk",
     "trace_google_live",
     "trace_openai_realtime",
@@ -270,6 +282,38 @@ def patch_langchain() -> Any:
 def patch_litellm() -> None:
     """Instrument litellm.completion/acompletion. Called by init() automatically."""
     _patch_litellm(_get_instance())
+
+
+def patch_ollama() -> None:
+    """Instrument ollama.Client/AsyncClient.chat. Called by init() automatically."""
+    _patch_ollama(_get_instance())
+
+
+def patch_pinecone() -> None:
+    """Instrument pinecone.Index.query/upsert as db_query spans. Called by init() automatically."""
+    _patch_pinecone(_get_instance())
+
+
+def patch_qdrant() -> None:
+    """Instrument qdrant_client.QdrantClient.query_points/upsert as db_query spans. Called by init() automatically."""
+    _patch_qdrant(_get_instance())
+
+
+def patch_chroma() -> None:
+    """Instrument chromadb Collection.query/add/upsert as db_query spans. Called by init() automatically."""
+    _patch_chroma(_get_instance())
+
+
+def patch_weaviate() -> None:
+    """Instrument weaviate-client near_vector query + insert/insert_many as db_query spans.
+    Called by init() automatically."""
+    _patch_weaviate(_get_instance())
+
+
+def patch_llamaindex() -> None:
+    """Register evalkit's handlers on LlamaIndex's instrumentation dispatcher, capturing
+    llm/embedding/retrieval/query/rerank spans. Called by init() automatically."""
+    _patch_llamaindex(_get_instance())
 
 
 def patch_claude_agent_sdk() -> None:

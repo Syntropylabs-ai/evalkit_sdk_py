@@ -43,12 +43,22 @@ def patch_anthropic(
         request_body = _safe_body(_dump(kwargs))
 
         if kwargs.get("stream"):
-            def on_stream_done(completion: str, tokens_in: int, tokens_out: int) -> None:
+            def on_stream_done(
+                completion: str, tokens_in: int, tokens_out: int,
+                thinking: str, reasoning_tokens: int, has_redacted_thinking: bool,
+                ttft_ms: Optional[int],
+            ) -> None:
                 end_ts = _now_iso()
                 latency = int(time.time() * 1000 - start_ms)
                 stream_attrs = {**client._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True}
                 if request_body:
                     stream_attrs["gen_ai.request.body"] = request_body
+                if thinking:
+                    stream_attrs["gen_ai.response.thinking"] = thinking[:_COMPLETION_MAX]
+                if has_redacted_thinking:
+                    stream_attrs["gen_ai.response.has_redacted_thinking"] = True
+                if ttft_ms is not None:
+                    stream_attrs["gen_ai.server.time_to_first_token_ms"] = ttft_ms
                 client.enqueue(TraceEnvelope(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                     span_type="llm_call", status="OK",
@@ -61,7 +71,7 @@ def patch_anthropic(
                     environment=client._opts.environment, app_version=client._opts.app_version,
                     sdk_version=SDK_VERSION,
                 ))
-            return _SyncStreamTracer(original_create(*args, **kwargs), on_stream_done, is_anthropic=True)
+            return _SyncStreamTracer(original_create(*args, **kwargs), on_stream_done, is_anthropic=True, start_ms=start_ms)
 
         span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
         token = _current_span.set(span_ctx)
@@ -90,6 +100,7 @@ def patch_anthropic(
         latency = int(time.time() * 1000 - start_ms)
 
         text_content = ""
+        thinking_text, has_redacted_thinking = _extract_thinking(getattr(result, "content", []))
         for block in getattr(result, "content", []):
             if getattr(block, "type", None) == "text":
                 text_content += getattr(block, "text", "")
@@ -112,6 +123,10 @@ def patch_anthropic(
         stop_reason = getattr(result, "stop_reason", None)
         if stop_reason:
             attrs["gen_ai.response.finish_reasons"] = [stop_reason]
+        if thinking_text:
+            attrs["gen_ai.response.thinking"] = thinking_text[:_COMPLETION_MAX]
+        if has_redacted_thinking:
+            attrs["gen_ai.response.has_redacted_thinking"] = True
         if request_body:
             attrs["gen_ai.request.body"] = request_body
         response_body = _safe_body(_dump(result))
@@ -134,6 +149,25 @@ def patch_anthropic(
 
     traced_create._evalkit = True  # type: ignore[attr-defined]
     messages_api.create = traced_create
+
+
+def _extract_thinking(blocks: List[Any]) -> "tuple[str, bool]":
+    """Pulls extended-thinking text out of an Anthropic response's content blocks.
+
+    Returns (thinking_text, has_redacted_thinking). Redacted blocks carry only an
+    opaque encrypted payload (no readable text), so we just flag their presence.
+    """
+    parts: List[str] = []
+    has_redacted = False
+    for block in blocks or []:
+        btype = block.get("type") if isinstance(block, dict) else getattr(block, "type", None)
+        if btype == "thinking":
+            text = block.get("thinking", "") if isinstance(block, dict) else getattr(block, "thinking", "")
+            if text:
+                parts.append(text)
+        elif btype == "redacted_thinking":
+            has_redacted = True
+    return "".join(parts), has_redacted
 
 
 def _build_prompt(system: Optional[str], messages: List[Dict[str, Any]]) -> str:

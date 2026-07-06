@@ -83,6 +83,7 @@ def patch_bedrock(client: EvalKitClient, bedrock_runtime_client: Any) -> None:
         completion = " ".join(
             c.get("text", "") for c in output_content if isinstance(c, dict) and "text" in c
         )
+        thinking_text, has_redacted_thinking = _extract_reasoning(output_content)
 
         usage = result.get("usage", {})
         tokens_in = usage.get("inputTokens", 0) or 0
@@ -101,6 +102,10 @@ def patch_bedrock(client: EvalKitClient, bedrock_runtime_client: Any) -> None:
             attrs["gen_ai.request.max_tokens"] = max_tokens
         if stop_reason:
             attrs["gen_ai.response.finish_reasons"] = [stop_reason]
+        if thinking_text:
+            attrs["gen_ai.response.thinking"] = thinking_text
+        if has_redacted_thinking:
+            attrs["gen_ai.response.has_redacted_thinking"] = True
         if request_body:
             attrs["gen_ai.request.body"] = request_body
         response_body = _safe_body(_dump(result))
@@ -124,3 +129,26 @@ def patch_bedrock(client: EvalKitClient, bedrock_runtime_client: Any) -> None:
     traced_converse._evalkit = True  # type: ignore[attr-defined]
     bedrock_runtime_client.converse = traced_converse
     bedrock_runtime_client._evalkit = True
+
+
+def _extract_reasoning(content: list) -> "tuple[str, bool]":
+    """Pulls Converse API reasoningContent blocks out of the output message.
+
+    Anthropic (and other reasoning-capable) models on Bedrock surface their
+    chain-of-thought as `{"reasoningContent": {"reasoningText": {"text": ...}}}`;
+    redacted variants carry only an opaque encrypted payload, so we just flag them.
+    """
+    parts: list = []
+    has_redacted = False
+    for c in content or []:
+        if not isinstance(c, dict):
+            continue
+        reasoning = c.get("reasoningContent")
+        if not isinstance(reasoning, dict):
+            continue
+        text = reasoning.get("reasoningText", {}).get("text", "") if isinstance(reasoning.get("reasoningText"), dict) else ""
+        if text:
+            parts.append(text)
+        if "redactedContent" in reasoning:
+            has_redacted = True
+    return "".join(parts), has_redacted

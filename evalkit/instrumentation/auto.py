@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING
 
 from ._streaming import _AsyncStreamTracer, _SyncStreamTracer
 from ._toolcalls import from_anthropic_blocks, from_openai_chat, from_openai_responses
+from .llm.anthropic import _extract_thinking
+from .llm.bedrock import _extract_reasoning as _extract_bedrock_reasoning
 from ..core.client import _exc_attrs  # standard exception attributes for error spans
 
 if TYPE_CHECKING:
@@ -54,9 +56,18 @@ def _patch_openai_class_sync(ek: "EvalKitClient", cls, provider: str = "openai")
         prompt = "\n".join(f"{m.get('role','')}: {m.get('content','')}" for m in messages)
 
         if kwargs.get("stream"):
-            def on_stream_done(completion: str, tokens_in: int, tokens_out: int) -> None:
+            def on_stream_done(
+                completion: str, tokens_in: int, tokens_out: int,
+                thinking: str, reasoning_tokens: int, has_redacted_thinking: bool,
+                ttft_ms=None,
+            ) -> None:
                 end_ts = _now_iso()
                 latency = int(time.time() * 1000 - start_ms)
+                stream_attrs = {**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True}
+                if reasoning_tokens:
+                    stream_attrs["gen_ai.usage.reasoning_tokens"] = reasoning_tokens
+                if ttft_ms is not None:
+                    stream_attrs["gen_ai.server.time_to_first_token_ms"] = ttft_ms
                 ek.enqueue(TraceEnvelope(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                     span_type="llm_call", status="OK",
@@ -65,11 +76,11 @@ def _patch_openai_class_sync(ek: "EvalKitClient", cls, provider: str = "openai")
                     prompt=prompt, completion=completion,
                     tokens_in=tokens_in, tokens_out=tokens_out,
                     latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
-                    attributes={**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True},
+                    attributes=stream_attrs,
                     environment=ek._opts.environment, app_version=ek._opts.app_version,
                     sdk_version=SDK_VERSION,
                 ))
-            return _SyncStreamTracer(original(self, *args, **kwargs), on_stream_done)
+            return _SyncStreamTracer(original(self, *args, **kwargs), on_stream_done, start_ms=start_ms)
 
         span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
         token = _current_span.set(span_ctx)
@@ -93,7 +104,7 @@ def _patch_openai_class_sync(ek: "EvalKitClient", cls, provider: str = "openai")
             _current_span.reset(token)
         end_ts = _now_iso()
         latency = int(time.time() * 1000 - start_ms)
-       
+
         if not hasattr(result, "choices"):
             return result
         try:
@@ -102,7 +113,14 @@ def _patch_openai_class_sync(ek: "EvalKitClient", cls, provider: str = "openai")
             usage = getattr(result, "usage", None)
             tokens_in = getattr(usage, "prompt_tokens", 0) or 0
             tokens_out = getattr(usage, "completion_tokens", 0) or 0
+            completion_details = getattr(usage, "completion_tokens_details", None)
+            reasoning_tokens = getattr(completion_details, "reasoning_tokens", 0) or 0
             events = from_openai_chat(result, end_ts)
+            attrs = {**ek._meta_attrs(), "gen_ai.request.model": model,
+                     "gen_ai.response.model": getattr(result, "model", model),
+                     "gen_ai.usage.total_tokens": getattr(usage, "total_tokens", 0) or 0}
+            if reasoning_tokens:
+                attrs["gen_ai.usage.reasoning_tokens"] = reasoning_tokens
             ek.enqueue(TraceEnvelope(
                 trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                 span_type="llm_call", status="OK",
@@ -112,9 +130,7 @@ def _patch_openai_class_sync(ek: "EvalKitClient", cls, provider: str = "openai")
                 tokens_in=tokens_in, tokens_out=tokens_out,
                 latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
                 events=events or None,
-                attributes={**ek._meta_attrs(), "gen_ai.request.model": model,
-                            "gen_ai.response.model": getattr(result, "model", model),
-                            "gen_ai.usage.total_tokens": getattr(usage, "total_tokens", 0) or 0},
+                attributes=attrs,
                 environment=ek._opts.environment, app_version=ek._opts.app_version,
                 sdk_version=SDK_VERSION,
             ))
@@ -149,9 +165,18 @@ def _patch_openai_class_async(ek: "EvalKitClient", cls, provider: str = "openai"
         prompt = "\n".join(f"{m.get('role','')}: {m.get('content','')}" for m in messages)
 
         if kwargs.get("stream"):
-            def on_stream_done(completion: str, tokens_in: int, tokens_out: int) -> None:
+            def on_stream_done(
+                completion: str, tokens_in: int, tokens_out: int,
+                thinking: str, reasoning_tokens: int, has_redacted_thinking: bool,
+                ttft_ms=None,
+            ) -> None:
                 end_ts = _now_iso()
                 latency = int(time.time() * 1000 - start_ms)
+                stream_attrs = {**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True}
+                if reasoning_tokens:
+                    stream_attrs["gen_ai.usage.reasoning_tokens"] = reasoning_tokens
+                if ttft_ms is not None:
+                    stream_attrs["gen_ai.server.time_to_first_token_ms"] = ttft_ms
                 ek.enqueue(TraceEnvelope(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                     span_type="llm_call", status="OK",
@@ -160,12 +185,12 @@ def _patch_openai_class_async(ek: "EvalKitClient", cls, provider: str = "openai"
                     prompt=prompt, completion=completion,
                     tokens_in=tokens_in, tokens_out=tokens_out,
                     latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
-                    attributes={**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True},
+                    attributes=stream_attrs,
                     environment=ek._opts.environment, app_version=ek._opts.app_version,
                     sdk_version=SDK_VERSION,
                 ))
             raw = await original(self, *args, **kwargs)
-            return _AsyncStreamTracer(raw, on_stream_done)
+            return _AsyncStreamTracer(raw, on_stream_done, start_ms=start_ms)
 
         span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
         token = _current_span.set(span_ctx)
@@ -197,7 +222,14 @@ def _patch_openai_class_async(ek: "EvalKitClient", cls, provider: str = "openai"
             usage = getattr(result, "usage", None)
             tokens_in = getattr(usage, "prompt_tokens", 0) or 0
             tokens_out = getattr(usage, "completion_tokens", 0) or 0
+            completion_details = getattr(usage, "completion_tokens_details", None)
+            reasoning_tokens = getattr(completion_details, "reasoning_tokens", 0) or 0
             events = from_openai_chat(result, end_ts)
+            attrs = {**ek._meta_attrs(), "gen_ai.request.model": model,
+                     "gen_ai.response.model": getattr(result, "model", model),
+                     "gen_ai.usage.total_tokens": getattr(usage, "total_tokens", 0) or 0}
+            if reasoning_tokens:
+                attrs["gen_ai.usage.reasoning_tokens"] = reasoning_tokens
             ek.enqueue(TraceEnvelope(
                 trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                 span_type="llm_call", status="OK",
@@ -207,9 +239,7 @@ def _patch_openai_class_async(ek: "EvalKitClient", cls, provider: str = "openai"
                 tokens_in=tokens_in, tokens_out=tokens_out,
                 latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
                 events=events or None,
-                attributes={**ek._meta_attrs(), "gen_ai.request.model": model,
-                            "gen_ai.response.model": getattr(result, "model", model),
-                            "gen_ai.usage.total_tokens": getattr(usage, "total_tokens", 0) or 0},
+                attributes=attrs,
                 environment=ek._opts.environment, app_version=ek._opts.app_version,
                 sdk_version=SDK_VERSION,
             ))
@@ -291,20 +321,29 @@ def _patch_anthropic_stream_sync(ek: "EvalKitClient", cls) -> None:
                 end_ts = _now_iso()
                 latency = int(time.time() * 1000 - start_ms)
                 completion = ""
+                thinking_text = ""
+                has_redacted_thinking = False
                 tokens_in = tokens_out = 0
                 events = []
                 try:
                     final_msg = self_inner._underlying.get_final_message()
-                    for block in getattr(final_msg, "content", []):
+                    content = getattr(final_msg, "content", [])
+                    for block in content:
                         if hasattr(block, "text"):
                             completion += block.text
-                    events = from_anthropic_blocks(getattr(final_msg, "content", []), end_ts)
+                    thinking_text, has_redacted_thinking = _extract_thinking(content)
+                    events = from_anthropic_blocks(content, end_ts)
                     usage = getattr(final_msg, "usage", None)
                     tokens_in = getattr(usage, "input_tokens", 0) or 0
                     tokens_out = getattr(usage, "output_tokens", 0) or 0
                 except Exception:
                     pass
                 status = "ERROR" if exc_type else "OK"
+                stream_attrs = {**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True}
+                if thinking_text:
+                    stream_attrs["gen_ai.response.thinking"] = thinking_text[:32768]
+                if has_redacted_thinking:
+                    stream_attrs["gen_ai.response.has_redacted_thinking"] = True
                 ek.enqueue(TraceEnvelope(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                     span_type="llm_call", status=status,
@@ -314,7 +353,7 @@ def _patch_anthropic_stream_sync(ek: "EvalKitClient", cls) -> None:
                     tokens_in=tokens_in, tokens_out=tokens_out,
                     latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
                     events=events or None,
-                    attributes={**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True},
+                    attributes=stream_attrs,
                     environment=ek._opts.environment, app_version=ek._opts.app_version,
                     sdk_version=SDK_VERSION,
                 ))
@@ -369,20 +408,29 @@ def _patch_anthropic_stream_async(ek: "EvalKitClient", cls) -> None:
                 end_ts = _now_iso()
                 latency = int(time.time() * 1000 - start_ms)
                 completion = ""
+                thinking_text = ""
+                has_redacted_thinking = False
                 tokens_in = tokens_out = 0
                 events = []
                 try:
                     final_msg = await self_inner._underlying.get_final_message()
-                    for block in getattr(final_msg, "content", []):
+                    content = getattr(final_msg, "content", [])
+                    for block in content:
                         if hasattr(block, "text"):
                             completion += block.text
-                    events = from_anthropic_blocks(getattr(final_msg, "content", []), end_ts)
+                    thinking_text, has_redacted_thinking = _extract_thinking(content)
+                    events = from_anthropic_blocks(content, end_ts)
                     usage = getattr(final_msg, "usage", None)
                     tokens_in = getattr(usage, "input_tokens", 0) or 0
                     tokens_out = getattr(usage, "output_tokens", 0) or 0
                 except Exception:
                     pass
                 status = "ERROR" if exc_type else "OK"
+                stream_attrs = {**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True}
+                if thinking_text:
+                    stream_attrs["gen_ai.response.thinking"] = thinking_text[:32768]
+                if has_redacted_thinking:
+                    stream_attrs["gen_ai.response.has_redacted_thinking"] = True
                 ek.enqueue(TraceEnvelope(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                     span_type="llm_call", status=status,
@@ -392,7 +440,7 @@ def _patch_anthropic_stream_async(ek: "EvalKitClient", cls) -> None:
                     tokens_in=tokens_in, tokens_out=tokens_out,
                     latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
                     events=events or None,
-                    attributes={**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True},
+                    attributes=stream_attrs,
                     environment=ek._opts.environment, app_version=ek._opts.app_version,
                     sdk_version=SDK_VERSION,
                 ))
@@ -431,9 +479,20 @@ def _patch_anthropic_class_sync(ek: "EvalKitClient", cls) -> None:
         prompt = "\n".join(parts)
 
         if kwargs.get("stream"):
-            def on_stream_done(completion: str, tokens_in: int, tokens_out: int) -> None:
+            def on_stream_done(
+                completion: str, tokens_in: int, tokens_out: int,
+                thinking: str, reasoning_tokens: int, has_redacted_thinking: bool,
+                ttft_ms=None,
+            ) -> None:
                 end_ts = _now_iso()
                 latency = int(time.time() * 1000 - start_ms)
+                stream_attrs = {**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True}
+                if thinking:
+                    stream_attrs["gen_ai.response.thinking"] = thinking[:32768]
+                if has_redacted_thinking:
+                    stream_attrs["gen_ai.response.has_redacted_thinking"] = True
+                if ttft_ms is not None:
+                    stream_attrs["gen_ai.server.time_to_first_token_ms"] = ttft_ms
                 ek.enqueue(TraceEnvelope(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                     span_type="llm_call", status="OK",
@@ -442,11 +501,11 @@ def _patch_anthropic_class_sync(ek: "EvalKitClient", cls) -> None:
                     prompt=prompt, completion=completion,
                     tokens_in=tokens_in, tokens_out=tokens_out,
                     latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
-                    attributes={**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True},
+                    attributes=stream_attrs,
                     environment=ek._opts.environment, app_version=ek._opts.app_version,
                     sdk_version=SDK_VERSION,
                 ))
-            return _SyncStreamTracer(original(self, *args, **kwargs), on_stream_done, is_anthropic=True)
+            return _SyncStreamTracer(original(self, *args, **kwargs), on_stream_done, is_anthropic=True, start_ms=start_ms)
 
         span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
         token = _current_span.set(span_ctx)
@@ -472,6 +531,7 @@ def _patch_anthropic_class_sync(ek: "EvalKitClient", cls) -> None:
         latency = int(time.time() * 1000 - start_ms)
         content = getattr(result, "content", [])
         completion = next((b.text for b in content if hasattr(b, "text")), "")
+        thinking_text, has_redacted_thinking = _extract_thinking(content)
         usage = getattr(result, "usage", None)
         tokens_in = getattr(usage, "input_tokens", 0) or 0
         tokens_out = getattr(usage, "output_tokens", 0) or 0
@@ -486,6 +546,10 @@ def _patch_anthropic_class_sync(ek: "EvalKitClient", cls) -> None:
         }
         if stop_reason:
             attrs["gen_ai.response.finish_reasons"] = [stop_reason]
+        if thinking_text:
+            attrs["gen_ai.response.thinking"] = thinking_text[:32768]
+        if has_redacted_thinking:
+            attrs["gen_ai.response.has_redacted_thinking"] = True
         ek.enqueue(TraceEnvelope(
             trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
             span_type="llm_call", status="OK",
@@ -532,9 +596,20 @@ def _patch_anthropic_class_async(ek: "EvalKitClient", cls) -> None:
         prompt = "\n".join(parts)
 
         if kwargs.get("stream"):
-            def on_stream_done(completion: str, tokens_in: int, tokens_out: int) -> None:
+            def on_stream_done(
+                completion: str, tokens_in: int, tokens_out: int,
+                thinking: str, reasoning_tokens: int, has_redacted_thinking: bool,
+                ttft_ms=None,
+            ) -> None:
                 end_ts = _now_iso()
                 latency = int(time.time() * 1000 - start_ms)
+                stream_attrs = {**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True}
+                if thinking:
+                    stream_attrs["gen_ai.response.thinking"] = thinking[:32768]
+                if has_redacted_thinking:
+                    stream_attrs["gen_ai.response.has_redacted_thinking"] = True
+                if ttft_ms is not None:
+                    stream_attrs["gen_ai.server.time_to_first_token_ms"] = ttft_ms
                 ek.enqueue(TraceEnvelope(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                     span_type="llm_call", status="OK",
@@ -543,12 +618,12 @@ def _patch_anthropic_class_async(ek: "EvalKitClient", cls) -> None:
                     prompt=prompt, completion=completion,
                     tokens_in=tokens_in, tokens_out=tokens_out,
                     latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
-                    attributes={**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True},
+                    attributes=stream_attrs,
                     environment=ek._opts.environment, app_version=ek._opts.app_version,
                     sdk_version=SDK_VERSION,
                 ))
             raw = await original(self, *args, **kwargs)
-            return _AsyncStreamTracer(raw, on_stream_done, is_anthropic=True)
+            return _AsyncStreamTracer(raw, on_stream_done, is_anthropic=True, start_ms=start_ms)
 
         span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
         token = _current_span.set(span_ctx)
@@ -574,6 +649,7 @@ def _patch_anthropic_class_async(ek: "EvalKitClient", cls) -> None:
         latency = int(time.time() * 1000 - start_ms)
         content = getattr(result, "content", [])
         completion = next((b.text for b in content if hasattr(b, "text")), "")
+        thinking_text, has_redacted_thinking = _extract_thinking(content)
         usage = getattr(result, "usage", None)
         tokens_in = getattr(usage, "input_tokens", 0) or 0
         tokens_out = getattr(usage, "output_tokens", 0) or 0
@@ -588,6 +664,10 @@ def _patch_anthropic_class_async(ek: "EvalKitClient", cls) -> None:
         }
         if stop_reason:
             attrs["gen_ai.response.finish_reasons"] = [stop_reason]
+        if thinking_text:
+            attrs["gen_ai.response.thinking"] = thinking_text[:32768]
+        if has_redacted_thinking:
+            attrs["gen_ai.response.has_redacted_thinking"] = True
         ek.enqueue(TraceEnvelope(
             trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
             span_type="llm_call", status="OK",
@@ -1113,6 +1193,84 @@ def _try_patch_litellm(ek: "EvalKitClient") -> None:
         pass
 
 
+# ── Ollama ────────────────────────────────────────────────────────────────────
+
+def _try_patch_ollama(ek: "EvalKitClient") -> None:
+    try:
+        import ollama  # noqa: F401
+    except ImportError:
+        return
+    try:
+        from .llm.ollama import patch_ollama
+        patch_ollama(ek)
+    except Exception:
+        pass
+
+
+# ── Vector DBs (Pinecone, Qdrant, Chroma, Weaviate) ────────────────────────────
+
+def _try_patch_pinecone(ek: "EvalKitClient") -> None:
+    try:
+        import pinecone  # noqa: F401
+    except ImportError:
+        return
+    try:
+        from .vectordb.pinecone import patch_pinecone
+        patch_pinecone(ek)
+    except Exception:
+        pass
+
+
+def _try_patch_qdrant(ek: "EvalKitClient") -> None:
+    try:
+        import qdrant_client  # noqa: F401
+    except ImportError:
+        return
+    try:
+        from .vectordb.qdrant import patch_qdrant
+        patch_qdrant(ek)
+    except Exception:
+        pass
+
+
+def _try_patch_chroma(ek: "EvalKitClient") -> None:
+    try:
+        import chromadb  # noqa: F401
+    except ImportError:
+        return
+    try:
+        from .vectordb.chroma import patch_chroma
+        patch_chroma(ek)
+    except Exception:
+        pass
+
+
+def _try_patch_weaviate(ek: "EvalKitClient") -> None:
+    try:
+        import weaviate  # noqa: F401
+    except ImportError:
+        return
+    try:
+        from .vectordb.weaviate import patch_weaviate
+        patch_weaviate(ek)
+    except Exception:
+        pass
+
+
+# ── LlamaIndex ─────────────────────────────────────────────────────────────────
+
+def _try_patch_llamaindex(ek: "EvalKitClient") -> None:
+    try:
+        import llama_index.core  # noqa: F401
+    except ImportError:
+        return
+    try:
+        from .llm.llamaindex import patch_llamaindex
+        patch_llamaindex(ek)
+    except Exception:
+        pass
+
+
 # ── AWS Bedrock ───────────────────────────────────────────────────────────────
 
 def _try_patch_bedrock(ek: "EvalKitClient") -> None:
@@ -1181,9 +1339,16 @@ def _patch_bedrock_class(ek: "EvalKitClient", cls) -> None:
         out_msg = (result.get("output", {}) or {}).get("message", {}) or {}
         content = out_msg.get("content", []) or []
         completion = next((c.get("text", "") for c in content if isinstance(c, dict) and "text" in c), "")
+        thinking_text, has_redacted_thinking = _extract_bedrock_reasoning(content)
         usage = result.get("usage", {}) or {}
         tokens_in = usage.get("inputTokens", 0) or 0
         tokens_out = usage.get("outputTokens", 0) or 0
+        attrs = {**ek._meta_attrs(), "gen_ai.request.model": model,
+                 "gen_ai.usage.total_tokens": tokens_in + tokens_out}
+        if thinking_text:
+            attrs["gen_ai.response.thinking"] = thinking_text
+        if has_redacted_thinking:
+            attrs["gen_ai.response.has_redacted_thinking"] = True
         ek.enqueue(TraceEnvelope(
             trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
             span_type="llm_call", status="OK",
@@ -1192,8 +1357,7 @@ def _patch_bedrock_class(ek: "EvalKitClient", cls) -> None:
             prompt=prompt, completion=completion,
             tokens_in=tokens_in, tokens_out=tokens_out,
             latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
-            attributes={**ek._meta_attrs(), "gen_ai.request.model": model,
-                        "gen_ai.usage.total_tokens": tokens_in + tokens_out},
+            attributes=attrs,
             environment=ek._opts.environment, app_version=ek._opts.app_version,
             sdk_version=SDK_VERSION,
         ))
@@ -1417,6 +1581,12 @@ def setup_auto_instrumentation(
     _try_patch_mistral(client)
     _try_patch_groq(client)
     _try_patch_litellm(client)
+    _try_patch_ollama(client)
+    _try_patch_pinecone(client)
+    _try_patch_qdrant(client)
+    _try_patch_chroma(client)
+    _try_patch_weaviate(client)
+    _try_patch_llamaindex(client)
     _try_patch_langchain(client)
     _try_patch_databases(client)
     _try_patch_claude_agent_sdk(client)

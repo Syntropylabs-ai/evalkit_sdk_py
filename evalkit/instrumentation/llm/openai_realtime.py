@@ -25,6 +25,11 @@ import json
 import time
 from typing import TYPE_CHECKING, Any, Optional
 
+from ..._version import SDK_VERSION
+from ...core.client import _new_span_id, _now_iso
+from ...core.types import SpanEvent, TraceEnvelope
+from ._bodies import _dump, _safe_body
+
 if TYPE_CHECKING:
     from ...core.client import EvalKitClient
 
@@ -82,7 +87,12 @@ class _ObservedConnection:
         self.__dict__["_ctx"] = ctx
         self.__dict__["_end_session"] = end_session
         self.__dict__["_closed"] = False
+        self._reset_turn()
+
+    def _reset_turn(self) -> None:
         self.__dict__["_buf"] = []
+        self.__dict__["_input_parts"] = []
+        self.__dict__["_tool_events"] = []
         self.__dict__["_turn_start"] = time.time() * 1000
 
     def _emit_tool_call(self, name: Any, args: Any, call_id: Any = None) -> None:
@@ -95,6 +105,11 @@ class _ObservedConnection:
                 args_str = json.dumps(args or {})[:_MAX_TEXT]
         except Exception:
             args_str = str(args)[:_MAX_TEXT]
+        self._tool_events.append(SpanEvent(
+            name="gen_ai.tool.call",
+            timestamp=_now_iso(),
+            attributes={"gen_ai.tool.name": str(name), "gen_ai.tool.call.arguments": args_str},
+        ))
         attrs = {
             **self._base,
             "evalkit.span_type": "tool_call",
@@ -127,28 +142,67 @@ class _ObservedConnection:
 
     def _end_turn(self, response: Any = None) -> None:
         try:
-            text = "".join(self._buf).strip()
-            ms = int(time.time() * 1000 - self._turn_start)
-            self._buf.clear()
-            self.__dict__["_turn_start"] = time.time() * 1000
+            prompt = "\n".join(self._input_parts).strip()
+            completion = "".join(self._buf).strip()
+            latency_ms = int(time.time() * 1000 - self._turn_start)
+            events = self._tool_events
             if response is not None:
                 self._scan_output_items(response)
-            if not text:
-                return  # skip audio-only turns with no transcript
-            end, _c = self._ek.start_span("voice.turn", {
-                **self._base,
-                "evalkit.span_type": "llm_call",
-                "evalkit.completion": text[:_MAX_TEXT],
-                "llm.turn_ms": ms,
-            }, self._ctx)
-            end("OK")
+                events = self._tool_events  # _scan_output_items may have appended more
+            self._reset_turn()
+
+            if not prompt and not completion:
+                return  # skip audio-only turns with no transcript at all
+
+            attrs = dict(self._base)
+            usage = _event_get(response, "usage") if response is not None else None
+            tokens_in = _event_get(usage, "input_tokens") or 0 if usage else 0
+            tokens_out = _event_get(usage, "output_tokens") or 0 if usage else 0
+            total_tokens = _event_get(usage, "total_tokens") or 0 if usage else 0
+            if usage is not None:
+                attrs["gen_ai.usage.total_tokens"] = total_tokens or (tokens_in + tokens_out)
+            resp_body = _safe_body(_dump(response)) if response is not None else None
+            if resp_body:
+                attrs["gen_ai.response.body"] = resp_body
+
+            ts = _now_iso()
+            self._ek.enqueue(TraceEnvelope(
+                trace_id=self._ctx.trace_id,
+                span_id=_new_span_id(),
+                parent_span_id=self._ctx.span_id,
+                created_at=ts,
+                span_type="llm_call",
+                status="OK",
+                operation="voice.turn",
+                service_name=self._ek._opts.service_name,
+                model=self._base.get("gen_ai.request.model"),
+                provider="openai-realtime",
+                prompt=prompt[:_MAX_TEXT] or None,
+                completion=completion[:_MAX_TEXT] or None,
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
+                latency_ms=latency_ms,
+                start_time=ts,
+                end_time=ts,
+                events=events or None,
+                attributes=attrs,
+                environment=self._ek._opts.environment,
+                app_version=self._ek._opts.app_version,
+                session_id=self._ctx.session_id,
+                device_id=self._ctx.device_id,
+                sdk_version=SDK_VERSION,
+            ))
         except Exception:
             pass
 
     def _observe(self, event: Any) -> None:
         try:
             etype = _event_type(event)
-            if etype in self._DELTA_TYPES:
+            if etype == "conversation.item.input_audio_transcription.completed":
+                transcript = _event_get(event, "transcript")
+                if isinstance(transcript, str) and transcript:
+                    self._input_parts.append(transcript)
+            elif etype in self._DELTA_TYPES:
                 delta = _event_get(event, "delta")
                 if isinstance(delta, str) and delta:
                     self._buf.append(delta)

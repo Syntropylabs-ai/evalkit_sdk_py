@@ -1,64 +1,103 @@
 from __future__ import annotations
 
-from typing import Callable
+import time
+from typing import Callable, Optional
 
 
-class _SyncStreamTracer:
-    def __init__(self, stream: object, on_done: Callable[[str, int, int], None], *, is_anthropic: bool = False) -> None:
-        self._stream = stream
-        self._on_done = on_done
-        self._done = False
-        self._chunks: list[str] = []
-        self._tokens_in = 0
-        self._tokens_out = 0
-        self._is_anthropic = is_anthropic
+class _StreamState:
+    """Shared accumulator/parsing logic for the sync and async stream tracers."""
 
-    def _process_openai_chunk(self, chunk: object) -> object:
+    def __init__(self, start_ms: Optional[float] = None) -> None:
+        self.chunks: list[str] = []
+        self.thinking_chunks: list[str] = []
+        self.tokens_in = 0
+        self.tokens_out = 0
+        self.reasoning_tokens = 0
+        self.has_redacted_thinking = False
+        self.start_ms = start_ms
+        self.ttft_ms: Optional[int] = None
+
+    def _mark_first_token(self) -> None:
+        if self.ttft_ms is None and self.start_ms is not None:
+            self.ttft_ms = int(time.time() * 1000 - self.start_ms)
+
+    def process_openai_chunk(self, chunk: object) -> None:
         choices = getattr(chunk, "choices", None)
         if choices:
             delta = getattr(choices[0], "delta", None)
             if delta:
                 c = getattr(delta, "content", None)
                 if c:
-                    self._chunks.append(c)
+                    self._mark_first_token()
+                    self.chunks.append(c)
         usage = getattr(chunk, "usage", None)
         if usage:
-            self._tokens_in = getattr(usage, "prompt_tokens", 0) or 0
-            self._tokens_out = getattr(usage, "completion_tokens", 0) or 0
-        return chunk
+            self.tokens_in = getattr(usage, "prompt_tokens", 0) or 0
+            self.tokens_out = getattr(usage, "completion_tokens", 0) or 0
+            details = getattr(usage, "completion_tokens_details", None)
+            if details:
+                self.reasoning_tokens = getattr(details, "reasoning_tokens", 0) or 0
 
-    def _process_anthropic_chunk(self, event: object) -> object:
+    def process_anthropic_chunk(self, event: object) -> None:
         etype = getattr(event, "type", None)
         if etype == "content_block_delta":
             delta = getattr(event, "delta", None)
-            if delta and getattr(delta, "type", None) == "text_delta":
+            dtype = getattr(delta, "type", None) if delta else None
+            if dtype == "text_delta":
                 t = getattr(delta, "text", None)
                 if t:
-                    self._chunks.append(t)
+                    self._mark_first_token()
+                    self.chunks.append(t)
+            elif dtype == "thinking_delta":
+                t = getattr(delta, "thinking", None)
+                if t:
+                    self._mark_first_token()
+                    self.thinking_chunks.append(t)
+        elif etype == "content_block_start":
+            block = getattr(event, "content_block", None)
+            if block and getattr(block, "type", None) == "redacted_thinking":
+                self.has_redacted_thinking = True
         elif etype == "message_start":
             message = getattr(event, "message", None)
             if message:
                 usage = getattr(message, "usage", None)
                 if usage:
-                    self._tokens_in = getattr(usage, "input_tokens", 0) or 0
+                    self.tokens_in = getattr(usage, "input_tokens", 0) or 0
         elif etype == "message_delta":
             usage = getattr(event, "usage", None)
             if usage:
-                self._tokens_out = getattr(usage, "output_tokens", 0) or 0
-        return event
+                self.tokens_out = getattr(usage, "output_tokens", 0) or 0
+
+
+class _SyncStreamTracer:
+    def __init__(
+        self, stream: object, on_done: Callable[..., None], *,
+        is_anthropic: bool = False, start_ms: Optional[float] = None,
+    ) -> None:
+        self._stream = stream
+        self._on_done = on_done
+        self._done = False
+        self._state = _StreamState(start_ms)
+        self._is_anthropic = is_anthropic
 
     def _finish(self) -> None:
         if not self._done:
             self._done = True
-            self._on_done("".join(self._chunks), self._tokens_in, self._tokens_out)
+            s = self._state
+            self._on_done(
+                "".join(s.chunks), s.tokens_in, s.tokens_out,
+                "".join(s.thinking_chunks), s.reasoning_tokens, s.has_redacted_thinking,
+                s.ttft_ms,
+            )
 
     def __iter__(self):  # type: ignore[return]
         try:
             for chunk in self._stream:  # type: ignore[union-attr]
                 if self._is_anthropic:
-                    yield self._process_anthropic_chunk(chunk)
+                    self._state.process_anthropic_chunk(chunk)
                 else:
-                    yield self._process_openai_chunk(chunk)
+                    self._state.process_openai_chunk(chunk)
+                yield chunk
         finally:
             self._finish()
 
@@ -78,61 +117,34 @@ class _SyncStreamTracer:
 
 
 class _AsyncStreamTracer:
-    def __init__(self, stream: object, on_done: Callable[[str, int, int], None], *, is_anthropic: bool = False) -> None:
+    def __init__(
+        self, stream: object, on_done: Callable[..., None], *,
+        is_anthropic: bool = False, start_ms: Optional[float] = None,
+    ) -> None:
         self._stream = stream
         self._on_done = on_done
         self._done = False
-        self._chunks: list[str] = []
-        self._tokens_in = 0
-        self._tokens_out = 0
+        self._state = _StreamState(start_ms)
         self._is_anthropic = is_anthropic
-
-    def _process_openai_chunk(self, chunk: object) -> object:
-        choices = getattr(chunk, "choices", None)
-        if choices:
-            delta = getattr(choices[0], "delta", None)
-            if delta:
-                c = getattr(delta, "content", None)
-                if c:
-                    self._chunks.append(c)
-        usage = getattr(chunk, "usage", None)
-        if usage:
-            self._tokens_in = getattr(usage, "prompt_tokens", 0) or 0
-            self._tokens_out = getattr(usage, "completion_tokens", 0) or 0
-        return chunk
-
-    def _process_anthropic_chunk(self, event: object) -> object:
-        etype = getattr(event, "type", None)
-        if etype == "content_block_delta":
-            delta = getattr(event, "delta", None)
-            if delta and getattr(delta, "type", None) == "text_delta":
-                t = getattr(delta, "text", None)
-                if t:
-                    self._chunks.append(t)
-        elif etype == "message_start":
-            message = getattr(event, "message", None)
-            if message:
-                usage = getattr(message, "usage", None)
-                if usage:
-                    self._tokens_in = getattr(usage, "input_tokens", 0) or 0
-        elif etype == "message_delta":
-            usage = getattr(event, "usage", None)
-            if usage:
-                self._tokens_out = getattr(usage, "output_tokens", 0) or 0
-        return event
 
     def _finish(self) -> None:
         if not self._done:
             self._done = True
-            self._on_done("".join(self._chunks), self._tokens_in, self._tokens_out)
+            s = self._state
+            self._on_done(
+                "".join(s.chunks), s.tokens_in, s.tokens_out,
+                "".join(s.thinking_chunks), s.reasoning_tokens, s.has_redacted_thinking,
+                s.ttft_ms,
+            )
 
     async def __aiter__(self):  # type: ignore[return]
         try:
             async for chunk in self._stream:  # type: ignore[union-attr]
                 if self._is_anthropic:
-                    yield self._process_anthropic_chunk(chunk)
+                    self._state.process_anthropic_chunk(chunk)
                 else:
-                    yield self._process_openai_chunk(chunk)
+                    self._state.process_openai_chunk(chunk)
+                yield chunk
         finally:
             self._finish()
 

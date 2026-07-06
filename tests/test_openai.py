@@ -89,6 +89,54 @@ class TestOpenAI(unittest.TestCase):
         self.assertEqual(llm[0].tokens_out, 10)
         self.assertTrue(llm[0].attributes.get("gen_ai.streaming"))
 
+    def test_streaming_captures_time_to_first_token(self):
+        chunks = [
+            OStreamChunk("Hel"),
+            OStreamChunk("lo!", usage=types.SimpleNamespace(prompt_tokens=5, completion_tokens=10)),
+        ]
+        fc = install_fake_openai_sync(self.client, chunks)
+        list(fc.create(model="gpt-4o-mini", messages=[], stream=True))
+        self.client.flush()
+        llm = [e for e in self.captured if e.span_type == "llm_call"][0]
+        ttft = llm.attributes.get("gen_ai.server.time_to_first_token_ms")
+        self.assertIsNotNone(ttft)
+        self.assertIsInstance(ttft, int)
+        self.assertGreaterEqual(ttft, 0)
+
+    def test_non_streaming_has_no_ttft(self):
+        # TTFT only makes sense for streaming responses.
+        fc = install_fake_openai_sync(self.client, OResp("hello"))
+        fc.create(model="gpt-4o-mini", messages=[{"role": "user", "content": "hi"}])
+        self.client.flush()
+        llm = [e for e in self.captured if e.span_type == "llm_call"][0]
+        self.assertNotIn("gen_ai.server.time_to_first_token_ms", llm.attributes)
+
+    def test_reasoning_tokens_captured(self):
+        fc = install_fake_openai_sync(self.client, OResp("42", pin=5, pout=8, reasoning_tokens=120))
+        fc.create(model="o3-mini", messages=[{"role": "user", "content": "what is 6*7?"}])
+        self.client.flush()
+        llm = [e for e in self.captured if e.span_type == "llm_call"]
+        self.assertEqual(llm[0].attributes.get("gen_ai.usage.reasoning_tokens"), 120)
+
+    def test_no_reasoning_tokens_key_when_absent(self):
+        fc = install_fake_openai_sync(self.client, OResp("hello", pin=5, pout=8))
+        fc.create(model="gpt-4o-mini", messages=[{"role": "user", "content": "hi"}])
+        self.client.flush()
+        llm = [e for e in self.captured if e.span_type == "llm_call"]
+        self.assertNotIn("gen_ai.usage.reasoning_tokens", llm[0].attributes)
+
+    def test_reasoning_tokens_captured_streaming(self):
+        final_usage = types.SimpleNamespace(
+            prompt_tokens=5, completion_tokens=10,
+            completion_tokens_details=types.SimpleNamespace(reasoning_tokens=64),
+        )
+        chunks = [OStreamChunk("42"), OStreamChunk("", usage=final_usage)]
+        fc = install_fake_openai_sync(self.client, chunks)
+        list(fc.create(model="o3-mini", messages=[], stream=True))
+        self.client.flush()
+        llm = [e for e in self.captured if e.span_type == "llm_call"]
+        self.assertEqual(llm[0].attributes.get("gen_ai.usage.reasoning_tokens"), 64)
+
     def test_joins_active_trace(self):
         fc = install_fake_openai_sync(self.client, OResp("nested"))
         trace_id, end, ctx = self.client.start_trace("request")

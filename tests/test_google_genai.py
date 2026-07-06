@@ -61,6 +61,45 @@ class TestGoogleGenAI(unittest.TestCase):
         self.assertEqual(llm.completion, "Hello!")
         self.assertTrue(llm.attributes.get("gen_ai.streaming"))
 
+    def test_streaming_captures_request_and_response_body(self):
+        # Regression test: the streaming path used to never attach body attrs
+        # (only the non-streaming generate_content path did).
+        chunks = [GenAIResp(text="Hel"), GenAIResp(text="lo!", pin=0, pout=7)]
+        m = install_fake_genai(self.client, stream_chunks=chunks)
+        list(m.generate_content_stream(model="g", contents="hi"))
+        self.client.flush()
+        llm = [e for e in self.captured if e.span_type == "llm_call"][0]
+        self.assertIn("gen_ai.request.body", llm.attributes)
+        self.assertIn("gen_ai.response.body", llm.attributes)
+
+    def test_thinking_captured_non_streaming(self):
+        m = install_fake_genai(self.client, response=GenAIResp(text="42", thinking="let me think..."))
+        m.generate_content(model="g", contents="what is 6*7?")
+        self.client.flush()
+        llm = [e for e in self.captured if e.span_type == "llm_call"][0]
+        self.assertEqual(llm.completion, "42")
+        self.assertEqual(llm.attributes.get("gen_ai.response.thinking"), "let me think...")
+
+    def test_reasoning_tokens_captured_non_streaming(self):
+        m = install_fake_genai(self.client, response=GenAIResp(text="42", thoughts_tokens=15))
+        m.generate_content(model="g", contents="what is 6*7?")
+        self.client.flush()
+        llm = [e for e in self.captured if e.span_type == "llm_call"][0]
+        self.assertEqual(llm.attributes.get("gen_ai.usage.reasoning_tokens"), 15)
+
+    def test_thinking_and_reasoning_tokens_captured_streaming(self):
+        chunks = [
+            GenAIResp(thinking="step one...", pin=0, pout=0),
+            GenAIResp(text="42", pin=5, pout=8, thoughts_tokens=12),
+        ]
+        m = install_fake_genai(self.client, stream_chunks=chunks)
+        list(m.generate_content_stream(model="g", contents="what is 6*7?"))
+        self.client.flush()
+        llm = [e for e in self.captured if e.span_type == "llm_call"][0]
+        self.assertEqual(llm.completion, "42")
+        self.assertEqual(llm.attributes.get("gen_ai.response.thinking"), "step one...")
+        self.assertEqual(llm.attributes.get("gen_ai.usage.reasoning_tokens"), 12)
+
 
 class TestGoogleAILegacy(unittest.TestCase):
     def setUp(self):

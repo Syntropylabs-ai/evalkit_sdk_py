@@ -99,10 +99,11 @@ def _extract_prompt(contents: Any, config: Any = None) -> str:
 
 
 def _extract_completion(response: Any) -> str:
-    """Pull text from a generate_content response, joining all text parts.
+    """Pull text from a generate_content response, joining all non-thought text parts.
 
     When the model returns only function calls (no text), we return a compact
-    JSON summary of the calls so the span is never silently empty.
+    JSON summary of the calls so the span is never silently empty. Thinking
+    (``part.thought``) parts are excluded here — see ``_extract_thinking``.
     """
     text_parts: List[str] = []
     fn_parts: List[str] = []
@@ -112,6 +113,8 @@ def _extract_completion(response: Any) -> str:
             if content is None:
                 continue
             for part in getattr(content, "parts", []) or []:
+                if getattr(part, "thought", False):
+                    continue
                 t = getattr(part, "text", None)
                 if t:
                     text_parts.append(str(t))
@@ -141,19 +144,39 @@ def _extract_completion(response: Any) -> str:
     return ""
 
 
+def _extract_thinking(response: Any) -> str:
+    """Pull Gemini's extended-thinking text (``part.thought`` parts) out of a
+    generate_content response or streaming chunk. Never raises."""
+    parts: List[str] = []
+    try:
+        for candidate in (getattr(response, "candidates", None) or []):
+            content = getattr(candidate, "content", None)
+            if content is None:
+                continue
+            for part in getattr(content, "parts", []) or []:
+                if getattr(part, "thought", False):
+                    t = getattr(part, "text", None)
+                    if t:
+                        parts.append(str(t))
+    except Exception:
+        pass
+    return "".join(parts)
+
+
 def _extract_tool_events(response: Any, ts: str) -> List[SpanEvent]:
     """Extract function calls from response as SpanEvent list."""
     return from_google_parts(response, ts)
 
 
 def _usage_tokens(response: Any):
-    """Return (input_tokens, output_tokens) from a response or streaming chunk."""
+    """Return (input_tokens, output_tokens, reasoning_tokens) from a response or streaming chunk."""
     meta = getattr(response, "usage_metadata", None)
     if meta is None:
-        return 0, 0
+        return 0, 0, 0
     tokens_in = getattr(meta, "prompt_token_count", 0) or 0
     tokens_out = getattr(meta, "candidates_token_count", 0) or 0
-    return tokens_in, tokens_out
+    reasoning_tokens = getattr(meta, "thoughts_token_count", 0) or 0
+    return tokens_in, tokens_out, reasoning_tokens
 
 
 def _resolve_trace(ek: EvalKitClient):
@@ -319,8 +342,14 @@ def _patch_sync_models(ek: EvalKitClient, gm: Any) -> None:
             end_ts = _now_iso()
             latency = int(time.time() * 1000 - start_ms)
             completion = _extract_completion(result)
+            thinking = _extract_thinking(result)
             events = _extract_tool_events(result, end_ts)
-            tokens_in, tokens_out = _usage_tokens(result)
+            tokens_in, tokens_out, reasoning_tokens = _usage_tokens(result)
+            extra_attrs: Dict[str, Any] = {}
+            if thinking:
+                extra_attrs["gen_ai.response.thinking"] = thinking
+            if reasoning_tokens:
+                extra_attrs["gen_ai.usage.reasoning_tokens"] = reasoning_tokens
 
             ek.enqueue(_build_envelope(
                 ek, trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
@@ -330,6 +359,7 @@ def _patch_sync_models(ek: EvalKitClient, gm: Any) -> None:
                 session_id=session_id, device_id=device_id,
                 request_body=_request_body(contents, config),
                 response_body=_response_body(result),
+                attrs=extra_attrs or None,
             ))
             return result
 
@@ -361,7 +391,9 @@ def _patch_sync_models(ek: EvalKitClient, gm: Any) -> None:
 
                 def _gen():
                     parts: List[str] = []
-                    tin = tout = 0
+                    thinking_parts: List[str] = []
+                    chunk_dumps: List[Any] = []
+                    tin = tout = treason = 0
                     events: List[SpanEvent] = []
                     status = "OK"
                     smsg: Optional[str] = None
@@ -371,14 +403,20 @@ def _patch_sync_models(ek: EvalKitClient, gm: Any) -> None:
                                 t = _extract_completion(chunk)
                                 if t:
                                     parts.append(t)
-                                ci, co = _usage_tokens(chunk)
+                                th = _extract_thinking(chunk)
+                                if th:
+                                    thinking_parts.append(th)
+                                ci, co, cr = _usage_tokens(chunk)
                                 if ci:
                                     tin = ci
                                 if co:
                                     tout = co
+                                if cr:
+                                    treason = cr
                                 evs = _extract_tool_events(chunk, _now_iso())
                                 if evs:
                                     events.extend(evs)
+                                chunk_dumps.append(_dump(chunk))
                             except Exception:
                                 pass
                             yield chunk
@@ -388,13 +426,20 @@ def _patch_sync_models(ek: EvalKitClient, gm: Any) -> None:
                     finally:
                         end_ts = _now_iso()
                         try:
+                            extra_attrs: Dict[str, Any] = {"gen_ai.streaming": True}
+                            if thinking_parts:
+                                extra_attrs["gen_ai.response.thinking"] = "".join(thinking_parts)
+                            if treason:
+                                extra_attrs["gen_ai.usage.reasoning_tokens"] = treason
                             ek.enqueue(_build_envelope(
                                 ek, trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                                 model=model, prompt=prompt, completion="".join(parts),
                                 tokens_in=tin, tokens_out=tout,
                                 latency=int(time.time() * 1000 - start_ms), ts=ts, end_ts=end_ts,
                                 events=events or None, session_id=session_id, device_id=device_id,
-                                status=status, status_message=smsg, attrs={"gen_ai.streaming": True},
+                                status=status, status_message=smsg, attrs=extra_attrs,
+                                request_body=_request_body(contents, config),
+                                response_body=_safe_body(chunk_dumps) if chunk_dumps else None,
                             ))
                         except Exception:
                             pass
@@ -445,8 +490,14 @@ def _patch_async_models(ek: EvalKitClient, gm: Any) -> None:
             end_ts = _now_iso()
             latency = int(time.time() * 1000 - start_ms)
             completion = _extract_completion(result)
+            thinking = _extract_thinking(result)
             events = _extract_tool_events(result, end_ts)
-            tokens_in, tokens_out = _usage_tokens(result)
+            tokens_in, tokens_out, reasoning_tokens = _usage_tokens(result)
+            extra_attrs: Dict[str, Any] = {}
+            if thinking:
+                extra_attrs["gen_ai.response.thinking"] = thinking
+            if reasoning_tokens:
+                extra_attrs["gen_ai.usage.reasoning_tokens"] = reasoning_tokens
 
             ek.enqueue(_build_envelope(
                 ek, trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
@@ -456,6 +507,7 @@ def _patch_async_models(ek: EvalKitClient, gm: Any) -> None:
                 session_id=session_id, device_id=device_id,
                 request_body=_request_body(contents, config),
                 response_body=_response_body(result),
+                attrs=extra_attrs or None,
             ))
             return result
 
@@ -487,7 +539,9 @@ def _patch_async_models(ek: EvalKitClient, gm: Any) -> None:
 
                 async def _agen():
                     parts: List[str] = []
-                    tin = tout = 0
+                    thinking_parts: List[str] = []
+                    chunk_dumps: List[Any] = []
+                    tin = tout = treason = 0
                     events: List[SpanEvent] = []
                     status = "OK"
                     smsg: Optional[str] = None
@@ -497,14 +551,20 @@ def _patch_async_models(ek: EvalKitClient, gm: Any) -> None:
                                 t = _extract_completion(chunk)
                                 if t:
                                     parts.append(t)
-                                ci, co = _usage_tokens(chunk)
+                                th = _extract_thinking(chunk)
+                                if th:
+                                    thinking_parts.append(th)
+                                ci, co, cr = _usage_tokens(chunk)
                                 if ci:
                                     tin = ci
                                 if co:
                                     tout = co
+                                if cr:
+                                    treason = cr
                                 evs = _extract_tool_events(chunk, _now_iso())
                                 if evs:
                                     events.extend(evs)
+                                chunk_dumps.append(_dump(chunk))
                             except Exception:
                                 pass
                             yield chunk
@@ -514,13 +574,20 @@ def _patch_async_models(ek: EvalKitClient, gm: Any) -> None:
                     finally:
                         end_ts = _now_iso()
                         try:
+                            extra_attrs: Dict[str, Any] = {"gen_ai.streaming": True}
+                            if thinking_parts:
+                                extra_attrs["gen_ai.response.thinking"] = "".join(thinking_parts)
+                            if treason:
+                                extra_attrs["gen_ai.usage.reasoning_tokens"] = treason
                             ek.enqueue(_build_envelope(
                                 ek, trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                                 model=model, prompt=prompt, completion="".join(parts),
                                 tokens_in=tin, tokens_out=tout,
                                 latency=int(time.time() * 1000 - start_ms), ts=ts, end_ts=end_ts,
                                 events=events or None, session_id=session_id, device_id=device_id,
-                                status=status, status_message=smsg, attrs={"gen_ai.streaming": True},
+                                status=status, status_message=smsg, attrs=extra_attrs,
+                                request_body=_request_body(contents, config),
+                                response_body=_safe_body(chunk_dumps) if chunk_dumps else None,
                             ))
                         except Exception:
                             pass
