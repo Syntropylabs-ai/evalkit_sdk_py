@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "python-minifier>=2.9.0"]
 build-backend = "hatchling.build"
 
 [project]
 name = "syntropylabs-evalkit"
-version = "0.2.8"
+version = "0.2.9"
 description = "EvalKit Python SDK — LLM observability and tracing"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -66,6 +66,8 @@ qdrant = ["qdrant-client>=1.9.0"]
 chroma = ["chromadb>=0.5.0"]
 weaviate = ["weaviate-client>=4.6.0"]
 llamaindex = ["llama-index-core>=0.11.0"]
+elevenlabs = ["elevenlabs>=1.4.0"]
+assemblyai = ["assemblyai>=0.35.1"]
 otel = ["opentelemetry-sdk>=1.20.0", "opentelemetry-instrumentation>=0.41b0"]
 # Install every supported integration at once:  pip install "syntropylabs-evalkit[all]"
 all = [
@@ -85,12 +87,18 @@ all = [
     "chromadb>=0.5.0",
     "weaviate-client>=4.6.0",
     "llama-index-core>=0.11.0",
+    "elevenlabs>=1.4.0",
+    "assemblyai>=0.35.1",
 ]
 
 [tool.hatch.build.targets.wheel]
 packages = ["evalkit"]
+exclude = ["evalkit/**/*.py"]
 
 [tool.hatch.build.targets.sdist]
 only-include = ["evalkit"]
 include = ["/README.md", "/LICENSE"]
 exclude = ["tests", "examples", ".claude", ".gitignore"]
+
+[tool.hatch.build.hooks.custom]
+path = "hatch_build.py"
