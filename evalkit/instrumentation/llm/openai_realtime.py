@@ -161,6 +161,14 @@ class _ObservedConnection:
             total_tokens = _event_get(usage, "total_tokens") or 0 if usage else 0
             if usage is not None:
                 attrs["gen_ai.usage.total_tokens"] = total_tokens or (tokens_in + tokens_out)
+                input_details = _event_get(usage, "input_token_details")
+                output_details = _event_get(usage, "output_token_details")
+                audio_tokens_in = _event_get(input_details, "audio_tokens") or 0 if input_details else 0
+                audio_tokens_out = _event_get(output_details, "audio_tokens") or 0 if output_details else 0
+                if audio_tokens_in:
+                    attrs["gen_ai.usage.audio_input_tokens"] = audio_tokens_in
+                if audio_tokens_out:
+                    attrs["gen_ai.usage.audio_output_tokens"] = audio_tokens_out
             resp_body = _safe_body(_dump(response)) if response is not None else None
             if resp_body:
                 attrs["gen_ai.response.body"] = resp_body

@@ -29,6 +29,9 @@ from .instrumentation.vectordb.qdrant import patch_qdrant as _patch_qdrant
 from .instrumentation.vectordb.chroma import patch_chroma as _patch_chroma
 from .instrumentation.vectordb.weaviate import patch_weaviate as _patch_weaviate
 from .instrumentation.llm.llamaindex import patch_llamaindex as _patch_llamaindex
+from .instrumentation.llm.openai_audio import patch_openai_audio as _patch_openai_audio
+from .instrumentation.llm.elevenlabs import patch_elevenlabs as _patch_elevenlabs
+from .instrumentation.llm.assemblyai import patch_assemblyai as _patch_assemblyai
 from .instrumentation.llm.claude_agent_sdk import patch_claude_agent_sdk as _patch_claude_agent_sdk
 from .instrumentation.llm.google_live import (
     trace_google_live as _trace_google_live,
@@ -90,6 +93,9 @@ __all__ = [
     "patch_chroma",
     "patch_weaviate",
     "patch_llamaindex",
+    "patch_openai_audio",
+    "patch_elevenlabs",
+    "patch_assemblyai",
     "patch_claude_agent_sdk",
     "trace_google_live",
     "trace_openai_realtime",
@@ -314,6 +320,24 @@ def patch_llamaindex() -> None:
     """Register evalkit's handlers on LlamaIndex's instrumentation dispatcher, capturing
     llm/embedding/retrieval/query/rerank spans. Called by init() automatically."""
     _patch_llamaindex(_get_instance())
+
+
+def patch_openai_audio() -> None:
+    """Instrument openai's audio.speech/transcriptions/translations as llm_call spans
+    (character/duration/token-billed as appropriate). Called by init() automatically."""
+    _patch_openai_audio(_get_instance())
+
+
+def patch_elevenlabs() -> None:
+    """Instrument elevenlabs TextToSpeechClient.convert as llm_call spans. Called by
+    init() automatically."""
+    _patch_elevenlabs(_get_instance())
+
+
+def patch_assemblyai() -> None:
+    """Instrument assemblyai Transcriber.transcribe as llm_call spans. Called by
+    init() automatically."""
+    _patch_assemblyai(_get_instance())
 
 
 def patch_claude_agent_sdk() -> None:

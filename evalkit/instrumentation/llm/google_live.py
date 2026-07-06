@@ -46,6 +46,17 @@ def _base_attrs(model: str) -> dict:
     }
 
 
+def _modality_tokens(details: Any, modality: str) -> int:
+    total = 0
+    try:
+        for m in details or []:
+            if getattr(m, "modality", None) == modality:
+                total += getattr(m, "token_count", 0) or 0
+    except Exception:
+        pass
+    return total
+
+
 def _turn_complete(msg: Any) -> bool:
     try:
         sc = getattr(msg, "server_content", None)
@@ -263,6 +274,12 @@ class _ObservedSession:
                 thoughts_tokens = getattr(usage, "thoughts_token_count", 0) or 0
                 if thoughts_tokens:
                     attrs["gen_ai.usage.reasoning_tokens"] = thoughts_tokens
+                audio_tokens_in = _modality_tokens(getattr(usage, "prompt_tokens_details", None), "AUDIO")
+                audio_tokens_out = _modality_tokens(getattr(usage, "response_tokens_details", None), "AUDIO")
+                if audio_tokens_in:
+                    attrs["gen_ai.usage.audio_input_tokens"] = audio_tokens_in
+                if audio_tokens_out:
+                    attrs["gen_ai.usage.audio_output_tokens"] = audio_tokens_out
 
             ts = _now_iso()
             self._ek.enqueue(TraceEnvelope(

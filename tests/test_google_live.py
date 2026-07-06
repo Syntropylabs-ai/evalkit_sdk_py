@@ -18,11 +18,16 @@ def _server_content(**kwargs):
     return types.SimpleNamespace(**defaults)
 
 
-def _usage(prompt=10, response=20, total=30, thoughts=0):
+def _usage(prompt=10, response=20, total=30, thoughts=0, prompt_tokens_details=None, response_tokens_details=None):
     return types.SimpleNamespace(
         prompt_token_count=prompt, response_token_count=response,
         total_token_count=total, thoughts_token_count=thoughts,
+        prompt_tokens_details=prompt_tokens_details, response_tokens_details=response_tokens_details,
     )
+
+
+def _modality_count(modality, count):
+    return types.SimpleNamespace(modality=modality, token_count=count)
 
 
 class FakeAsyncSession:
@@ -129,6 +134,41 @@ class TestGoogleLive(unittest.TestCase):
         self.assertEqual(len(sessions), 1)
         self.assertEqual(sessions[0].trace_id, llm[0].trace_id)
         self.assertEqual(sessions[0].span_id, llm[0].parent_span_id)
+
+    def test_turn_captures_audio_token_breakdown(self):
+        turn_complete_msg = _msg(
+            server_content=_server_content(
+                output_transcription=types.SimpleNamespace(text="42"),
+                turn_complete=True,
+            ),
+            usage_metadata=_usage(
+                prompt=10, response=20, total=30,
+                prompt_tokens_details=[_modality_count("TEXT", 4), _modality_count("AUDIO", 6)],
+                response_tokens_details=[_modality_count("AUDIO", 20)],
+            ),
+            tool_call=None,
+        )
+        session = FakeAsyncSession([turn_complete_msg])
+        live = install_fake_live(self.client, session)
+
+        async def scenario():
+            async with live.connect(model="gemini-2.0-flash-live") as s:
+                await s.send_client_content(
+                    turns=[{"role": "user", "parts": [{"text": "what is 6*7?"}]}],
+                    turn_complete=True,
+                )
+                async for _ in s.receive():
+                    pass
+
+        self._run(scenario())
+        self.client.flush()
+
+        llm = [e for e in self.captured if e.span_type == "llm_call" and e.operation == "voice.turn"]
+        self.assertEqual(len(llm), 1)
+        self.assertEqual(llm[0].tokens_in, 10)
+        self.assertEqual(llm[0].tokens_out, 20)
+        self.assertEqual(llm[0].attributes["gen_ai.usage.audio_input_tokens"], 6)
+        self.assertEqual(llm[0].attributes["gen_ai.usage.audio_output_tokens"], 20)
 
     def test_input_transcription_also_captured_as_prompt(self):
         turn_complete_msg = _msg(

@@ -18,6 +18,7 @@ _SKIP_INSTRUMENTORS = {
     "openai", "anthropic", "google-generativeai", "google-genai", "google_genai",
     "vertexai", "cohere", "mistralai", "groq", "bedrock", "langchain", "litellm",
     "replicate", "transformers",
+    "asgi", "wsgi", "fastapi", "flask", "django", "starlette",
 }
 
 

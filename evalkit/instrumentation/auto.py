@@ -1271,6 +1271,44 @@ def _try_patch_llamaindex(ek: "EvalKitClient") -> None:
         pass
 
 
+# ── Audio (OpenAI TTS/transcription, ElevenLabs, AssemblyAI) ──────────────────
+
+def _try_patch_openai_audio(ek: "EvalKitClient") -> None:
+    try:
+        import openai  # noqa: F401
+    except ImportError:
+        return
+    try:
+        from .llm.openai_audio import patch_openai_audio
+        patch_openai_audio(ek)
+    except Exception:
+        pass
+
+
+def _try_patch_elevenlabs(ek: "EvalKitClient") -> None:
+    try:
+        import elevenlabs  # noqa: F401
+    except ImportError:
+        return
+    try:
+        from .llm.elevenlabs import patch_elevenlabs
+        patch_elevenlabs(ek)
+    except Exception:
+        pass
+
+
+def _try_patch_assemblyai(ek: "EvalKitClient") -> None:
+    try:
+        import assemblyai  # noqa: F401
+    except ImportError:
+        return
+    try:
+        from .llm.assemblyai import patch_assemblyai
+        patch_assemblyai(ek)
+    except Exception:
+        pass
+
+
 # ── AWS Bedrock ───────────────────────────────────────────────────────────────
 
 def _try_patch_bedrock(ek: "EvalKitClient") -> None:
@@ -1587,6 +1625,9 @@ def setup_auto_instrumentation(
     _try_patch_chroma(client)
     _try_patch_weaviate(client)
     _try_patch_llamaindex(client)
+    _try_patch_openai_audio(client)
+    _try_patch_elevenlabs(client)
+    _try_patch_assemblyai(client)
     _try_patch_langchain(client)
     _try_patch_databases(client)
     _try_patch_claude_agent_sdk(client)
