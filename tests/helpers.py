@@ -314,17 +314,27 @@ class LLMResult:
 # ── Claude Agent SDK fakes ────────────────────────────────────────────────────
 
 class SDKTextBlock:
+    # __name__ must be "TextBlock" — the instrumentation dispatches on
+    # type(block).__name__ since claude_agent_sdk's own block dataclasses
+    # (unlike anthropic.types') carry no `.type` discriminator attribute.
     def __init__(self, text):
-        self.type = "text"
         self.text = text
 
 
+SDKTextBlock.__name__ = "TextBlock"
+SDKTextBlock.__qualname__ = "TextBlock"
+
+
 class SDKToolUseBlock:
+    # __name__ must be "ToolUseBlock" — see SDKTextBlock.
     def __init__(self, name, input_data, id="tu_1"):
-        self.type = "tool_use"
         self.name = name
         self.input = input_data
         self.id = id
+
+
+SDKToolUseBlock.__name__ = "ToolUseBlock"
+SDKToolUseBlock.__qualname__ = "ToolUseBlock"
 
 
 class SDKAssistantMessage:

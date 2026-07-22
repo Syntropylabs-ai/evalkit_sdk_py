@@ -701,6 +701,22 @@ def _try_patch_google_genai(ek: "EvalKitClient") -> None:
         pass
 
 
+# ── Google ADK (Agent Development Kit) ──────────────────────────────────────
+# LLM calls are already covered via google.genai above (ADK calls it
+# internally); this adds agent-turn and tool-call spans on top.
+
+def _try_patch_google_adk(ek: "EvalKitClient") -> None:
+    try:
+        import google.adk  # noqa: F401
+    except ImportError:
+        return
+    try:
+        from .llm.google_adk import patch_google_adk
+        patch_google_adk(ek)
+    except Exception:
+        pass
+
+
 # ── Google Generative AI (legacy google.generativeai) ───────────────────────
 
 def _try_patch_google_ai(ek: "EvalKitClient") -> None:
@@ -1614,6 +1630,7 @@ def setup_auto_instrumentation(
     _try_patch_anthropic(client)
     _try_patch_google_genai(client)
     _try_patch_google_ai(client)
+    _try_patch_google_adk(client)
     _try_patch_cohere(client)
     _try_patch_bedrock(client)
     _try_patch_mistral(client)

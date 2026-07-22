@@ -22,7 +22,7 @@ from ..._version import SDK_VERSION
 from ...core.client import _new_span_id, _now_iso
 from ...core.context import SpanContext, _current_span, current_span_ctx, get_or_create_ambient_trace_id
 from ...core.types import SpanEvent, TraceEnvelope
-from .._toolcalls import from_anthropic_blocks
+from .._toolcalls import tool_event
 from ._bodies import _dump, _safe_body
 
 if TYPE_CHECKING:
@@ -46,6 +46,33 @@ def _get_attr(obj: Any, *names: str) -> Any:
         if v is not None:
             return v
     return None
+
+
+def _extract_text_and_tool_events(blocks: Any, ts: str) -> tuple:
+    """Split an AssistantMessage's content blocks into completion text and
+    tool_use SpanEvents.
+
+    claude_agent_sdk's own TextBlock/ToolUseBlock dataclasses (distinct from
+    anthropic.types' same-named classes) carry no `.type` discriminator field
+    at all — only `anthropic.types` blocks do — so this dispatches on the
+    block's class name instead of a `.type` attribute that doesn't exist here.
+    """
+    text = ""
+    events: list = []
+    for block in (blocks or []):
+        name = type(block).__name__
+        if name == "TextBlock":
+            text += getattr(block, "text", "") or ""
+        elif name == "ToolUseBlock":
+            ev = tool_event(
+                name=getattr(block, "name", None),
+                arguments=getattr(block, "input", {}),
+                call_id=getattr(block, "id", ""),
+                ts=ts,
+            )
+            if ev is not None:
+                events.append(ev)
+    return text, events
 
 
 async def _traced_gen(
@@ -78,10 +105,9 @@ async def _traced_gen(
                 m = _get_attr(message, "model")
                 if m:
                     model = str(m)
-                for block in getattr(message, "content", []):
-                    if getattr(block, "type", None) == "text":
-                        completion += getattr(block, "text", "")
-                events.extend(from_anthropic_blocks(getattr(message, "content", []), _now_iso()))
+                text, tool_events = _extract_text_and_tool_events(getattr(message, "content", []), _now_iso())
+                completion += text
+                events.extend(tool_events)
 
             elif msg_type == "ResultMessage":
                 usage = _get_attr(message, "usage") or {}

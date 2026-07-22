@@ -12,9 +12,22 @@ def _setup_fake_langchain_core():
     class BaseCallbackHandler:
         pass
 
+    class BaseCallbackManager:
+        # Mirrors the real class closely enough to exercise the patch: takes
+        # a `handlers` list, tracks `inheritable_handlers`, and supports
+        # `add_handler(handler, inherit)` the same way langchain-core does.
+        def __init__(self, handlers=None, inheritable_handlers=None, **kwargs):
+            self.handlers = list(handlers or [])
+            self.inheritable_handlers = list(inheritable_handlers or [])
+
+        def add_handler(self, handler, inherit=True):
+            self.handlers.append(handler)
+            if inherit:
+                self.inheritable_handlers.append(handler)
+
     base.BaseCallbackHandler = BaseCallbackHandler
+    base.BaseCallbackManager = BaseCallbackManager
     manager = types.ModuleType("langchain_core.callbacks.manager")
-    manager.register_configure_hook = lambda *a, **k: None
     callbacks = types.ModuleType("langchain_core.callbacks")
     root = types.ModuleType("langchain_core")
 
@@ -37,14 +50,12 @@ class TestLangChain(unittest.TestCase):
 
         import evalkit.instrumentation.llm.langchain as lc
         lc._registered = False
-        lc._handler_var = None
 
     def tearDown(self):
         for name in self._mods:
             sys.modules.pop(name, None)
         import evalkit.instrumentation.llm.langchain as lc
         lc._registered = False
-        lc._handler_var = None
 
     def _make_human_msg(self, text):
         return types.SimpleNamespace(type="human", content=text)
@@ -90,6 +101,30 @@ class TestLangChain(unittest.TestCase):
         self.assertEqual(llm.tokens_in, 4)
         self.assertEqual(llm.tokens_out, 6)
         self.assertEqual(tool.attributes.get("tool.name"), "search")
+
+    def test_handler_actually_gets_attached_to_new_callback_managers(self):
+        """Guards against the class of bug that shipped silently in 0.2.9:
+        register_configure_hook was removed in langchain-core 1.x, so the old
+        registration path built a handler but never actually wired it up —
+        zero spans were ever emitted against any current LangChain install.
+        This constructs a callback manager the way LangChain itself does
+        internally and asserts our handler is actually present on it,
+        rather than only exercising the handler's methods directly.
+        """
+        handler = evalkit.patch_langchain()
+        self.assertIsNotNone(handler)
+
+        from langchain_core.callbacks.base import BaseCallbackManager
+
+        mgr = BaseCallbackManager(handlers=[])
+        self.assertTrue(
+            any(isinstance(h, type(handler)) for h in mgr.inheritable_handlers),
+            "evalkit handler was not attached to a newly constructed BaseCallbackManager",
+        )
+
+        # A second manager must also get it (every run constructs its own).
+        mgr2 = BaseCallbackManager(handlers=[])
+        self.assertTrue(any(isinstance(h, type(handler)) for h in mgr2.inheritable_handlers))
 
     def test_noop_when_no_langchain(self):
         from evalkit.instrumentation.auto import _try_patch_langchain

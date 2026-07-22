@@ -2,8 +2,10 @@
 
 LangGraph is built on LangChain Core, so a single LangChain ``BaseCallbackHandler``
 captures every chain/node, LLM, chat model, tool, and retriever run in a LangGraph
-graph. We register the handler **globally** via ``register_configure_hook`` so that —
-true to ``init()`` does everything — the user never has to pass ``callbacks=[...]``.
+graph. The handler is registered **globally** by patching
+``BaseCallbackManager.__init__`` to add it as an inheritable handler on every
+callback manager LangChain constructs, so — true to ``init()`` does everything —
+the user never has to pass ``callbacks=[...]``.
 
 The handler builds the span tree from LangChain's own ``run_id`` / ``parent_run_id``
 graph (independent of ContextVar timing across async tasks), and nests the whole
@@ -16,7 +18,6 @@ from __future__ import annotations
 
 import logging
 import time
-from contextvars import ContextVar
 from threading import Lock
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -33,9 +34,8 @@ _log = logging.getLogger("evalkit")
 
 _ATTR_MAX = 4096
 
-# Module-level singletons so global registration happens exactly once.
+# Module-level sentinel so the BaseCallbackManager.__init__ patch is only applied once.
 _registered = False
-_handler_var: Optional[ContextVar] = None
 
 
 def _truncate(s: Any, limit: int = _ATTR_MAX) -> str:
@@ -369,29 +369,60 @@ def _build_handler(client: "EvalKitClient"):
 def patch_langchain(client: "EvalKitClient") -> Optional[Any]:
     """Register a global evalkit callback handler for LangChain / LangGraph.
 
-    Idempotent and dependency-free: if LangChain is not installed (or the global
-    hook API is unavailable) this is a silent no-op. Returns the handler instance
-    (also usable manually via ``callbacks=[handler]``) or ``None``.
+    Wraps ``BaseCallbackManager.__init__`` so every callback manager LangChain
+    constructs — for any chain/graph run, regardless of whether the caller
+    passed ``callbacks=[...]`` — gets the evalkit handler added as an
+    inheritable handler, exactly the technique OpenLIT and OpenLLMetry/Traceloop
+    use. This replaced an earlier version built on
+    ``langchain_core.callbacks.manager.register_configure_hook``: that function
+    was removed in the LangChain 1.0 stabilization release (confirmed via a
+    live install of langchain-core 1.5.0 — the import raises `ImportError`,
+    which the old code's ``except Exception: return handler`` swallowed
+    silently, so the handler was built but never actually attached to
+    anything and zero spans were ever emitted). ``BaseCallbackManager.__init__``
+    is core plumbing every LangChain version constructs internally regardless
+    of whichever global-hook API does or doesn't exist in that version, so
+    this is resilient to exactly the kind of breaking change that broke the
+    old approach.
+
+    Idempotent and dependency-free: if LangChain is not installed, this is a
+    silent no-op. Returns the handler instance (also usable manually via
+    ``callbacks=[handler]``) or ``None``.
     """
-    global _registered, _handler_var
+    global _registered
 
     handler = _build_handler(client)
     if handler is None:
         return None
 
-    try:
-        from langchain_core.callbacks.manager import register_configure_hook
-    except Exception:
-        # Older/newer LangChain without the hook — still return the handler so it
-        # can be attached manually.
+    if _registered:
         return handler
 
     try:
-        if not _registered or _handler_var is None:
-            _handler_var = ContextVar("evalkit_langchain_handler", default=None)
-            register_configure_hook(_handler_var, True)
+        from langchain_core.callbacks.base import BaseCallbackManager
+    except Exception:
+        return handler
+
+    try:
+        if getattr(BaseCallbackManager.__init__, "_evalkit", False):
             _registered = True
-        _handler_var.set(handler)  # type: ignore[union-attr]
+            return handler
+
+        original_init = BaseCallbackManager.__init__
+        handler_type = type(handler)
+
+        def patched_init(self, *args: Any, **kwargs: Any) -> None:
+            original_init(self, *args, **kwargs)
+            try:
+                if any(isinstance(h, handler_type) for h in self.inheritable_handlers):
+                    return
+                self.add_handler(handler, True)
+            except Exception as exc:
+                _log.debug("[evalkit] langchain handler injection failed: %s", exc)
+
+        patched_init._evalkit = True  # type: ignore[attr-defined]
+        BaseCallbackManager.__init__ = patched_init  # type: ignore[method-assign]
+        _registered = True
     except Exception as exc:
         _log.debug("[evalkit] langchain global registration failed: %s", exc)
 
