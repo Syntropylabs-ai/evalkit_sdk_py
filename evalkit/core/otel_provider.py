@@ -157,7 +157,11 @@ def setup_otel(client: Any) -> bool:
         def export(self, spans) -> "SpanExportResult":
             for sp in spans:
                 try:
-                    if (getattr(sp, "attributes", None) or {}).get("asgi.event.type") is not None:
+                    attrs = getattr(sp, "attributes", None) or {}
+                    if attrs.get("asgi.event.type") is not None:
+                        continue
+                    scope_name = getattr(getattr(sp, "instrumentation_scope", None), "name", "") or ""
+                    if scope_name == "gcp.vertex.agent":
                         continue
                     client.enqueue(_readable_to_envelope(sp))
                 except Exception as exc:
