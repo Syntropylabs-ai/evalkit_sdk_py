@@ -100,6 +100,30 @@ class TestGoogleGenAI(unittest.TestCase):
         self.assertEqual(llm.attributes.get("gen_ai.response.thinking"), "step one...")
         self.assertEqual(llm.attributes.get("gen_ai.usage.reasoning_tokens"), 12)
 
+    def test_cached_tokens_captured_non_streaming(self):
+        # Regression test: cached_content_token_count (Gemini's context-cache
+        # discount signal) must be surfaced separately from tokens_in, or
+        # downstream cost math has no way to avoid pricing an entire long,
+        # mostly-cached prompt at the full fresh-input-token rate.
+        m = install_fake_genai(self.client, response=GenAIResp(text="42", pin=394505, cached_tokens=392425))
+        m.generate_content(model="g", contents="what is 6*7?")
+        self.client.flush()
+        llm = [e for e in self.captured if e.span_type == "llm_call"][0]
+        self.assertEqual(llm.tokens_in, 394505)
+        self.assertEqual(llm.attributes.get("gen_ai.usage.cached_tokens"), 392425)
+
+    def test_cached_tokens_captured_streaming(self):
+        chunks = [
+            GenAIResp(text="Hel", pin=0, pout=0),
+            GenAIResp(text="lo!", pin=394505, pout=7, cached_tokens=392425),
+        ]
+        m = install_fake_genai(self.client, stream_chunks=chunks)
+        list(m.generate_content_stream(model="g", contents="hi"))
+        self.client.flush()
+        llm = [e for e in self.captured if e.span_type == "llm_call"][0]
+        self.assertEqual(llm.tokens_in, 394505)
+        self.assertEqual(llm.attributes.get("gen_ai.usage.cached_tokens"), 392425)
+
 
 class TestGoogleAILegacy(unittest.TestCase):
     def setUp(self):

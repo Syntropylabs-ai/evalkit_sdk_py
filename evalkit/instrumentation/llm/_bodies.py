@@ -27,7 +27,7 @@ def _dump(o: Any) -> Any:
     return o
 
 
-def _safe_body(obj: Any, limit: int = 16384) -> Optional[str]:
+def _safe_body(obj: Any, limit: int = 2 * 1024 * 1024) -> Optional[str]:
     """Best-effort JSON of a request/response object. Never raises; truncated."""
     if obj is None:
         return None

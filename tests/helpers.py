@@ -62,14 +62,15 @@ class _Candidate:
 
 
 class _GenAIUsage:
-    def __init__(self, pin, pout, thoughts=0):
+    def __init__(self, pin, pout, thoughts=0, cached=0):
         self.prompt_token_count = pin
         self.candidates_token_count = pout
         self.thoughts_token_count = thoughts
+        self.cached_content_token_count = cached
 
 
 class GenAIResp:
-    def __init__(self, text="", tool=None, pin=3, pout=5, thinking=None, thoughts_tokens=0):
+    def __init__(self, text="", tool=None, pin=3, pout=5, thinking=None, thoughts_tokens=0, cached_tokens=0):
         parts = []
         if thinking:
             parts.append(_Part(text=thinking, thought=True))
@@ -78,7 +79,7 @@ class GenAIResp:
         if tool:
             parts.append(_Part(function_call=_FC(tool[0], tool[1])))
         self.candidates = [_Candidate(parts)]
-        self.usage_metadata = _GenAIUsage(pin, pout, thoughts=thoughts_tokens)
+        self.usage_metadata = _GenAIUsage(pin, pout, thoughts=thoughts_tokens, cached=cached_tokens)
         self.text = text
 
 

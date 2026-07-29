@@ -274,6 +274,12 @@ class _ObservedSession:
                 thoughts_tokens = getattr(usage, "thoughts_token_count", 0) or 0
                 if thoughts_tokens:
                     attrs["gen_ai.usage.reasoning_tokens"] = thoughts_tokens
+                # Subset of tokens_in served from context cache — already
+                # included in tokens_in, never additive. Absent on session
+                # types that don't support caching (getattr default handles that).
+                cached_tokens = getattr(usage, "cached_content_token_count", 0) or 0
+                if cached_tokens:
+                    attrs["gen_ai.usage.cached_tokens"] = cached_tokens
                 audio_tokens_in = _modality_tokens(getattr(usage, "prompt_tokens_details", None), "AUDIO")
                 audio_tokens_out = _modality_tokens(getattr(usage, "response_tokens_details", None), "AUDIO")
                 if audio_tokens_in:

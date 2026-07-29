@@ -169,14 +169,19 @@ def _extract_tool_events(response: Any, ts: str) -> List[SpanEvent]:
 
 
 def _usage_tokens(response: Any):
-    """Return (input_tokens, output_tokens, reasoning_tokens) from a response or streaming chunk."""
+    """Return (input_tokens, output_tokens, reasoning_tokens, cached_tokens) from a response
+    or streaming chunk. `cached_tokens` is the subset of input_tokens Gemini served from its
+    (much cheaper) context cache — it's already included in input_tokens, never additive.
+    Surfaced separately (gen_ai.usage.cached_tokens attribute) so downstream cost math isn't
+    forced to price an entire long, mostly-cached prompt at full fresh-input-token rate."""
     meta = getattr(response, "usage_metadata", None)
     if meta is None:
-        return 0, 0, 0
+        return 0, 0, 0, 0
     tokens_in = getattr(meta, "prompt_token_count", 0) or 0
     tokens_out = getattr(meta, "candidates_token_count", 0) or 0
     reasoning_tokens = getattr(meta, "thoughts_token_count", 0) or 0
-    return tokens_in, tokens_out, reasoning_tokens
+    cached_tokens = getattr(meta, "cached_content_token_count", 0) or 0
+    return tokens_in, tokens_out, reasoning_tokens, cached_tokens
 
 
 def _resolve_trace(ek: EvalKitClient):
@@ -344,12 +349,14 @@ def _patch_sync_models(ek: EvalKitClient, gm: Any) -> None:
             completion = _extract_completion(result)
             thinking = _extract_thinking(result)
             events = _extract_tool_events(result, end_ts)
-            tokens_in, tokens_out, reasoning_tokens = _usage_tokens(result)
+            tokens_in, tokens_out, reasoning_tokens, cached_tokens = _usage_tokens(result)
             extra_attrs: Dict[str, Any] = {}
             if thinking:
                 extra_attrs["gen_ai.response.thinking"] = thinking
             if reasoning_tokens:
                 extra_attrs["gen_ai.usage.reasoning_tokens"] = reasoning_tokens
+            if cached_tokens:
+                extra_attrs["gen_ai.usage.cached_tokens"] = cached_tokens
 
             ek.enqueue(_build_envelope(
                 ek, trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
@@ -393,7 +400,7 @@ def _patch_sync_models(ek: EvalKitClient, gm: Any) -> None:
                     parts: List[str] = []
                     thinking_parts: List[str] = []
                     chunk_dumps: List[Any] = []
-                    tin = tout = treason = 0
+                    tin = tout = treason = tcached = 0
                     events: List[SpanEvent] = []
                     status = "OK"
                     smsg: Optional[str] = None
@@ -406,13 +413,15 @@ def _patch_sync_models(ek: EvalKitClient, gm: Any) -> None:
                                 th = _extract_thinking(chunk)
                                 if th:
                                     thinking_parts.append(th)
-                                ci, co, cr = _usage_tokens(chunk)
+                                ci, co, cr, cc = _usage_tokens(chunk)
                                 if ci:
                                     tin = ci
                                 if co:
                                     tout = co
                                 if cr:
                                     treason = cr
+                                if cc:
+                                    tcached = cc
                                 evs = _extract_tool_events(chunk, _now_iso())
                                 if evs:
                                     events.extend(evs)
@@ -431,6 +440,8 @@ def _patch_sync_models(ek: EvalKitClient, gm: Any) -> None:
                                 extra_attrs["gen_ai.response.thinking"] = "".join(thinking_parts)
                             if treason:
                                 extra_attrs["gen_ai.usage.reasoning_tokens"] = treason
+                            if tcached:
+                                extra_attrs["gen_ai.usage.cached_tokens"] = tcached
                             ek.enqueue(_build_envelope(
                                 ek, trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                                 model=model, prompt=prompt, completion="".join(parts),
@@ -492,12 +503,14 @@ def _patch_async_models(ek: EvalKitClient, gm: Any) -> None:
             completion = _extract_completion(result)
             thinking = _extract_thinking(result)
             events = _extract_tool_events(result, end_ts)
-            tokens_in, tokens_out, reasoning_tokens = _usage_tokens(result)
+            tokens_in, tokens_out, reasoning_tokens, cached_tokens = _usage_tokens(result)
             extra_attrs: Dict[str, Any] = {}
             if thinking:
                 extra_attrs["gen_ai.response.thinking"] = thinking
             if reasoning_tokens:
                 extra_attrs["gen_ai.usage.reasoning_tokens"] = reasoning_tokens
+            if cached_tokens:
+                extra_attrs["gen_ai.usage.cached_tokens"] = cached_tokens
 
             ek.enqueue(_build_envelope(
                 ek, trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
@@ -541,7 +554,7 @@ def _patch_async_models(ek: EvalKitClient, gm: Any) -> None:
                     parts: List[str] = []
                     thinking_parts: List[str] = []
                     chunk_dumps: List[Any] = []
-                    tin = tout = treason = 0
+                    tin = tout = treason = tcached = 0
                     events: List[SpanEvent] = []
                     status = "OK"
                     smsg: Optional[str] = None
@@ -554,13 +567,15 @@ def _patch_async_models(ek: EvalKitClient, gm: Any) -> None:
                                 th = _extract_thinking(chunk)
                                 if th:
                                     thinking_parts.append(th)
-                                ci, co, cr = _usage_tokens(chunk)
+                                ci, co, cr, cc = _usage_tokens(chunk)
                                 if ci:
                                     tin = ci
                                 if co:
                                     tout = co
                                 if cr:
                                     treason = cr
+                                if cc:
+                                    tcached = cc
                                 evs = _extract_tool_events(chunk, _now_iso())
                                 if evs:
                                     events.extend(evs)
@@ -579,6 +594,8 @@ def _patch_async_models(ek: EvalKitClient, gm: Any) -> None:
                                 extra_attrs["gen_ai.response.thinking"] = "".join(thinking_parts)
                             if treason:
                                 extra_attrs["gen_ai.usage.reasoning_tokens"] = treason
+                            if tcached:
+                                extra_attrs["gen_ai.usage.cached_tokens"] = tcached
                             ek.enqueue(_build_envelope(
                                 ek, trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                                 model=model, prompt=prompt, completion="".join(parts),

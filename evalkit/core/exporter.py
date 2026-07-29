@@ -17,12 +17,8 @@ _log = logging.getLogger("evalkit")
 # so hammering the ingest endpoint every flush just spams logs and wastes CPU.
 _AUTH_FAIL_LIMIT = 3
 
-# Hard ceiling on a single span's serialized size, kept under Kafka's default
-# 1 MiB message limit. An oversized span (e.g. a captured base64 image body from
-# an image-generation response) is trimmed — and dropped if still too big —
-# instead of being sent and rejected with "Message Size Too Large". Tracing must
-# never ship a payload the backend can't accept.
-_MAX_SPAN_BYTES = 900 * 1024
+
+_MAX_SPAN_BYTES = 8 * 1024 * 1024
 
 
 def _event_size(d: Dict[str, Any]) -> int:

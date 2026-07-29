@@ -58,6 +58,38 @@ class TestSQLAlchemy(unittest.TestCase):
         self.assertEqual(db[0].trace_id, tid)
         self.assertIn("db.statement", db[0].attributes)
 
+    def test_skips_adk_session_tables_but_not_others(self):
+        # Regression test: an ADK-based agent's own DatabaseSessionService
+        # queries `sessions`/`app_states`/`user_states` several times per
+        # turn — near-zero-duration bookkeeping that used to flood a trace
+        # with low-signal spans around every real tool/model call.
+        try:
+            from sqlalchemy import create_engine, text
+        except ImportError:
+            self.skipTest("sqlalchemy not installed")
+
+        eng = create_engine("sqlite:///:memory:")
+        evalkit.patch_sqlalchemy_engine(eng)
+        tid, end, ctx = self.client.start_trace("req")
+        with evalkit.with_trace(ctx):
+            with eng.connect() as conn:
+                conn.execute(text("CREATE TABLE sessions (id INTEGER)"))
+                conn.execute(text("CREATE TABLE app_states (id INTEGER)"))
+                conn.execute(text("CREATE TABLE user_states (id INTEGER)"))
+                conn.execute(text("CREATE TABLE widgets (id INTEGER)"))
+                conn.execute(text("SELECT * FROM sessions"))
+                conn.execute(text("SELECT * FROM app_states"))
+                conn.execute(text("SELECT * FROM user_states"))
+                conn.execute(text("SELECT * FROM widgets"))
+        end("OK")
+        self.client.flush()
+        eng.dispose()
+        tables = {e.attributes.get("db.sql.table") for e in self.captured if e.span_type == "db_query"}
+        self.assertNotIn("sessions", tables)
+        self.assertNotIn("app_states", tables)
+        self.assertNotIn("user_states", tables)
+        self.assertIn("widgets", tables)
+
 
 class TestRedis(unittest.TestCase):
     def setUp(self):

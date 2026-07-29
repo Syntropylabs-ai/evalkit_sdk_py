@@ -196,6 +196,11 @@ def patch_vertex_generative_model(
         usage_metadata = getattr(result, "usage_metadata", None)
         tokens_in = getattr(usage_metadata, "prompt_token_count", 0) or 0
         tokens_out = getattr(usage_metadata, "candidates_token_count", 0) or 0
+        # Subset of tokens_in Gemini served from its (much cheaper) context
+        # cache — already included in tokens_in, never additive. Surfaced
+        # separately so downstream cost math isn't forced to price an entire
+        # long, mostly-cached prompt at the full fresh-input-token rate.
+        cached_tokens = getattr(usage_metadata, "cached_content_token_count", 0) or 0
 
         attrs: Dict[str, Any] = {
             **client._meta_attrs(),
@@ -203,6 +208,8 @@ def patch_vertex_generative_model(
             "gen_ai.response.model": model_name,
             "gen_ai.usage.total_tokens": tokens_in + tokens_out,
         }
+        if cached_tokens:
+            attrs["gen_ai.usage.cached_tokens"] = cached_tokens
         try:
             candidates = getattr(result, "candidates", None) or []
             if candidates:

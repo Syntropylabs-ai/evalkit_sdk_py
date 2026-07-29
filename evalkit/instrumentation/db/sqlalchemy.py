@@ -11,6 +11,17 @@ from ...core.types import TraceEnvelope
 
 _BODY_MAX = 2048
 
+# Tables to never emit a db_query span for — low-signal, near-zero-duration
+# internal bookkeeping that floods a trace without adding debuggable signal.
+# Defaults to Google ADK's own DatabaseSessionService tables: an ADK-based
+# agent hits these several times per turn (session read, app/user state
+# reads, then a write) around every single tool/model call, which is real
+# framework behavior, not something the traced agent's own code chose to do.
+# Mutable — add/remove table names for your own deployment same as the HTTP
+# instrumentation's _SKIP (evalkit.instrumentation.http.*): `from evalkit.instrumentation.db.sqlalchemy
+# import _SKIP_TABLES; _SKIP_TABLES.add("my_table")`.
+_SKIP_TABLES = {"sessions", "app_states", "user_states"}
+
 
 def patch_sqlalchemy(client: EvalKitClient, engine: Any) -> None:
     """
@@ -56,6 +67,8 @@ def patch_sqlalchemy(client: EvalKitClient, engine: Any) -> None:
         op = op_match.group(1).upper() if op_match else "QUERY"
         table_match = re.search(r"(?:FROM|INTO|UPDATE|JOIN)\s+[\"']?(\w+)[\"']?", statement, re.IGNORECASE)
         table = table_match.group(1) if table_match else ""
+        if table.lower() in _SKIP_TABLES:
+            return
         span_name = f"{op} {table}" if table else f"sql {op}"
 
         try:
