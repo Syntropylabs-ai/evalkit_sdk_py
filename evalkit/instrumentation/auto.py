@@ -59,7 +59,7 @@ def _patch_openai_class_sync(ek: "EvalKitClient", cls, provider: str = "openai")
             def on_stream_done(
                 completion: str, tokens_in: int, tokens_out: int,
                 thinking: str, reasoning_tokens: int, has_redacted_thinking: bool,
-                ttft_ms=None,
+                ttft_ms=None, cache_read_tokens: int = 0, cache_creation_tokens: int = 0,
             ) -> None:
                 end_ts = _now_iso()
                 latency = int(time.time() * 1000 - start_ms)
@@ -75,6 +75,7 @@ def _patch_openai_class_sync(ek: "EvalKitClient", cls, provider: str = "openai")
                     service_name=ek._opts.service_name, provider=provider, model=model,
                     prompt=prompt, completion=completion,
                     tokens_in=tokens_in, tokens_out=tokens_out,
+                    cache_read_tokens=cache_read_tokens or None, cache_creation_tokens=cache_creation_tokens or None,
                     latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
                     attributes=stream_attrs,
                     environment=ek._opts.environment, app_version=ek._opts.app_version,
@@ -115,6 +116,8 @@ def _patch_openai_class_sync(ek: "EvalKitClient", cls, provider: str = "openai")
             tokens_out = getattr(usage, "completion_tokens", 0) or 0
             completion_details = getattr(usage, "completion_tokens_details", None)
             reasoning_tokens = getattr(completion_details, "reasoning_tokens", 0) or 0
+            prompt_details = getattr(usage, "prompt_tokens_details", None)
+            cache_read_tokens = getattr(prompt_details, "cached_tokens", 0) or 0
             events = from_openai_chat(result, end_ts)
             attrs = {**ek._meta_attrs(), "gen_ai.request.model": model,
                      "gen_ai.response.model": getattr(result, "model", model),
@@ -128,6 +131,7 @@ def _patch_openai_class_sync(ek: "EvalKitClient", cls, provider: str = "openai")
                 service_name=ek._opts.service_name, provider=provider, model=model,
                 prompt=prompt, completion=completion,
                 tokens_in=tokens_in, tokens_out=tokens_out,
+                cache_read_tokens=cache_read_tokens or None,
                 latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
                 events=events or None,
                 attributes=attrs,
@@ -168,7 +172,7 @@ def _patch_openai_class_async(ek: "EvalKitClient", cls, provider: str = "openai"
             def on_stream_done(
                 completion: str, tokens_in: int, tokens_out: int,
                 thinking: str, reasoning_tokens: int, has_redacted_thinking: bool,
-                ttft_ms=None,
+                ttft_ms=None, cache_read_tokens: int = 0, cache_creation_tokens: int = 0,
             ) -> None:
                 end_ts = _now_iso()
                 latency = int(time.time() * 1000 - start_ms)
@@ -184,6 +188,7 @@ def _patch_openai_class_async(ek: "EvalKitClient", cls, provider: str = "openai"
                     service_name=ek._opts.service_name, provider=provider, model=model,
                     prompt=prompt, completion=completion,
                     tokens_in=tokens_in, tokens_out=tokens_out,
+                    cache_read_tokens=cache_read_tokens or None, cache_creation_tokens=cache_creation_tokens or None,
                     latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
                     attributes=stream_attrs,
                     environment=ek._opts.environment, app_version=ek._opts.app_version,
@@ -224,6 +229,8 @@ def _patch_openai_class_async(ek: "EvalKitClient", cls, provider: str = "openai"
             tokens_out = getattr(usage, "completion_tokens", 0) or 0
             completion_details = getattr(usage, "completion_tokens_details", None)
             reasoning_tokens = getattr(completion_details, "reasoning_tokens", 0) or 0
+            prompt_details = getattr(usage, "prompt_tokens_details", None)
+            cache_read_tokens = getattr(prompt_details, "cached_tokens", 0) or 0
             events = from_openai_chat(result, end_ts)
             attrs = {**ek._meta_attrs(), "gen_ai.request.model": model,
                      "gen_ai.response.model": getattr(result, "model", model),
@@ -237,6 +244,7 @@ def _patch_openai_class_async(ek: "EvalKitClient", cls, provider: str = "openai"
                 service_name=ek._opts.service_name, provider=provider, model=model,
                 prompt=prompt, completion=completion,
                 tokens_in=tokens_in, tokens_out=tokens_out,
+                cache_read_tokens=cache_read_tokens or None,
                 latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
                 events=events or None,
                 attributes=attrs,
@@ -482,7 +490,7 @@ def _patch_anthropic_class_sync(ek: "EvalKitClient", cls) -> None:
             def on_stream_done(
                 completion: str, tokens_in: int, tokens_out: int,
                 thinking: str, reasoning_tokens: int, has_redacted_thinking: bool,
-                ttft_ms=None,
+                ttft_ms=None, cache_read_tokens: int = 0, cache_creation_tokens: int = 0,
             ) -> None:
                 end_ts = _now_iso()
                 latency = int(time.time() * 1000 - start_ms)
@@ -500,6 +508,7 @@ def _patch_anthropic_class_sync(ek: "EvalKitClient", cls) -> None:
                     service_name=ek._opts.service_name, provider="anthropic", model=model,
                     prompt=prompt, completion=completion,
                     tokens_in=tokens_in, tokens_out=tokens_out,
+                    cache_read_tokens=cache_read_tokens or None, cache_creation_tokens=cache_creation_tokens or None,
                     latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
                     attributes=stream_attrs,
                     environment=ek._opts.environment, app_version=ek._opts.app_version,
@@ -533,8 +542,12 @@ def _patch_anthropic_class_sync(ek: "EvalKitClient", cls) -> None:
         completion = next((b.text for b in content if hasattr(b, "text")), "")
         thinking_text, has_redacted_thinking = _extract_thinking(content)
         usage = getattr(result, "usage", None)
-        tokens_in = getattr(usage, "input_tokens", 0) or 0
         tokens_out = getattr(usage, "output_tokens", 0) or 0
+        cache_read_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
+        cache_creation_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
+        # See llm/anthropic.py: Anthropic's input_tokens excludes cache reads/writes
+        # (additive, unlike OpenAI/Gemini) — normalize to inclusive-of-cache here.
+        tokens_in = (getattr(usage, "input_tokens", 0) or 0) + cache_read_tokens + cache_creation_tokens
         events = from_anthropic_blocks(content, end_ts)
         stop_reason = getattr(result, "stop_reason", None)
         attrs = {
@@ -557,6 +570,7 @@ def _patch_anthropic_class_sync(ek: "EvalKitClient", cls) -> None:
             service_name=ek._opts.service_name, provider="anthropic", model=model,
             prompt=prompt, completion=completion,
             tokens_in=tokens_in, tokens_out=tokens_out,
+            cache_read_tokens=cache_read_tokens or None, cache_creation_tokens=cache_creation_tokens or None,
             latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
             events=events or None,
             attributes=attrs,
@@ -599,7 +613,7 @@ def _patch_anthropic_class_async(ek: "EvalKitClient", cls) -> None:
             def on_stream_done(
                 completion: str, tokens_in: int, tokens_out: int,
                 thinking: str, reasoning_tokens: int, has_redacted_thinking: bool,
-                ttft_ms=None,
+                ttft_ms=None, cache_read_tokens: int = 0, cache_creation_tokens: int = 0,
             ) -> None:
                 end_ts = _now_iso()
                 latency = int(time.time() * 1000 - start_ms)
@@ -617,6 +631,7 @@ def _patch_anthropic_class_async(ek: "EvalKitClient", cls) -> None:
                     service_name=ek._opts.service_name, provider="anthropic", model=model,
                     prompt=prompt, completion=completion,
                     tokens_in=tokens_in, tokens_out=tokens_out,
+                    cache_read_tokens=cache_read_tokens or None, cache_creation_tokens=cache_creation_tokens or None,
                     latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
                     attributes=stream_attrs,
                     environment=ek._opts.environment, app_version=ek._opts.app_version,
@@ -651,8 +666,12 @@ def _patch_anthropic_class_async(ek: "EvalKitClient", cls) -> None:
         completion = next((b.text for b in content if hasattr(b, "text")), "")
         thinking_text, has_redacted_thinking = _extract_thinking(content)
         usage = getattr(result, "usage", None)
-        tokens_in = getattr(usage, "input_tokens", 0) or 0
         tokens_out = getattr(usage, "output_tokens", 0) or 0
+        cache_read_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
+        cache_creation_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
+        # See llm/anthropic.py: Anthropic's input_tokens excludes cache reads/writes
+        # (additive, unlike OpenAI/Gemini) — normalize to inclusive-of-cache here.
+        tokens_in = (getattr(usage, "input_tokens", 0) or 0) + cache_read_tokens + cache_creation_tokens
         events = from_anthropic_blocks(content, end_ts)
         stop_reason = getattr(result, "stop_reason", None)
         attrs = {
@@ -675,6 +694,7 @@ def _patch_anthropic_class_async(ek: "EvalKitClient", cls) -> None:
             service_name=ek._opts.service_name, provider="anthropic", model=model,
             prompt=prompt, completion=completion,
             tokens_in=tokens_in, tokens_out=tokens_out,
+            cache_read_tokens=cache_read_tokens or None, cache_creation_tokens=cache_creation_tokens or None,
             latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
             events=events or None,
             attributes=attrs,

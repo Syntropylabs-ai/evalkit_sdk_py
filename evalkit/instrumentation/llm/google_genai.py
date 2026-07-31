@@ -256,6 +256,7 @@ def _build_envelope(
     latency: int,
     ts: str,
     end_ts: str,
+    cache_read_tokens: int = 0,
     session_id: Optional[str] = None,
     device_id: Optional[str] = None,
     status: str = "OK",
@@ -293,6 +294,7 @@ def _build_envelope(
         completion=completion,
         tokens_in=tokens_in,
         tokens_out=tokens_out,
+        cache_read_tokens=cache_read_tokens or None,
         latency_ms=latency,
         start_time=ts,
         end_time=end_ts,
@@ -361,7 +363,7 @@ def _patch_sync_models(ek: EvalKitClient, gm: Any) -> None:
             ek.enqueue(_build_envelope(
                 ek, trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                 model=model, prompt=prompt, completion=completion,
-                tokens_in=tokens_in, tokens_out=tokens_out,
+                tokens_in=tokens_in, tokens_out=tokens_out, cache_read_tokens=cached_tokens,
                 latency=latency, ts=ts, end_ts=end_ts, events=events,
                 session_id=session_id, device_id=device_id,
                 request_body=_request_body(contents, config),
@@ -445,7 +447,7 @@ def _patch_sync_models(ek: EvalKitClient, gm: Any) -> None:
                             ek.enqueue(_build_envelope(
                                 ek, trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                                 model=model, prompt=prompt, completion="".join(parts),
-                                tokens_in=tin, tokens_out=tout,
+                                tokens_in=tin, tokens_out=tout, cache_read_tokens=tcached,
                                 latency=int(time.time() * 1000 - start_ms), ts=ts, end_ts=end_ts,
                                 events=events or None, session_id=session_id, device_id=device_id,
                                 status=status, status_message=smsg, attrs=extra_attrs,
@@ -515,7 +517,7 @@ def _patch_async_models(ek: EvalKitClient, gm: Any) -> None:
             ek.enqueue(_build_envelope(
                 ek, trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                 model=model, prompt=prompt, completion=completion,
-                tokens_in=tokens_in, tokens_out=tokens_out,
+                tokens_in=tokens_in, tokens_out=tokens_out, cache_read_tokens=cached_tokens,
                 latency=latency, ts=ts, end_ts=end_ts, events=events,
                 session_id=session_id, device_id=device_id,
                 request_body=_request_body(contents, config),
@@ -599,7 +601,7 @@ def _patch_async_models(ek: EvalKitClient, gm: Any) -> None:
                             ek.enqueue(_build_envelope(
                                 ek, trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                                 model=model, prompt=prompt, completion="".join(parts),
-                                tokens_in=tin, tokens_out=tout,
+                                tokens_in=tin, tokens_out=tout, cache_read_tokens=tcached,
                                 latency=int(time.time() * 1000 - start_ms), ts=ts, end_ts=end_ts,
                                 events=events or None, session_id=session_id, device_id=device_id,
                                 status=status, status_message=smsg, attrs=extra_attrs,

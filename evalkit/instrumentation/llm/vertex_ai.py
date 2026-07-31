@@ -85,8 +85,12 @@ def patch_anthropic_vertex(
         events: List[SpanEvent] = from_anthropic_blocks(getattr(result, "content", []), end_ts)
 
         usage = getattr(result, "usage", None)
-        tokens_in = getattr(usage, "input_tokens", 0) or 0
         tokens_out = getattr(usage, "output_tokens", 0) or 0
+        cache_read_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
+        cache_creation_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
+        # See llm/anthropic.py: Anthropic's input_tokens excludes cache reads/writes
+        # (additive, unlike OpenAI/Gemini) — normalize to inclusive-of-cache here.
+        tokens_in = (getattr(usage, "input_tokens", 0) or 0) + cache_read_tokens + cache_creation_tokens
 
         attrs: Dict[str, Any] = {
             **client._meta_attrs(),
@@ -114,6 +118,7 @@ def patch_anthropic_vertex(
             service_name=client._opts.service_name, provider="anthropic-vertex", model=model,
             prompt=prompt_text, completion=text_content,
             tokens_in=tokens_in, tokens_out=tokens_out,
+            cache_read_tokens=cache_read_tokens or None, cache_creation_tokens=cache_creation_tokens or None,
             latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
             events=events or None, attributes=attrs,
             environment=client._opts.environment, app_version=client._opts.app_version,
@@ -234,7 +239,7 @@ def patch_vertex_generative_model(
             operation="generate_content",
             service_name=client._opts.service_name, provider="vertex-ai", model=model_name,
             prompt=prompt_text, completion=completion,
-            tokens_in=tokens_in, tokens_out=tokens_out,
+            tokens_in=tokens_in, tokens_out=tokens_out, cache_read_tokens=cached_tokens or None,
             latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
             attributes=attrs,
             environment=client._opts.environment, app_version=client._opts.app_version,

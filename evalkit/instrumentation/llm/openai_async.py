@@ -47,6 +47,7 @@ def patch_async_openai(
                 completion: str, tokens_in: int, tokens_out: int,
                 thinking: str, reasoning_tokens: int, has_redacted_thinking: bool,
                 ttft_ms: Optional[int],
+                cache_read_tokens: int = 0, cache_creation_tokens: int = 0,
             ) -> None:
                 end_ts = _now_iso()
                 latency = int(time.time() * 1000 - start_ms)
@@ -64,6 +65,7 @@ def patch_async_openai(
                     service_name=client._opts.service_name, provider="openai", model=model,
                     prompt=prompt_text, completion=completion[:_COMPLETION_MAX],
                     tokens_in=tokens_in, tokens_out=tokens_out,
+                    cache_read_tokens=cache_read_tokens or None, cache_creation_tokens=cache_creation_tokens or None,
                     latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
                     attributes=stream_attrs,
                     environment=client._opts.environment, app_version=client._opts.app_version,
@@ -103,6 +105,8 @@ def patch_async_openai(
         tokens_out = getattr(usage, "completion_tokens", 0) or 0
         completion_details = getattr(usage, "completion_tokens_details", None)
         reasoning_tokens = getattr(completion_details, "reasoning_tokens", 0) or 0
+        prompt_details = getattr(usage, "prompt_tokens_details", None)
+        cache_read_tokens = getattr(prompt_details, "cached_tokens", 0) or 0
 
         events: List[SpanEvent] = from_openai_chat(result, end_ts)
 
@@ -134,6 +138,7 @@ def patch_async_openai(
             service_name=client._opts.service_name, provider="openai", model=model,
             prompt=prompt_text, completion=completion[:_COMPLETION_MAX],
             tokens_in=tokens_in, tokens_out=tokens_out,
+            cache_read_tokens=cache_read_tokens or None,
             latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
             events=events or None, attributes=attrs,
             environment=client._opts.environment, app_version=client._opts.app_version,

@@ -268,6 +268,7 @@ class _ObservedSession:
 
             tokens_in = getattr(usage, "prompt_token_count", 0) or 0 if usage else 0
             tokens_out = getattr(usage, "response_token_count", 0) or 0 if usage else 0
+            cached_tokens = 0
             if usage is not None:
                 total = getattr(usage, "total_token_count", 0) or 0
                 attrs["gen_ai.usage.total_tokens"] = total or (tokens_in + tokens_out)
@@ -303,6 +304,7 @@ class _ObservedSession:
                 completion=completion[:_MAX_TEXT] or None,
                 tokens_in=tokens_in,
                 tokens_out=tokens_out,
+                cache_read_tokens=cached_tokens or None,
                 latency_ms=latency_ms,
                 start_time=ts,
                 end_time=ts,

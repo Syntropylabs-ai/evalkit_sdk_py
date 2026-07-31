@@ -57,6 +57,19 @@ def _usage(result: Any):
     )
 
 
+def _cache_usage(result: Any):
+    """LiteLLM normalizes every provider onto the OpenAI usage shape but
+    passes provider-specific fields through where it can — OpenAI-routed
+    calls carry prompt_tokens_details.cached_tokens, Anthropic-routed calls
+    carry cache_read_input_tokens/cache_creation_input_tokens directly on
+    usage. Check both; whichever the underlying provider populated wins."""
+    usage = getattr(result, "usage", None)
+    prompt_details = getattr(usage, "prompt_tokens_details", None)
+    cache_read = getattr(prompt_details, "cached_tokens", 0) or getattr(usage, "cache_read_input_tokens", 0) or 0
+    cache_creation = getattr(usage, "cache_creation_input_tokens", 0) or 0
+    return cache_read, cache_creation
+
+
 def _reasoning_tokens(result: Any) -> int:
     usage = getattr(result, "usage", None)
     details = getattr(usage, "completion_tokens_details", None)
@@ -111,6 +124,7 @@ def _patch_sync(ek: "EvalKitClient", litellm: Any) -> None:
                 completion: str, tin: int, tout: int,
                 thinking: str, reasoning_tokens: int, has_redacted_thinking: bool,
                 ttft_ms: Optional[int],
+                cache_read_tokens: int = 0, cache_creation_tokens: int = 0,
             ) -> None:
                 stream_attrs = {**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True}
                 if request_body:
@@ -124,6 +138,7 @@ def _patch_sync(ek: "EvalKitClient", litellm: Any) -> None:
                     span_type="llm_call", status="OK", operation="litellm.completion",
                     service_name=ek._opts.service_name, provider="litellm", model=model,
                     prompt=prompt, completion=completion, tokens_in=tin, tokens_out=tout,
+                    cache_read_tokens=cache_read_tokens or None, cache_creation_tokens=cache_creation_tokens or None,
                     latency_ms=int(time.time() * 1000 - start_ms), start_time=ts, end_time=_now_iso(),
                     created_at=ts, attributes=stream_attrs,
                     environment=ek._opts.environment, app_version=ek._opts.app_version, sdk_version=SDK_VERSION,
@@ -150,6 +165,7 @@ def _patch_sync(ek: "EvalKitClient", litellm: Any) -> None:
 
         end_ts = _now_iso()
         tin, tout = _usage(result)
+        cache_read_tokens, cache_creation_tokens = _cache_usage(result)
         reasoning_tokens = _reasoning_tokens(result)
         reasoning_content = _reasoning_content(result)
         attrs = {**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.usage.total_tokens": tin + tout}
@@ -167,6 +183,7 @@ def _patch_sync(ek: "EvalKitClient", litellm: Any) -> None:
             span_type="llm_call", status="OK", operation="litellm.completion",
             service_name=ek._opts.service_name, provider="litellm", model=model,
             prompt=prompt, completion=_completion_text(result), tokens_in=tin, tokens_out=tout,
+            cache_read_tokens=cache_read_tokens or None, cache_creation_tokens=cache_creation_tokens or None,
             latency_ms=int(time.time() * 1000 - start_ms), start_time=ts, end_time=end_ts, created_at=ts,
             events=_tool_events(result, end_ts) or None,
             attributes=attrs,
@@ -202,6 +219,7 @@ def _patch_async(ek: "EvalKitClient", litellm: Any) -> None:
                 completion: str, tin: int, tout: int,
                 thinking: str, reasoning_tokens: int, has_redacted_thinking: bool,
                 ttft_ms: Optional[int],
+                cache_read_tokens: int = 0, cache_creation_tokens: int = 0,
             ) -> None:
                 stream_attrs = {**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True}
                 if request_body:
@@ -215,6 +233,7 @@ def _patch_async(ek: "EvalKitClient", litellm: Any) -> None:
                     span_type="llm_call", status="OK", operation="litellm.acompletion",
                     service_name=ek._opts.service_name, provider="litellm", model=model,
                     prompt=prompt, completion=completion, tokens_in=tin, tokens_out=tout,
+                    cache_read_tokens=cache_read_tokens or None, cache_creation_tokens=cache_creation_tokens or None,
                     latency_ms=int(time.time() * 1000 - start_ms), start_time=ts, end_time=_now_iso(),
                     created_at=ts, attributes=stream_attrs,
                     environment=ek._opts.environment, app_version=ek._opts.app_version, sdk_version=SDK_VERSION,
@@ -242,6 +261,7 @@ def _patch_async(ek: "EvalKitClient", litellm: Any) -> None:
 
         end_ts = _now_iso()
         tin, tout = _usage(result)
+        cache_read_tokens, cache_creation_tokens = _cache_usage(result)
         reasoning_tokens = _reasoning_tokens(result)
         reasoning_content = _reasoning_content(result)
         attrs = {**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.usage.total_tokens": tin + tout}
@@ -259,6 +279,7 @@ def _patch_async(ek: "EvalKitClient", litellm: Any) -> None:
             span_type="llm_call", status="OK", operation="litellm.acompletion",
             service_name=ek._opts.service_name, provider="litellm", model=model,
             prompt=prompt, completion=_completion_text(result), tokens_in=tin, tokens_out=tout,
+            cache_read_tokens=cache_read_tokens or None, cache_creation_tokens=cache_creation_tokens or None,
             latency_ms=int(time.time() * 1000 - start_ms), start_time=ts, end_time=end_ts, created_at=ts,
             events=_tool_events(result, end_ts) or None,
             attributes=attrs,

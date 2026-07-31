@@ -48,6 +48,7 @@ def patch_async_anthropic(
                 completion: str, tokens_in: int, tokens_out: int,
                 thinking: str, reasoning_tokens: int, has_redacted_thinking: bool,
                 ttft_ms: Optional[int],
+                cache_read_tokens: int = 0, cache_creation_tokens: int = 0,
             ) -> None:
                 end_ts = _now_iso()
                 latency = int(time.time() * 1000 - start_ms)
@@ -67,6 +68,7 @@ def patch_async_anthropic(
                     service_name=client._opts.service_name, provider="anthropic", model=model,
                     prompt=prompt_text, completion=completion[:_COMPLETION_MAX],
                     tokens_in=tokens_in, tokens_out=tokens_out,
+                    cache_read_tokens=cache_read_tokens or None, cache_creation_tokens=cache_creation_tokens or None,
                     latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
                     attributes=stream_attrs,
                     environment=client._opts.environment, app_version=client._opts.app_version,
@@ -109,8 +111,12 @@ def patch_async_anthropic(
         events: List[SpanEvent] = from_anthropic_blocks(getattr(result, "content", []), end_ts)
 
         usage = getattr(result, "usage", None)
-        tokens_in = getattr(usage, "input_tokens", 0) or 0
         tokens_out = getattr(usage, "output_tokens", 0) or 0
+        cache_read_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
+        cache_creation_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
+        # See anthropic.py: Anthropic's input_tokens excludes cache reads/writes
+        # (additive, unlike OpenAI/Gemini) — normalize to inclusive-of-cache here.
+        tokens_in = (getattr(usage, "input_tokens", 0) or 0) + cache_read_tokens + cache_creation_tokens
 
         attrs: Dict[str, Any] = {
             **client._meta_attrs(),
@@ -142,6 +148,7 @@ def patch_async_anthropic(
             service_name=client._opts.service_name, provider="anthropic", model=model,
             prompt=prompt_text, completion=text_content[:_COMPLETION_MAX],
             tokens_in=tokens_in, tokens_out=tokens_out,
+            cache_read_tokens=cache_read_tokens or None, cache_creation_tokens=cache_creation_tokens or None,
             latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
             events=events or None, attributes=attrs,
             environment=client._opts.environment, app_version=client._opts.app_version,

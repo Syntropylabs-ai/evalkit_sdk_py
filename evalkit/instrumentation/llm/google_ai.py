@@ -121,7 +121,7 @@ def patch_google_ai(client: EvalKitClient, model: Any) -> None:
             operation="generate_content",
             service_name=client._opts.service_name, provider="google-ai", model=model_name,
             prompt=prompt_text, completion=completion,
-            tokens_in=tokens_in, tokens_out=tokens_out,
+            tokens_in=tokens_in, tokens_out=tokens_out, cache_read_tokens=cached_tokens or None,
             latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
             attributes=attrs,
             environment=client._opts.environment, app_version=client._opts.app_version,

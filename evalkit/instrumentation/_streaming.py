@@ -12,6 +12,8 @@ class _StreamState:
         self.thinking_chunks: list[str] = []
         self.tokens_in = 0
         self.tokens_out = 0
+        self.cache_read_tokens = 0
+        self.cache_creation_tokens = 0
         self.reasoning_tokens = 0
         self.has_redacted_thinking = False
         self.start_ms = start_ms
@@ -37,6 +39,9 @@ class _StreamState:
             details = getattr(usage, "completion_tokens_details", None)
             if details:
                 self.reasoning_tokens = getattr(details, "reasoning_tokens", 0) or 0
+            prompt_details = getattr(usage, "prompt_tokens_details", None)
+            if prompt_details:
+                self.cache_read_tokens = getattr(prompt_details, "cached_tokens", 0) or 0
 
     def process_anthropic_chunk(self, event: object) -> None:
         etype = getattr(event, "type", None)
@@ -62,7 +67,12 @@ class _StreamState:
             if message:
                 usage = getattr(message, "usage", None)
                 if usage:
-                    self.tokens_in = getattr(usage, "input_tokens", 0) or 0
+                    self.cache_read_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
+                    self.cache_creation_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
+                    # Anthropic's input_tokens excludes cache reads/writes (additive,
+                    # unlike OpenAI) — normalize to inclusive-of-cache like every
+                    # other provider's tokens_in (see llm/anthropic.py).
+                    self.tokens_in = (getattr(usage, "input_tokens", 0) or 0) + self.cache_read_tokens + self.cache_creation_tokens
         elif etype == "message_delta":
             usage = getattr(event, "usage", None)
             if usage:
@@ -87,7 +97,7 @@ class _SyncStreamTracer:
             self._on_done(
                 "".join(s.chunks), s.tokens_in, s.tokens_out,
                 "".join(s.thinking_chunks), s.reasoning_tokens, s.has_redacted_thinking,
-                s.ttft_ms,
+                s.ttft_ms, s.cache_read_tokens, s.cache_creation_tokens,
             )
 
     def __iter__(self):  # type: ignore[return]
@@ -134,7 +144,7 @@ class _AsyncStreamTracer:
             self._on_done(
                 "".join(s.chunks), s.tokens_in, s.tokens_out,
                 "".join(s.thinking_chunks), s.reasoning_tokens, s.has_redacted_thinking,
-                s.ttft_ms,
+                s.ttft_ms, s.cache_read_tokens, s.cache_creation_tokens,
             )
 
     async def __aiter__(self):  # type: ignore[return]

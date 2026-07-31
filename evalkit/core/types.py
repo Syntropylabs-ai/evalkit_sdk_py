@@ -40,6 +40,13 @@ class TraceEnvelope:
     events: Optional[List[SpanEvent]] = None
     tokens_in: Optional[int] = None
     tokens_out: Optional[int] = None
+    # Tokens served from / written to the provider's prompt cache (Anthropic
+    # cache_read_input_tokens/cache_creation_input_tokens, OpenAI
+    # prompt_tokens_details.cached_tokens, Gemini cached_content_token_count).
+    # Already counted within tokens_in — these are additive breakdowns for
+    # cost math, not extra tokens on top of tokens_in.
+    cache_read_tokens: Optional[int] = None
+    cache_creation_tokens: Optional[int] = None
     latency_ms: Optional[int] = None
     start_time: Optional[str] = None
     end_time: Optional[str] = None
@@ -90,6 +97,10 @@ class TraceEnvelope:
             d["tokensIn"] = self.tokens_in
         if self.tokens_out is not None:
             d["tokensOut"] = self.tokens_out
+        if self.cache_read_tokens is not None:
+            d["cacheReadTokens"] = self.cache_read_tokens
+        if self.cache_creation_tokens is not None:
+            d["cacheCreationTokens"] = self.cache_creation_tokens
         if self.latency_ms is not None:
             d["latencyMs"] = self.latency_ms
         if self.start_time:
