@@ -5,16 +5,6 @@ import threading
 
 
 def patch_threads() -> None:
-    """
-    Patch threading.Thread.start and concurrent.futures.ThreadPoolExecutor.submit
-    so every thread/executor task automatically inherits the current ContextVar
-    state (including the active evalkit trace context).
-
-    Without this:
-    - threading.Thread gets an empty ContextVar copy → orphan traces
-    - run_in_executor / ThreadPoolExecutor.submit → orphan traces
-    - Fire-and-forget background tasks lose the request trace context
-    """
     _patch_thread_start()
     _patch_thread_pool_executor()
 
@@ -44,16 +34,11 @@ def _patch_thread_start() -> None:
 
         return original_start(self)
 
-    patched_start._evalkit = True  # type: ignore[attr-defined]
-    threading.Thread.start = patched_start  # type: ignore[method-assign]
+    patched_start._evalkit = True
+    threading.Thread.start = patched_start
 
 
 def _patch_thread_pool_executor() -> None:
-    """
-    Patch ThreadPoolExecutor.submit so tasks submitted to a pool inherit the
-    calling thread's ContextVars. This covers asyncio's run_in_executor() and
-    any explicit ThreadPoolExecutor usage.
-    """
     try:
         from concurrent.futures import ThreadPoolExecutor
     except ImportError:
@@ -64,9 +49,9 @@ def _patch_thread_pool_executor() -> None:
 
     original_submit = ThreadPoolExecutor.submit
 
-    def patched_submit(self: ThreadPoolExecutor, fn, *args, **kwargs):  # type: ignore[override]
+    def patched_submit(self: ThreadPoolExecutor, fn, *args, **kwargs):
         ctx = contextvars.copy_context()
         return original_submit(self, ctx.run, fn, *args, **kwargs)
 
-    patched_submit._evalkit = True  # type: ignore[attr-defined]
-    ThreadPoolExecutor.submit = patched_submit  # type: ignore[method-assign]
+    patched_submit._evalkit = True
+    ThreadPoolExecutor.submit = patched_submit

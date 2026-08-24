@@ -1,26 +1,3 @@
-"""Trace Google Gemini Live (voice/realtime over a WebSocket).
-
-Nothing auto-instruments a WebSocket, so we wrap the Live session: open a
-``voice.session`` trace, accumulate both sides of the conversation (user input
-transcription + everything sent via ``send_client_content``/``send_realtime_input``,
-and the model's output transcription/text/thinking), emit one ``voice.turn``
-llm_call span per completed turn with prompt/completion/tokens/request+response
-body — the same shape every other auto-instrumented provider produces — and emit
-a ``tool_call`` span per function call. Closes the session span when the socket
-closes. Mirrors the TS reference (instrumentation/llm/google-live.ts).
-
-The Python API is async:
-
-    client = genai.Client(...)
-    async with client.aio.live.connect(model=..., config=...) as session:
-        await session.send_client_content(turns=[...], turn_complete=True)
-        async for msg in session.receive():
-            ...
-
-``connect()`` is an *async context manager*, so we wrap the object it returns and
-forward ``receive()``/``send_*`` through observing wrappers. Tracing must NEVER
-break the host: every wrapper path falls back to the real session on any error.
-"""
 from __future__ import annotations
 
 import json
@@ -66,12 +43,6 @@ def _turn_complete(msg: Any) -> bool:
 
 
 def _emit_tool_calls(client: "EvalKitClient", msg: Any, base: dict, parent_ctx: Any) -> List[SpanEvent]:
-    """Emit one tool_call span per function call on ``msg.tool_call``.
-
-    Returns the same calls as SpanEvents too, so they can also ride along on the
-    turn's own llm_call span (matching how every other provider surfaces tool
-    calls), not just as separate child spans.
-    """
     events: List[SpanEvent] = []
     try:
         tc = getattr(msg, "tool_call", None)
@@ -108,12 +79,6 @@ def _emit_tool_calls(client: "EvalKitClient", msg: Any, base: dict, parent_ctx: 
 
 
 class _ObservedSession:
-    """Wraps a real Live session: forwards everything, observes both directions.
-
-    Holds the session-span ``end`` callback and ends it when the session closes
-    (close() or __aexit__). Unknown attributes proxy to the underlying session so
-    anything we don't explicitly wrap keeps working unchanged.
-    """
 
     def __init__(self, client: "EvalKitClient", session: Any, base: dict, ctx: Any, end_session) -> None:
         self.__dict__["_ek"] = client
@@ -134,7 +99,6 @@ class _ObservedSession:
         self.__dict__["_usage"] = None
         self.__dict__["_turn_start"] = time.time() * 1000
 
-    # ── outbound: capture what the app sends this turn ──────────────────────
 
     def _capture_outbound(self, kind: str, **fields: Any) -> None:
         try:
@@ -165,7 +129,6 @@ class _ObservedSession:
                 self._input_parts.append(text)
                 self._capture_outbound("realtime_input", text=text)
             elif kwargs:
-                # Audio/video/activity signals — note the modality, never dump binary data.
                 modality = next((k for k in ("audio", "video", "activity_start", "activity_end") if k in kwargs), None)
                 if modality:
                     self._capture_outbound("realtime_input", modality=modality)
@@ -190,7 +153,6 @@ class _ObservedSession:
             pass
         return await self._session.send(*args, **kwargs)
 
-    # ── inbound: observe model output + usage + tool calls ──────────────────
 
     def _observe(self, msg: Any) -> None:
         try:
@@ -222,7 +184,6 @@ class _ObservedSession:
 
             self._tool_events.extend(_emit_tool_calls(self._ek, msg, self._base, self._ctx))
 
-            # Compact response dump — never include raw audio/image bytes.
             try:
                 entry: dict = {}
                 if sc is not None and getattr(sc, "turn_complete", False):
@@ -254,7 +215,7 @@ class _ObservedSession:
             self._reset_turn()
 
             if not prompt and not completion:
-                return  # skip audio-only turns with no transcript at all
+                return
 
             attrs = dict(self._base)
             req_body = _safe_body(request_dump) if request_dump else None
@@ -275,9 +236,6 @@ class _ObservedSession:
                 thoughts_tokens = getattr(usage, "thoughts_token_count", 0) or 0
                 if thoughts_tokens:
                     attrs["gen_ai.usage.reasoning_tokens"] = thoughts_tokens
-                # Subset of tokens_in served from context cache — already
-                # included in tokens_in, never additive. Absent on session
-                # types that don't support caching (getattr default handles that).
                 cached_tokens = getattr(usage, "cached_content_token_count", 0) or 0
                 if cached_tokens:
                     attrs["gen_ai.usage.cached_tokens"] = cached_tokens
@@ -359,12 +317,6 @@ class _ObservedSession:
 
 
 class _TracedConnect:
-    """Async-context-manager wrapper around ``live.connect(...)``.
-
-    Opens the ``voice.session`` trace on ``__aenter__`` and returns an
-    ``_ObservedSession``; ends the session span on ``__aexit__``. Falls back to
-    the raw session if anything in our wrapping fails.
-    """
 
     def __init__(self, client: "EvalKitClient", cm: Any, model: str) -> None:
         self._ek = client
@@ -381,7 +333,7 @@ class _TracedConnect:
             self._observed = _ObservedSession(self._ek, session, _base_attrs(self._model), ctx, end)
             return self._observed
         except Exception:
-            return session  # fail open — host gets the unwrapped session
+            return session
 
     async def __aexit__(self, exc_type, exc, tb):
         try:
@@ -395,7 +347,6 @@ class _TracedConnect:
 
 
 def _resolve_live(genai_client: Any) -> Any:
-    """Return the object exposing ``connect`` (client.aio.live)."""
     aio = getattr(genai_client, "aio", None)
     live = getattr(aio, "live", None) if aio is not None else None
     if live is None:
@@ -410,20 +361,10 @@ def trace_google_live(
     model: Optional[str] = None,
     config: Any = None,
 ) -> Any:
-    """Explicit drop-in for ``client.aio.live.connect(model=, config=)``.
-
-    Returns an async context manager — use it exactly like the original::
-
-        async with evalkit.trace_google_live(genai_client, model=..., config=...) as session:
-            ...
-
-    The real socket is opened lazily on ``__aenter__``. On any error, falls back to
-    the real connect so the host is never broken.
-    """
     try:
         live = _resolve_live(genai_client)
         if live is None or not hasattr(live, "connect"):
-            return live.connect(model=model, config=config)  # let it raise naturally
+            return live.connect(model=model, config=config)
         kwargs: dict = {}
         if model is not None:
             kwargs["model"] = model
@@ -437,10 +378,6 @@ def trace_google_live(
 
 
 def patch_google_genai_live(client: "EvalKitClient") -> None:
-    """Best-effort: wrap ``Live.connect`` so plain ``client.aio.live.connect(...)``
-    is traced — including calls made deep inside a framework (e.g. Pipecat) that
-    creates and owns its own genai client internally. Idempotent (sentinel attr).
-    Never raises."""
     try:
         from google.genai import live as _live_mod
     except Exception:
@@ -463,7 +400,7 @@ def patch_google_genai_live(client: "EvalKitClient") -> None:
             except Exception:
                 return original(self, *args, **kwargs)
 
-        traced_connect._evalkit = True  # type: ignore[attr-defined]
+        traced_connect._evalkit = True
         Live.connect = traced_connect
     except Exception:
         pass

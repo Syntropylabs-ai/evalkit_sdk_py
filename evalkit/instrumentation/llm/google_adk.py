@@ -1,35 +1,3 @@
-"""Instrumentation for Google ADK (Agent Development Kit).
-
-ADK's LLM calls already surface as llm_call spans for free: every Gemini call
-ADK makes internally goes through google.genai, which EvalKit patches at the
-class level (see google_genai.py). Two things don't come for free and are
-added here:
-
-  - A `function_call` span (operation "run_agent") wrapping each agent turn,
-    sourced from BaseAgent.run_async — the one method every agent (root or
-    delegated sub-agent) funnels through, since LlmAgent and friends override
-    `_run_async_impl`, not `run_async` itself. Wrapping it once therefore
-    gives full agent-hierarchy visibility (root + nested sub-agents) with a
-    single patch. Shaped to match the dashboard's existing "run_agent"
-    narrative convention (see trace-analysis.service.ts's `firstArg` /
-    `extractAgentText`): `function.args` carries the user turn text and
-    `function.result` is an `AgentTurnResult(text=..., tool_calls=...)` repr —
-    the exact shape evalkit's own simulation framework already produces, so
-    ADK runs get the identical narrative rendering for free.
-
-  - A `tool_call` span per tool execution, sourced from LlmAgent's
-    before_tool_callback / after_tool_callback — ADK's public, documented
-    extension point for exactly this purpose. Deliberately not hooking ADK's
-    internal tracing plumbing (google.adk.telemetry._instrumentation,
-    google.adk.flows.llm_flows.functions): that surface has already changed
-    shape between recent ADK releases, while the callback fields on LlmAgent
-    are a stable, user-facing API. EvalKit's callbacks are prepended/appended
-    around whatever the caller already configured, so nothing is overridden
-    or double-registered, and the before-hook always returns None so it can
-    never be mistaken for a response override (ADK skips the real tool call
-    if any before_tool_callback returns truthy).
-"""
-
 from __future__ import annotations
 
 import time
@@ -45,9 +13,6 @@ from ...simulation.types import AgentTurnResult
 if TYPE_CHECKING:
     from ...core.client import EvalKitClient
 
-# id(tool_context) -> time.time() at before_tool_callback time. Safe to key by
-# identity: ADK creates a fresh ToolContext per tool invocation, and the
-# before/after pair for one call always shares that same instance.
 _tool_call_starts: Dict[int, float] = {}
 
 
@@ -132,7 +97,7 @@ def _install_tool_call_tracing(ek: "EvalKitClient", LlmAgent: Any) -> None:
     def patched_after_getter(self: Any) -> List[Any]:
         return [*original_after(self), after_hook]
 
-    patched_before_getter._evalkit = True  # type: ignore[attr-defined]
+    patched_before_getter._evalkit = True
     LlmAgent.canonical_before_tool_callbacks = property(patched_before_getter)
     LlmAgent.canonical_after_tool_callbacks = property(patched_after_getter)
 
@@ -150,8 +115,6 @@ async def _traced_agent_run(
     start_ms = time.time() * 1000
     ts = _now_iso()
 
-    # Publish the span context so nested spans (LLM calls, tool calls, and
-    # sub-agent run_agent spans) nest correctly under this agent turn.
     span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
     token = _current_span.set(span_ctx)
 
@@ -255,16 +218,11 @@ def _install_agent_run_tracing(ek: "EvalKitClient", BaseAgent: Any) -> None:
         original_gen = original_run_async(self, parent_context, *args, **kwargs)
         return _traced_agent_run(ek, original_gen, agent_name, user_text)
 
-    traced_run_async._evalkit = True  # type: ignore[attr-defined]
-    BaseAgent.run_async = traced_run_async  # type: ignore[method-assign]
+    traced_run_async._evalkit = True
+    BaseAgent.run_async = traced_run_async
 
 
 def patch_google_adk(ek: "EvalKitClient") -> None:
-    """Auto-instruments Google ADK. No-op if google-adk is not installed.
-
-    Safe to call multiple times — idempotent via the ``_evalkit`` sentinel,
-    matching every other instrumentation in this package.
-    """
     try:
         from google.adk.agents.llm_agent import LlmAgent
     except ImportError:

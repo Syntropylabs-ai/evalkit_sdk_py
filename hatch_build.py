@@ -8,17 +8,6 @@ import python_minifier
 
 
 class CustomBuildHook(BuildHookInterface):
-    """Ships evalkit as minified source in the wheel — locals renamed,
-    whitespace/docstrings/comments stripped — to keep the proprietary
-    implementation out of a plain-text pip install. remove_annotations is
-    forced off: @dataclass (used in core/context.py, core/types.py,
-    simulation/types.py) reads __annotations__ at class-definition time, so
-    stripping them would silently drop every dataclass field.
-
-    The scratch copy MUST live outside self.directory — that resolves to the
-    build target's own output dir (e.g. dist/), and anything left there gets
-    swept up by naive `dist/*` globs (twine, gh-action-pypi-publish) as if it
-    were a distribution file."""
 
     def initialize(self, version, build_data):
         if self.target_name != "wheel":

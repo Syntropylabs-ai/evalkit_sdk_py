@@ -7,20 +7,18 @@ from ._streaming import _AsyncStreamTracer, _SyncStreamTracer
 from ._toolcalls import from_anthropic_blocks, from_openai_chat, from_openai_responses
 from .llm.anthropic import _extract_thinking
 from .llm.bedrock import _extract_reasoning as _extract_bedrock_reasoning
-from ..core.client import _exc_attrs  # standard exception attributes for error spans
+from ..core.client import _exc_attrs
 
 if TYPE_CHECKING:
     from ..core.client import EvalKitClient
 
-
-# ── OpenAI ────────────────────────────────────────────────────────────────────
 
 def _try_patch_openai(ek: "EvalKitClient") -> None:
     try:
         import openai.resources.chat.completions.completions as _oc
     except ImportError:
         try:
-            import openai.resources.chat.completions as _oc  # type: ignore[no-redef]
+            import openai.resources.chat.completions as _oc
         except ImportError:
             return
     try:
@@ -142,7 +140,7 @@ def _patch_openai_class_sync(ek: "EvalKitClient", cls, provider: str = "openai")
             pass
         return result
 
-    traced._evalkit = True  # type: ignore[attr-defined]
+    traced._evalkit = True
     cls.create = traced
 
 
@@ -255,11 +253,9 @@ def _patch_openai_class_async(ek: "EvalKitClient", cls, provider: str = "openai"
             pass
         return result
 
-    traced_async._evalkit = True  # type: ignore[attr-defined]
+    traced_async._evalkit = True
     cls.create = traced_async
 
-
-# ── Anthropic ─────────────────────────────────────────────────────────────────
 
 def _try_patch_anthropic(ek: "EvalKitClient") -> None:
     try:
@@ -274,8 +270,6 @@ def _try_patch_anthropic(ek: "EvalKitClient") -> None:
         _patch_anthropic_class_async(ek, _am.AsyncMessages)
     except Exception:
         pass
-    # Also patch messages.stream() — the context-manager API used by agno and
-    # other frameworks (identified by x-stainless-helper-method: stream header).
     try:
         _patch_anthropic_stream_sync(ek, _am.Messages)
     except Exception:
@@ -369,7 +363,7 @@ def _patch_anthropic_stream_sync(ek: "EvalKitClient", cls) -> None:
 
         return _TracedStreamManager()
 
-    traced_stream._evalkit = True  # type: ignore[attr-defined]
+    traced_stream._evalkit = True
     cls.stream = traced_stream
 
 
@@ -456,7 +450,7 @@ def _patch_anthropic_stream_async(ek: "EvalKitClient", cls) -> None:
 
         return _TracedAsyncStreamManager()
 
-    traced_stream_async._evalkit = True  # type: ignore[attr-defined]
+    traced_stream_async._evalkit = True
     cls.stream = traced_stream_async
 
 
@@ -545,8 +539,6 @@ def _patch_anthropic_class_sync(ek: "EvalKitClient", cls) -> None:
         tokens_out = getattr(usage, "output_tokens", 0) or 0
         cache_read_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
         cache_creation_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
-        # See llm/anthropic.py: Anthropic's input_tokens excludes cache reads/writes
-        # (additive, unlike OpenAI/Gemini) — normalize to inclusive-of-cache here.
         tokens_in = (getattr(usage, "input_tokens", 0) or 0) + cache_read_tokens + cache_creation_tokens
         events = from_anthropic_blocks(content, end_ts)
         stop_reason = getattr(result, "stop_reason", None)
@@ -579,7 +571,7 @@ def _patch_anthropic_class_sync(ek: "EvalKitClient", cls) -> None:
         ))
         return result
 
-    traced._evalkit = True  # type: ignore[attr-defined]
+    traced._evalkit = True
     cls.create = traced
 
 
@@ -669,8 +661,6 @@ def _patch_anthropic_class_async(ek: "EvalKitClient", cls) -> None:
         tokens_out = getattr(usage, "output_tokens", 0) or 0
         cache_read_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
         cache_creation_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
-        # See llm/anthropic.py: Anthropic's input_tokens excludes cache reads/writes
-        # (additive, unlike OpenAI/Gemini) — normalize to inclusive-of-cache here.
         tokens_in = (getattr(usage, "input_tokens", 0) or 0) + cache_read_tokens + cache_creation_tokens
         events = from_anthropic_blocks(content, end_ts)
         stop_reason = getattr(result, "stop_reason", None)
@@ -703,15 +693,13 @@ def _patch_anthropic_class_async(ek: "EvalKitClient", cls) -> None:
         ))
         return result
 
-    traced_async._evalkit = True  # type: ignore[attr-defined]
+    traced_async._evalkit = True
     cls.create = traced_async
 
 
-# ── Google GenAI (google.genai — used by ADK) ────────────────────────────────
-
 def _try_patch_google_genai(ek: "EvalKitClient") -> None:
     try:
-        from google.genai import models as _gm  # noqa: F401
+        from google.genai import models as _gm
     except ImportError:
         return
     try:
@@ -721,13 +709,9 @@ def _try_patch_google_genai(ek: "EvalKitClient") -> None:
         pass
 
 
-# ── Google ADK (Agent Development Kit) ──────────────────────────────────────
-# LLM calls are already covered via google.genai above (ADK calls it
-# internally); this adds agent-turn and tool-call spans on top.
-
 def _try_patch_google_adk(ek: "EvalKitClient") -> None:
     try:
-        import google.adk  # noqa: F401
+        import google.adk
     except ImportError:
         return
     try:
@@ -736,8 +720,6 @@ def _try_patch_google_adk(ek: "EvalKitClient") -> None:
     except Exception:
         pass
 
-
-# ── Google Generative AI (legacy google.generativeai) ───────────────────────
 
 def _try_patch_google_ai(ek: "EvalKitClient") -> None:
     try:
@@ -812,11 +794,9 @@ def _patch_google_genai_legacy_class(ek: "EvalKitClient", cls) -> None:
         ))
         return result
 
-    traced._evalkit = True  # type: ignore[attr-defined]
+    traced._evalkit = True
     cls.generate_content = traced
 
-
-# ── Cohere ────────────────────────────────────────────────────────────────────
 
 def _try_patch_cohere(ek: "EvalKitClient") -> None:
     try:
@@ -891,15 +871,11 @@ def _patch_cohere_class(ek: "EvalKitClient", cls) -> None:
         ))
         return result
 
-    traced._evalkit = True  # type: ignore[attr-defined]
+    traced._evalkit = True
     cls.chat = traced
 
 
-# ── OpenAI Responses API (used by OpenAI Agents SDK) ─────────────────────────
-
 def _responses_tool_events(output_items: list, ts: str) -> list:
-    """Build gen_ai.tool.call SpanEvents from OpenAI Responses API output items.
-    Delegates to the shared normalizer (URL citations -> gen_ai.tool.call.result)."""
     return from_openai_responses(output_items, ts)
 
 
@@ -1098,7 +1074,7 @@ def _patch_openai_responses_sync(ek: "EvalKitClient", cls) -> None:
             pass
         return result
 
-    traced._evalkit = True  # type: ignore[attr-defined]
+    traced._evalkit = True
     cls.create = traced
 
 
@@ -1194,11 +1170,9 @@ def _patch_openai_responses_async(ek: "EvalKitClient", cls) -> None:
             pass
         return result
 
-    traced_async._evalkit = True  # type: ignore[attr-defined]
+    traced_async._evalkit = True
     cls.create = traced_async
 
-
-# ── Groq (OpenAI-compatible SDK) ──────────────────────────────────────────────
 
 def _try_patch_groq(ek: "EvalKitClient") -> None:
     try:
@@ -1215,11 +1189,9 @@ def _try_patch_groq(ek: "EvalKitClient") -> None:
         pass
 
 
-# ── LiteLLM (aggregator) ──────────────────────────────────────────────────────
-
 def _try_patch_litellm(ek: "EvalKitClient") -> None:
     try:
-        import litellm  # noqa: F401
+        import litellm
     except ImportError:
         return
     try:
@@ -1229,11 +1201,9 @@ def _try_patch_litellm(ek: "EvalKitClient") -> None:
         pass
 
 
-# ── Ollama ────────────────────────────────────────────────────────────────────
-
 def _try_patch_ollama(ek: "EvalKitClient") -> None:
     try:
-        import ollama  # noqa: F401
+        import ollama
     except ImportError:
         return
     try:
@@ -1243,11 +1213,9 @@ def _try_patch_ollama(ek: "EvalKitClient") -> None:
         pass
 
 
-# ── Vector DBs (Pinecone, Qdrant, Chroma, Weaviate) ────────────────────────────
-
 def _try_patch_pinecone(ek: "EvalKitClient") -> None:
     try:
-        import pinecone  # noqa: F401
+        import pinecone
     except ImportError:
         return
     try:
@@ -1259,7 +1227,7 @@ def _try_patch_pinecone(ek: "EvalKitClient") -> None:
 
 def _try_patch_qdrant(ek: "EvalKitClient") -> None:
     try:
-        import qdrant_client  # noqa: F401
+        import qdrant_client
     except ImportError:
         return
     try:
@@ -1271,7 +1239,7 @@ def _try_patch_qdrant(ek: "EvalKitClient") -> None:
 
 def _try_patch_chroma(ek: "EvalKitClient") -> None:
     try:
-        import chromadb  # noqa: F401
+        import chromadb
     except ImportError:
         return
     try:
@@ -1283,7 +1251,7 @@ def _try_patch_chroma(ek: "EvalKitClient") -> None:
 
 def _try_patch_weaviate(ek: "EvalKitClient") -> None:
     try:
-        import weaviate  # noqa: F401
+        import weaviate
     except ImportError:
         return
     try:
@@ -1293,11 +1261,9 @@ def _try_patch_weaviate(ek: "EvalKitClient") -> None:
         pass
 
 
-# ── LlamaIndex ─────────────────────────────────────────────────────────────────
-
 def _try_patch_llamaindex(ek: "EvalKitClient") -> None:
     try:
-        import llama_index.core  # noqa: F401
+        import llama_index.core
     except ImportError:
         return
     try:
@@ -1307,11 +1273,9 @@ def _try_patch_llamaindex(ek: "EvalKitClient") -> None:
         pass
 
 
-# ── Audio (OpenAI TTS/transcription, ElevenLabs, AssemblyAI) ──────────────────
-
 def _try_patch_openai_audio(ek: "EvalKitClient") -> None:
     try:
-        import openai  # noqa: F401
+        import openai
     except ImportError:
         return
     try:
@@ -1323,7 +1287,7 @@ def _try_patch_openai_audio(ek: "EvalKitClient") -> None:
 
 def _try_patch_elevenlabs(ek: "EvalKitClient") -> None:
     try:
-        import elevenlabs  # noqa: F401
+        import elevenlabs
     except ImportError:
         return
     try:
@@ -1335,7 +1299,7 @@ def _try_patch_elevenlabs(ek: "EvalKitClient") -> None:
 
 def _try_patch_assemblyai(ek: "EvalKitClient") -> None:
     try:
-        import assemblyai  # noqa: F401
+        import assemblyai
     except ImportError:
         return
     try:
@@ -1344,8 +1308,6 @@ def _try_patch_assemblyai(ek: "EvalKitClient") -> None:
     except Exception:
         pass
 
-
-# ── AWS Bedrock ───────────────────────────────────────────────────────────────
 
 def _try_patch_bedrock(ek: "EvalKitClient") -> None:
     try:
@@ -1437,11 +1399,9 @@ def _patch_bedrock_class(ek: "EvalKitClient", cls) -> None:
         ))
         return result
 
-    traced._evalkit_bedrock = True  # type: ignore[attr-defined]
+    traced._evalkit_bedrock = True
     cls._make_api_call = traced
 
-
-# ── MistralAI ────────────────────────────────────────────────────────────────
 
 def _try_patch_mistral(ek: "EvalKitClient") -> None:
     try:
@@ -1531,15 +1491,13 @@ def _patch_mistral_class_sync(ek: "EvalKitClient", cls) -> None:
         ))
         return result
 
-    traced._evalkit = True  # type: ignore[attr-defined]
+    traced._evalkit = True
     chat_cls.complete = traced
 
 
 def _patch_mistral_class_async(ek: "EvalKitClient", cls) -> None:
-    pass  # async Mistral patched via instance patcher (patch_async_mistral_client)
+    pass
 
-
-# ── Database drivers (raw drivers + NoSQL; SQLAlchemy is patched per-engine) ──
 
 def _try_patch_databases(ek: "EvalKitClient") -> None:
     import importlib
@@ -1575,11 +1533,9 @@ def _try_patch_databases(ek: "EvalKitClient") -> None:
             pass
 
 
-# ── LangChain / LangGraph ─────────────────────────────────────────────────────
-
 def _try_patch_langchain(ek: "EvalKitClient") -> None:
     try:
-        import langchain_core  # noqa: F401
+        import langchain_core
     except ImportError:
         return
     try:
@@ -1588,8 +1544,6 @@ def _try_patch_langchain(ek: "EvalKitClient") -> None:
     except Exception:
         pass
 
-
-# ── Main entry point ──────────────────────────────────────────────────────────
 
 def setup_auto_instrumentation(
     client: "EvalKitClient",
@@ -1685,11 +1639,9 @@ def _try_patch_claude_agent_sdk(ek: "EvalKitClient") -> None:
         pass
 
 
-# ── Realtime / voice over WebSocket (Gemini Live, OpenAI Realtime) ────────────
-
 def _try_patch_google_live(ek: "EvalKitClient") -> None:
     try:
-        from google.genai import live as _live  # noqa: F401
+        from google.genai import live as _live
     except ImportError:
         return
     try:
@@ -1701,7 +1653,7 @@ def _try_patch_google_live(ek: "EvalKitClient") -> None:
 
 def _try_patch_openai_realtime(ek: "EvalKitClient") -> None:
     try:
-        import openai  # noqa: F401
+        import openai
     except ImportError:
         return
     try:

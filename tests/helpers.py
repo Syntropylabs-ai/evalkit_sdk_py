@@ -1,29 +1,25 @@
-"""Shared test helpers: fake objects, client setup, context reset."""
 from __future__ import annotations
 
 import os
 import sys
 import types
 
-# Ensure the SDK is importable from any working directory.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import evalkit
 from evalkit.core.context import _ambient_trace_id, _current_span
 
-# ── Singleton client ──────────────────────────────────────────────────────────
 _CLIENT = None
 
 
 def fresh(capture: list):
-    """Return the shared EvalKitClient with exporter replaced by in-memory capture."""
     global _CLIENT
     if _CLIENT is None:
         _CLIENT = evalkit.init(
             subscription_key="tk_test",
             base_url="http://127.0.0.1:1",
             service_name="test",
-            function_tracing=False,  # don't install the import hook during tests
+            function_tracing=False,
         )
     _CLIENT._exporter.export = lambda batch: (capture.extend(batch), True)[1]
     with _CLIENT._lock:
@@ -35,8 +31,6 @@ def reset_context():
     _ambient_trace_id.set(None)
     _current_span.set(None)
 
-
-# ── Google GenAI fakes ────────────────────────────────────────────────────────
 
 class _FC:
     def __init__(self, name, args):
@@ -100,13 +94,7 @@ def install_fake_genai(client, *, response=None, stream_chunks=None):
     return FakeModels()
 
 
-# ── Anthropic fakes ───────────────────────────────────────────────────────────
-
 class ABlock:
-    """Mirrors the real SDK: each block type only carries its own fields
-    (a ThinkingBlock has no `.text`, a TextBlock has no `.thinking`, etc.) —
-    tests that rely on `hasattr(block, "text")` to distinguish block types
-    need that to hold here too."""
 
     def __init__(self, type, text=None, name=None, id=None, input=None, thinking=None):
         self.type = type
@@ -151,8 +139,6 @@ def install_fake_anthropic(client, resp):
     _auto._patch_anthropic_class_sync(client, FakeMessages)
     return FakeMessages()
 
-
-# ── OpenAI fakes ──────────────────────────────────────────────────────────────
 
 class OCompletionTokensDetails:
     def __init__(self, reasoning_tokens):
@@ -254,8 +240,6 @@ def install_fake_openai_responses_sync(client, resp):
     return FakeResponses()
 
 
-# ── OpenAI Responses API fakes ────────────────────────────────────────────────
-
 class ORespUsage:
     def __init__(self, pin=5, pout=8):
         self.input_tokens = pin
@@ -282,8 +266,6 @@ class ORespResult:
         self.model = "gpt-4o-mini"
         self.id = "resp_test"
 
-
-# ── LiteLLM fakes ─────────────────────────────────────────────────────────────
 
 class LLMUsage:
     def __init__(self, pin=7, pout=12):
@@ -312,12 +294,7 @@ class LLMResult:
         self._hidden_params = {"response_cost": cost}
 
 
-# ── Claude Agent SDK fakes ────────────────────────────────────────────────────
-
 class SDKTextBlock:
-    # __name__ must be "TextBlock" — the instrumentation dispatches on
-    # type(block).__name__ since claude_agent_sdk's own block dataclasses
-    # (unlike anthropic.types') carry no `.type` discriminator attribute.
     def __init__(self, text):
         self.text = text
 
@@ -327,7 +304,6 @@ SDKTextBlock.__qualname__ = "TextBlock"
 
 
 class SDKToolUseBlock:
-    # __name__ must be "ToolUseBlock" — see SDKTextBlock.
     def __init__(self, name, input_data, id="tu_1"):
         self.name = name
         self.input = input_data
@@ -339,7 +315,6 @@ SDKToolUseBlock.__qualname__ = "ToolUseBlock"
 
 
 class SDKAssistantMessage:
-    # __name__ must be "AssistantMessage" — the instrumentation checks type(msg).__name__
     def __init__(self, text="Agent reply", tool=None, model="claude-sonnet-4-6"):
         self.content = [SDKTextBlock(text)] if text else []
         if tool:
@@ -358,7 +333,6 @@ class SDKUsage:
 
 
 class SDKResultMessage:
-    # __name__ must be "ResultMessage" — the instrumentation checks type(msg).__name__
     def __init__(self, inp=10, out=20, cost=0.0006, stop="end_turn", turns=1):
         self.usage = SDKUsage(inp, out)
         self.total_cost_usd = cost

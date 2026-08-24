@@ -1,28 +1,3 @@
-"""
-EvalKit + Google ADK demo
-
-Just call evalkit.init() — auto-instruments google.genai at the class level
-so every Gemini call ADK makes internally (text responses AND tool-calling turns)
-appears as an llm_call span. No manual patch needed.
-
-ADK runs tools/skills in its own runtime (not the LLM provider), so to see tool
-executions — get_weather, load_skill, any FunctionTool — as tool_call spans, spread
-evalkit_tool_callbacks() into the agent (see below). Copy that pattern into your agent.
-
-Install:
-    pip install google-adk google-genai python-dotenv
-    pip install -e ../../sdk-py
-
-Authenticate:
-    gcloud auth application-default login
-
-Run:
-    EVALKIT_KEY=tk_live_...  \\
-    GOOGLE_CLOUD_PROJECT=your-project  \\
-    GOOGLE_GENAI_USE_VERTEXAI=True  \\
-    python adk_agent.py
-"""
-
 import asyncio
 import json
 import os
@@ -51,10 +26,7 @@ from google.adk.tools import FunctionTool
 from google.genai import types as genai_types
 
 
-# ── Demo tool ─────────────────────────────────────────────────────────────────
-
 def get_weather(city: str) -> str:
-    """Return a fake weather report (stub for demo purposes)."""
     stubs = {
         "london": "Cloudy, 14°C",
         "tokyo": "Sunny, 22°C",
@@ -64,7 +36,6 @@ def get_weather(city: str) -> str:
 
 
 weather_tool = FunctionTool(func=get_weather)
-
 
 
 _tool_starts: dict = {}
@@ -91,11 +62,8 @@ def _after_tool(tool, args, tool_context, tool_response):
 
 
 def evalkit_tool_callbacks() -> dict:
-    """Spread into any ADK LlmAgent(...) to trace its tool/skill executions in EvalKit."""
     return {"before_tool_callback": _before_tool, "after_tool_callback": _after_tool}
 
-
-# ── Agent ─────────────────────────────────────────────────────────────────────
 
 agent = LlmAgent(
     model=os.environ.get("GEMINI_MODEL_NAME", "gemini-2.0-flash"),
@@ -110,14 +78,11 @@ session_service = InMemorySessionService()
 runner = Runner(agent=agent, app_name="adk-demo", session_service=session_service)
 
 
-# ── Run ───────────────────────────────────────────────────────────────────────
-
 async def run_turn(session_id: str, user_message: str) -> str:
     message = genai_types.Content(
         role="user",
         parts=[genai_types.Part.from_text(text=user_message)],
     )
-    # Optional named trace for grouping spans in the dashboard
     trace_id, end_trace, ctx = evalkit.start_trace(
         "adk.turn", {"user.message": user_message[:100]}
     )

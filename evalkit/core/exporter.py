@@ -12,9 +12,6 @@ from .types import EvalKitOptions, TraceEnvelope
 _log = logging.getLogger("evalkit")
 
 
-# After this many consecutive auth failures (401/403) the exporter gives up and
-# disables itself. An invalid subscription key never becomes valid by retrying,
-# so hammering the ingest endpoint every flush just spams logs and wastes CPU.
 _AUTH_FAIL_LIMIT = 3
 
 
@@ -29,10 +26,6 @@ def _event_size(d: Dict[str, Any]) -> int:
 
 
 def _fit_event(d: Dict[str, Any], limit: int = _MAX_SPAN_BYTES) -> Optional[Dict[str, Any]]:
-    """Trim a span dict to <= limit bytes so it can always be ingested. Drops the
-    heaviest fields first (raw HTTP/GenAI bodies → prompt/completion → every large
-    string attribute); returns None to skip the span if even a metadata-only
-    skeleton won't fit."""
     if _event_size(d) <= limit:
         return d
 
@@ -66,7 +59,6 @@ def _fit_event(d: Dict[str, Any], limit: int = _MAX_SPAN_BYTES) -> Optional[Dict
     if _event_size(d) <= limit:
         return d
 
-    # Last resort: metadata-only skeleton.
     d["attributes"] = {"trace.truncated": True}
     d.pop("events", None)
     d.pop("prompt", None)
@@ -85,8 +77,6 @@ class _Exporter:
     def export(self, envelopes: List[TraceEnvelope]) -> bool:
         if self._disabled:
             return False
-        # Trim/drop oversized spans so we never POST a payload Kafka will reject
-        # with "Message Size Too Large" (e.g. a multi-MB base64 image body).
         events = []
         for e in envelopes:
             fitted = _fit_event(e.to_dict())
@@ -127,7 +117,7 @@ class _Exporter:
                     if self._debug:
                         data = json.loads(resp.read())
                         _log.debug("exported %d span(s) — %s", count, data.get("status"))
-                    self._auth_failures = 0  # success resets the auth-failure streak
+                    self._auth_failures = 0
                     return True
             except urllib.error.HTTPError as e:
                 if e.code in (401, 403):

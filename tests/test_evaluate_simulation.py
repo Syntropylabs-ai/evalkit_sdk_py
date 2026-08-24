@@ -133,7 +133,6 @@ class TestEvaluateSimulation(unittest.TestCase):
             if (e.operation or "").startswith("POST /simulations/evaluate")
         ]
         self.assertTrue(spans, "evaluate_simulation should emit an http_call span")
-        # The BYOK key must not be recorded in the span's request body.
         for s in spans:
             attrs = getattr(s, "attributes", {}) or {}
             self.assertNotIn("sk-secret", json.dumps(attrs, default=str))

@@ -1,13 +1,3 @@
-"""LiteLLM instrumentation.
-
-LiteLLM is a very common aggregator in AI apps (`litellm.completion(model="gpt-4o"...)`).
-For most providers LiteLLM issues its own HTTP requests rather than going through the
-provider SDKs, so without a dedicated patch those calls show up only as generic
-``http_call`` spans with no prompt/completion/tokens. This patches the module-level
-``completion`` / ``acompletion`` functions so they emit rich ``llm_call`` spans.
-
-Degrades to a no-op if litellm is not installed and never raises into the caller.
-"""
 from __future__ import annotations
 
 import time
@@ -58,11 +48,6 @@ def _usage(result: Any):
 
 
 def _cache_usage(result: Any):
-    """LiteLLM normalizes every provider onto the OpenAI usage shape but
-    passes provider-specific fields through where it can — OpenAI-routed
-    calls carry prompt_tokens_details.cached_tokens, Anthropic-routed calls
-    carry cache_read_input_tokens/cache_creation_input_tokens directly on
-    usage. Check both; whichever the underlying provider populated wins."""
     usage = getattr(result, "usage", None)
     prompt_details = getattr(usage, "prompt_tokens_details", None)
     cache_read = getattr(prompt_details, "cached_tokens", 0) or getattr(usage, "cache_read_input_tokens", 0) or 0
@@ -77,8 +62,6 @@ def _reasoning_tokens(result: Any) -> int:
 
 
 def _reasoning_content(result: Any) -> str:
-    """DeepSeek-R1 and other reasoning models routed through litellm normalize
-    their chain-of-thought onto `message.reasoning_content`."""
     try:
         choice = result.choices[0]
         return getattr(choice.message, "reasoning_content", None) or ""
@@ -92,7 +75,7 @@ def _tool_events(result: Any, ts: str):
 
 def patch_litellm(client: "EvalKitClient") -> None:
     try:
-        import litellm  # type: ignore
+        import litellm
     except ImportError:
         return
 
@@ -191,7 +174,7 @@ def _patch_sync(ek: "EvalKitClient", litellm: Any) -> None:
         ))
         return result
 
-    traced._evalkit = True  # type: ignore[attr-defined]
+    traced._evalkit = True
     litellm.completion = traced
 
 
@@ -287,5 +270,5 @@ def _patch_async(ek: "EvalKitClient", litellm: Any) -> None:
         ))
         return result
 
-    traced_async._evalkit = True  # type: ignore[attr-defined]
+    traced_async._evalkit = True
     litellm.acompletion = traced_async

@@ -1,15 +1,3 @@
-"""Patch the ``ollama`` Python client (local model server) at the class level.
-
-Unlike OpenAI/Anthropic, Ollama's own client isn't OpenAI-compatible in shape:
-responses carry ``message.content``/``message.thinking``, token counts live on
-``prompt_eval_count``/``eval_count``, and streaming chunks are themselves partial
-``ChatResponse`` objects with ``done=False`` until the last one. This module
-understands that shape directly rather than assuming an OpenAI-like response.
-
-Patches ``Client.chat``/``AsyncClient.chat`` on the class so every instance —
-including ones created after ``evalkit.init()`` — is traced. Degrades to a no-op
-if ``ollama`` isn't installed and never raises into the caller.
-"""
 from __future__ import annotations
 
 import json
@@ -82,7 +70,6 @@ def _resolve_trace(ek: "EvalKitClient"):
 
 
 def patch_ollama(client: "EvalKitClient") -> None:
-    """Patch ``ollama.Client``/``ollama.AsyncClient`` chat methods at the class level."""
     try:
         import ollama as _ollama
     except ImportError:
@@ -221,7 +208,7 @@ def _patch_sync(ek: "EvalKitClient", Client: Any) -> None:
         ))
         return result
 
-    traced_chat._evalkit = True  # type: ignore[attr-defined]
+    traced_chat._evalkit = True
     Client.chat = traced_chat
 
 
@@ -350,5 +337,5 @@ def _patch_async(ek: "EvalKitClient", AsyncClient: Any) -> None:
         ))
         return result
 
-    traced_chat._evalkit = True  # type: ignore[attr-defined]
+    traced_chat._evalkit = True
     AsyncClient.chat = traced_chat

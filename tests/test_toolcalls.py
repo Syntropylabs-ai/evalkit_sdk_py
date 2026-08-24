@@ -1,8 +1,3 @@
-"""Tests for the unified tool-call normalizer (evalkit/instrumentation/_toolcalls.py).
-
-Covers every response shape -> correct gen_ai.tool.call events, edge cases, and the
-end-to-end promotion into child tool_call spans via _maybe_emit_tool_spans.
-"""
 import json
 import types
 import unittest
@@ -15,8 +10,6 @@ from tests.helpers import (
 
 TS = "2026-06-07T00:00:00Z"
 
-
-# ── Fakes not in helpers.py: Responses web_search + citations, LangChain msg ───
 
 class _Annotation:
     def __init__(self, title, url, type="url_citation"):
@@ -55,8 +48,6 @@ class _LCMessage:
         self.tool_calls = tool_calls
 
 
-# ── Shape 1: OpenAI Chat ──────────────────────────────────────────────────────
-
 class TestOpenAIChat(unittest.TestCase):
     def test_extracts_tool_call(self):
         events = tc.from_openai_chat(OResp(tool=("search", '{"q":"x"}')), TS)
@@ -70,8 +61,6 @@ class TestOpenAIChat(unittest.TestCase):
         self.assertEqual(tc.from_openai_chat(OResp(), TS), [])
 
 
-# ── Shape 2: Anthropic blocks ─────────────────────────────────────────────────
-
 class TestAnthropicBlocks(unittest.TestCase):
     def test_object_blocks_json_args(self):
         events = tc.from_anthropic_blocks(AResp(tool=("get_weather", {"city": "london"})).content, TS)
@@ -79,7 +68,6 @@ class TestAnthropicBlocks(unittest.TestCase):
         a = events[0].attributes
         self.assertEqual(a["gen_ai.tool.name"], "get_weather")
         self.assertEqual(a["gen_ai.tool.call.id"], "t1")
-        # args must be JSON, not str(dict)
         self.assertEqual(json.loads(a["gen_ai.tool.call.arguments"]), {"city": "london"})
 
     def test_dict_blocks(self):
@@ -91,8 +79,6 @@ class TestAnthropicBlocks(unittest.TestCase):
     def test_text_only(self):
         self.assertEqual(tc.from_anthropic_blocks(AResp(text="hi").content, TS), [])
 
-
-# ── Shape 3: Google parts ─────────────────────────────────────────────────────
 
 class TestGoogleParts(unittest.TestCase):
     def test_function_call(self):
@@ -106,8 +92,6 @@ class TestGoogleParts(unittest.TestCase):
     def test_text_only(self):
         self.assertEqual(tc.from_google_parts(GenAIResp(text="hello"), TS), [])
 
-
-# ── Shape 4: OpenAI Responses ─────────────────────────────────────────────────
 
 class TestOpenAIResponses(unittest.TestCase):
     def test_function_call(self):
@@ -127,15 +111,12 @@ class TestOpenAIResponses(unittest.TestCase):
         a = events[0].attributes
         self.assertEqual(a["gen_ai.tool.name"], "web_search")
         self.assertEqual(a["gen_ai.tool.call.arguments"], "current AI news")
-        # citation must be carried as the tool result
         self.assertIn("https://example.com/aapl", a["gen_ai.tool.call.result"])
         self.assertIn("Apple News", a["gen_ai.tool.call.result"])
 
     def test_empty(self):
         self.assertEqual(tc.from_openai_responses([], TS), [])
 
-
-# ── Shape 5: LangChain ────────────────────────────────────────────────────────
 
 class TestLangChain(unittest.TestCase):
     def test_dict_form(self):
@@ -156,8 +137,6 @@ class TestLangChain(unittest.TestCase):
         events = tc.from_langchain_result(response, TS)
         self.assertEqual(len(events), 1)
 
-
-# ── Edge cases + dispatcher ───────────────────────────────────────────────────
 
 class TestEdgeCases(unittest.TestCase):
     def test_nameless_skipped(self):
@@ -182,8 +161,6 @@ class TestEdgeCases(unittest.TestCase):
         self.assertEqual(len(tc.extract_tool_events(GenAIResp(tool=("g", {})), TS)), 1)
         self.assertEqual(len(tc.extract_tool_events(ORespResult(tool=("r", "{}")), TS)), 1)
 
-
-# ── Integration: events -> child tool_call spans via _maybe_emit_tool_spans ────
 
 class TestPromotionToSpans(unittest.TestCase):
     def setUp(self):

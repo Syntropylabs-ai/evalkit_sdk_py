@@ -1,4 +1,3 @@
-"""asyncpg instrumentation (async Postgres, also used by Tortoise ORM) → db_query spans."""
 from __future__ import annotations
 
 from typing import Any
@@ -35,7 +34,7 @@ def _wrap(client: Any, cls: Any, name: str) -> None:
         return r
 
     try:
-        traced._evalkit = True  # type: ignore[attr-defined]
+        traced._evalkit = True
         setattr(cls, name, traced)
     except Exception:
         pass

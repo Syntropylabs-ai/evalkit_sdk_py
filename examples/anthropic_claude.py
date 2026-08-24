@@ -1,18 +1,3 @@
-"""
-EvalKit + Anthropic Claude SDK demo
-
-Just call evalkit.init() — auto-instruments both sync and async Anthropic clients
-at the class level. Tool use (function calling) and multi-turn conversations
-are all traced automatically.
-
-Install:
-    pip install anthropic python-dotenv
-    pip install -e ../../sdk-py
-
-Run:
-    EVALKIT_KEY=tk_live_... ANTHROPIC_API_KEY=sk-ant-... python anthropic_claude.py
-"""
-
 import asyncio
 import json
 import os
@@ -33,8 +18,6 @@ evalkit.init(
 sync_client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY") or "demo-key")
 async_client = anthropic.AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY") or "demo-key")
 
-
-# ── Tool definitions ──────────────────────────────────────────────────────────
 
 TOOLS = [
     {
@@ -61,8 +44,6 @@ def handle_tool_call(tool_name: str, tool_input: dict) -> str:
         return json.dumps({"ticker": ticker, "price": stubs.get(ticker, "N/A"), "currency": "USD"})
     return json.dumps({"error": f"Unknown tool: {tool_name}"})
 
-
-# ── Sync with tool use ────────────────────────────────────────────────────────
 
 def sync_demo() -> None:
     print("\n── Sync demo (tool use) ─────────────────────────────────────────")
@@ -91,8 +72,6 @@ def sync_demo() -> None:
     end_trace("OK")
     print(f"Trace ID: {trace_id}")
 
-
-# ── Async ─────────────────────────────────────────────────────────────────────
 
 async def async_demo() -> None:
     print("\n── Async demo ───────────────────────────────────────────────────")

@@ -17,7 +17,7 @@ class TestNeverCrash(unittest.TestCase):
         orig = self.client.start_span
         self.client.start_span = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
         try:
-            self.assertEqual(add(2, 3), 5)  # tracing blew up; host still returns
+            self.assertEqual(add(2, 3), 5)
         finally:
             self.client.start_span = orig
 

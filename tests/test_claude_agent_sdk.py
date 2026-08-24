@@ -90,7 +90,6 @@ class TestClaudeAgentSDK(unittest.TestCase):
         llm = [e for e in self.captured if e.span_type == "llm_call"][0]
         self.assertTrue(llm.events)
         self.assertEqual(llm.events[0].attributes["gen_ai.tool.name"], "lookup_order")
-        # Client-side tool: event only, no empty child span.
         tools = [e for e in self.captured if e.span_type == "tool_call"]
         self.assertEqual(len(tools), 0)
 

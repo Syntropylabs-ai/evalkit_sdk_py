@@ -142,9 +142,7 @@ class TestAiohttpHTTP(unittest.TestCase):
         patch_aiohttp(self.client)
         patched_once = aiohttp.ClientSession._request
         patch_aiohttp(self.client)
-        # second call must be a no-op — same function object
         self.assertIs(aiohttp.ClientSession._request, patched_once)
-        # cleanup
         aiohttp.ClientSession._request = orig
 
 

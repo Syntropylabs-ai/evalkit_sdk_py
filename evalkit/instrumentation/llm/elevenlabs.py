@@ -1,17 +1,3 @@
-"""Patch ElevenLabs' TextToSpeechClient.convert at the class level.
-
-Same rationale as ``openai_audio.py`` — TTS returns raw audio bytes with no
-usage at all, so cost is proportional to input text length
-(``gen_ai.audio.input_characters``), not tokens.
-
-``convert()`` returns an iterator of audio chunks (sync) or an async iterator
-(async) — the wrapper only brackets the call itself and passes the
-iterator/async-iterator straight through unconsumed; it never buffers or
-inspects the audio bytes.
-
-Degrades to a no-op if ``elevenlabs`` isn't installed and never raises into
-the caller.
-"""
 from __future__ import annotations
 
 import time
@@ -30,7 +16,6 @@ _TEXT_MAX = 8192
 
 
 def patch_elevenlabs(client: "EvalKitClient") -> None:
-    """Patch elevenlabs.text_to_speech's TextToSpeechClient (sync + async). Idempotent."""
     try:
         from elevenlabs.text_to_speech.client import AsyncTextToSpeechClient, TextToSpeechClient
     except ImportError:
@@ -113,5 +98,5 @@ def _patch_convert(ek: "EvalKitClient", Cls: Any, is_async: bool) -> None:
         return result
 
     wrapper = _arun if is_async else _run
-    wrapper._evalkit = True  # type: ignore[attr-defined]
+    wrapper._evalkit = True
     Cls.convert = wrapper

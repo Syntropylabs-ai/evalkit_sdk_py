@@ -23,8 +23,6 @@ _IO_MAX = 4096
 
 
 def _safe_io(value: Any, limit: int = _IO_MAX) -> str:
-    """Serialize a function argument / return value for a span attribute. Never raises
-    and never lets a value (large or unserializable) break tracing."""
     import json as _json
 
     try:
@@ -50,11 +48,6 @@ def _new_span_id() -> str:
 
 
 def _exc_attrs(exc: BaseException) -> Dict[str, Any]:
-    """Return standard APM exception attributes including full stack trace.
-
-    Stored as ``exception.*`` keys (OpenTelemetry semantic convention) so the
-    dashboard can display file + line info for any error span.
-    """
     import traceback as _tb
     attrs = {
         "exception.type": type(exc).__qualname__,
@@ -121,18 +114,6 @@ class EvalKitClient:
             sim.collector.append(envelope)
 
     def _maybe_emit_tool_spans(self, envelope: TraceEnvelope) -> None:
-        """Promote a tool call carried as a gen_ai.tool.call event on the llm_call
-        span into a first-class child tool_call span — but ONLY when the SDK has the
-        tool's result (server-side tools like OpenAI Responses web_search, where the
-        result is in the LLM response).
-
-        For client-side function tools the SDK only ever sees the model's *request*
-        (name + arguments); the result is produced by the application after the call.
-        Emitting a child span for those would be a zero-duration, output-less row, so
-        we keep just the gen_ai.tool.call event on the llm_call span instead. To trace
-        a client-side tool's execution (output + latency), wrap it with
-        evalkit.trace_function. Simulation tool metrics still work: _tools_from_collector
-        falls back to the llm_call span's tool events when no tool_call span exists."""
         if envelope.span_type != "llm_call" or not envelope.events:
             return
         ts = envelope.end_time or envelope.created_at
@@ -143,7 +124,6 @@ class EvalKitClient:
                 continue
             result = attrs.get("gen_ai.tool.call.result")
             if result is None:
-                # Client-side tool: no result available — keep the event only.
                 continue
             tool_attrs = {
                 "tool.name": name,
@@ -174,9 +154,6 @@ class EvalKitClient:
             ))
 
     def enqueue(self, envelope: TraceEnvelope) -> None:
-        # Never blocks and never raises into the caller's code path. Export happens
-        # only on the daemon flush thread; here we just buffer and (when a batch is
-        # ready) signal that thread to drain promptly.
         try:
             self._apply_simulation(envelope)
             try:
@@ -191,7 +168,7 @@ class EvalKitClient:
                 full = len(self._queue) >= self._opts.max_export_batch_size
             if full:
                 self._flush_now.set()
-        except Exception as exc:  # tracing must never break the host application
+        except Exception as exc:
             _log.debug("enqueue failed: %s", exc)
 
     def _flush_loop(self) -> None:
@@ -213,8 +190,6 @@ class EvalKitClient:
         return self._exporter.export(batch)
 
     def flush(self) -> bool:
-        """Drain + export pending spans now. Returns True if the export succeeded
-        (or nothing was queued) — handy for short-lived scripts / serverless."""
         return self._drain()
 
     def destroy(self) -> None:
@@ -229,9 +204,6 @@ class EvalKitClient:
         session_id: Optional[str] = None,
         device_id: Optional[str] = None,
     ) -> Tuple[str, Callable[[str], None], SpanContext]:
-        # Join existing trace as a child span if one is active (e.g. tool called within request).
-        # With no active span, fall back to the context's ambient trace so sibling spans in the
-        # same execution context share ONE trace instead of each minting a new id.
         parent = current_span_ctx()
         trace_id = parent.trace_id if parent else get_or_create_ambient_trace_id()
         _ambient_trace_id.set(trace_id)
@@ -247,7 +219,6 @@ class EvalKitClient:
             session_id=resolved_session_id,
             device_id=resolved_device_id,
         )
-        # Set ContextVar so nested LLM/HTTP calls become children of this span
         token = _current_span.set(ctx)
 
         def end(status: str = "OK") -> None:
@@ -261,7 +232,7 @@ class EvalKitClient:
                 span_id=span_id,
                 parent_span_id=parent_span_id,
                 span_type="log",
-                status=status,  # type: ignore[arg-type]
+                status=status,
                 operation=name,
                 service_name=self._opts.service_name,
                 attributes=attrs or None,
@@ -299,7 +270,6 @@ class EvalKitClient:
 
         trace_id = upstream_trace_id or _new_trace_id()
         span_id = _new_span_id()
-        # Pin ambient trace_id so orphaned spans within this request join its trace.
         _ambient_trace_id.set(trace_id)
         start_ms = time.time() * 1000
         start_iso = _now_iso()
@@ -336,7 +306,7 @@ class EvalKitClient:
                 span_id=span_id,
                 parent_span_id=upstream_span_id,
                 span_type="http_call",
-                status=status,  # type: ignore[arg-type]
+                status=status,
                 operation=name,
                 service_name=self._opts.service_name,
                 attributes=attrs,
@@ -358,8 +328,6 @@ class EvalKitClient:
         attributes: Optional[Dict[str, Any]] = None,
         parent_ctx: Optional[SpanContext] = None,
     ) -> Tuple[Callable[[str], None], SpanContext]:
-        # No explicit parent and no active span → join the context's ambient trace so
-        # orphan custom spans (tool calls, helpers) don't each start a separate trace.
         parent = parent_ctx or current_span_ctx()
         trace_id = parent.trace_id if parent else get_or_create_ambient_trace_id()
         span_id = _new_span_id()
@@ -381,8 +349,8 @@ class EvalKitClient:
                 trace_id=trace_id,
                 span_id=span_id,
                 parent_span_id=parent_span_id,
-                span_type=span_type,  # type: ignore[arg-type]
-                status=status,  # type: ignore[arg-type]
+                span_type=span_type,
+                status=status,
                 operation=name,
                 service_name=self._opts.service_name,
                 attributes=attrs or None,
@@ -427,7 +395,7 @@ class EvalKitClient:
                         end, ctx = self.start_span(span_name, attrs)
                         token = _current_span.set(ctx)
                     except Exception:
-                        return await fn(*args, **kwargs)  # tracing must never break the host
+                        return await fn(*args, **kwargs)
                     try:
                         result = await fn(*args, **kwargs)
                         if capture_io and result is not None:
@@ -446,7 +414,7 @@ class EvalKitClient:
                             _current_span.reset(token)
                         except Exception:
                             pass
-                return async_wrapper  # type: ignore[return-value]
+                return async_wrapper
             else:
                 @functools.wraps(fn)
                 def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -455,7 +423,7 @@ class EvalKitClient:
                         end, ctx = self.start_span(span_name, attrs)
                         token = _current_span.set(ctx)
                     except Exception:
-                        return fn(*args, **kwargs)  # tracing must never break the host
+                        return fn(*args, **kwargs)
                     try:
                         result = fn(*args, **kwargs)
                         if capture_io and result is not None:
@@ -474,7 +442,7 @@ class EvalKitClient:
                             _current_span.reset(token)
                         except Exception:
                             pass
-                return sync_wrapper  # type: ignore[return-value]
+                return sync_wrapper
 
         return decorator
 
@@ -484,10 +452,6 @@ class EvalKitClient:
         attributes: Optional[Dict[str, Any]] = None,
         capture_io: bool = True,
     ) -> Callable[[F], F]:
-        """Like ``trace_function`` but emits a first-class ``tool_call`` span — it
-        renders in the trace UI's Input/Output panels and counts toward tool
-        metrics. Use it on your own client-side tools so they behave exactly like
-        server-side / LangChain tools. Decorator; works on sync or async functions."""
         def decorator(fn: F) -> F:
             tool_name = name or fn.__qualname__
 
@@ -515,7 +479,7 @@ class EvalKitClient:
                         end, ctx = self.start_span(tool_name, attrs)
                         token = _current_span.set(ctx)
                     except Exception:
-                        return await fn(*args, **kwargs)  # tracing must never break the host
+                        return await fn(*args, **kwargs)
                     try:
                         result = await fn(*args, **kwargs)
                         if capture_io and result is not None:
@@ -534,7 +498,7 @@ class EvalKitClient:
                             _current_span.reset(token)
                         except Exception:
                             pass
-                return async_wrapper  # type: ignore[return-value]
+                return async_wrapper
             else:
                 @functools.wraps(fn)
                 def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -543,7 +507,7 @@ class EvalKitClient:
                         end, ctx = self.start_span(tool_name, attrs)
                         token = _current_span.set(ctx)
                     except Exception:
-                        return fn(*args, **kwargs)  # tracing must never break the host
+                        return fn(*args, **kwargs)
                     try:
                         result = fn(*args, **kwargs)
                         if capture_io and result is not None:
@@ -562,7 +526,7 @@ class EvalKitClient:
                             _current_span.reset(token)
                         except Exception:
                             pass
-                return sync_wrapper  # type: ignore[return-value]
+                return sync_wrapper
 
         return decorator
 

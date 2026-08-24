@@ -33,9 +33,6 @@ class TestAssemblyAI(unittest.TestCase):
         self.assertEqual(span.attributes["gen_ai.audio.duration_seconds"], 281)
 
     def test_transcribe_never_uses_audio_url_length_for_cost(self):
-        # Regression guard for the exact bug found in OpenLit's own AssemblyAI
-        # instrumentation: passing the audio_url as a character-billed "prompt"
-        # instead of using audio_duration.
         from evalkit.instrumentation.llm.assemblyai import _patch_transcribe
 
         long_url = "https://cdn.example.com/" + ("a" * 500) + ".mp3"
@@ -53,8 +50,6 @@ class TestAssemblyAI(unittest.TestCase):
         self.assertNotIn("gen_ai.audio.input_characters", span.attributes)
 
     def test_transcribe_failure_without_exception_emits_error_span(self):
-        # AssemblyAI doesn't raise on a failed job -- it returns a Transcript
-        # with .error set instead.
         from evalkit.instrumentation.llm.assemblyai import _patch_transcribe
 
         class FakeTranscriber:

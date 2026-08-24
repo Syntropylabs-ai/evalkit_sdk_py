@@ -146,5 +146,5 @@ def patch_async_openai(
         ))
         return result
 
-    traced_create._evalkit = True  # type: ignore[attr-defined]
+    traced_create._evalkit = True
     completions.create = traced_create

@@ -19,7 +19,6 @@ class SpanEvent:
 
 @dataclass
 class TraceEnvelope:
-    """Matches the Go trace-service TraceEnvelope exactly (camelCase JSON)."""
 
     trace_id: str
     span_id: str
@@ -40,11 +39,6 @@ class TraceEnvelope:
     events: Optional[List[SpanEvent]] = None
     tokens_in: Optional[int] = None
     tokens_out: Optional[int] = None
-    # Tokens served from / written to the provider's prompt cache (Anthropic
-    # cache_read_input_tokens/cache_creation_input_tokens, OpenAI
-    # prompt_tokens_details.cached_tokens, Gemini cached_content_token_count).
-    # Already counted within tokens_in — these are additive breakdowns for
-    # cost math, not extra tokens on top of tokens_in.
     cache_read_tokens: Optional[int] = None
     cache_creation_tokens: Optional[int] = None
     latency_ms: Optional[int] = None
@@ -142,10 +136,6 @@ class EvalKitOptions:
     max_export_batch_size: int = 512
     scheduled_delay_ms: int = 5000
     max_queue_size: int = 4096
-    # Max bytes of any captured HTTP request/response body stored on a span.
-    # Bodies larger than this are truncated. Applies to every HTTP client patch
-    # (requests/httpx/aiohttp) and framework middleware (FastAPI/Starlette/
-    # Django/Flask/Litestar).
     max_body_bytes: int = 10 * 1024 * 1024
     environment: Optional[str] = None
     app_version: Optional[str] = None

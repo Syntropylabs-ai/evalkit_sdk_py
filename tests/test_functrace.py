@@ -1,4 +1,3 @@
-"""Tests for automatic function tracing (the init() import hook)."""
 import importlib
 import os
 import sys
@@ -23,7 +22,7 @@ class TestFunctionTracer(unittest.TestCase):
         reset_context()
         self.captured = []
         self.client = fresh(self.captured)
-        functrace._installed = False  # let each test control installation
+        functrace._installed = False
 
     def tearDown(self):
         sys.meta_path[:] = [
@@ -44,9 +43,9 @@ class TestFunctionTracer(unittest.TestCase):
         functrace.install_function_tracer(self.client, tmp)
         mod = importlib.import_module("appx.mod")
 
-        self.assertEqual(mod.add(2, 3), 5)                       # still works
-        self.assertTrue(hasattr(mod.add, "__wrapped__"))        # wrapped (signature preserved)
-        self.assertFalse(hasattr(mod._hidden, "__wrapped__"))   # private skipped
+        self.assertEqual(mod.add(2, 3), 5)
+        self.assertTrue(hasattr(mod.add, "__wrapped__"))
+        self.assertFalse(hasattr(mod._hidden, "__wrapped__"))
 
         self.client.flush()
         ops = [getattr(e, "operation", "") for e in self.captured]
@@ -58,7 +57,7 @@ class TestFunctionTracer(unittest.TestCase):
         sys.path.insert(0, other_dir)
         _make_pkg(other_dir, "appy", "def mul(a, b):\n    return a * b\n")
 
-        functrace.install_function_tracer(self.client, scope_dir)  # scope ≠ where appy lives
+        functrace.install_function_tracer(self.client, scope_dir)
         mod = importlib.import_module("appy.mod")
 
         self.assertEqual(mod.mul(2, 3), 6)
@@ -67,7 +66,7 @@ class TestFunctionTracer(unittest.TestCase):
     def test_install_is_idempotent(self):
         tmp = tempfile.mkdtemp()
         functrace.install_function_tracer(self.client, tmp)
-        functrace.install_function_tracer(self.client, tmp)  # no-op
+        functrace.install_function_tracer(self.client, tmp)
         finders = [f for f in sys.meta_path if type(f).__name__ == "_EvalKitTracingFinder"]
         self.assertEqual(len(finders), 1)
 

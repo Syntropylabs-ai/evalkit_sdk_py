@@ -151,7 +151,7 @@ def init(
 ) -> EvalKitClient:
     global _instance
     if _instance is not None:
-        return _instance  # already initialized — reuse; patch closures reference this client
+        return _instance
     opts = EvalKitOptions(
         subscription_key=subscription_key,
         base_url=base_url,
@@ -182,12 +182,11 @@ def init(
         try:
             _install_function_tracing(_instance, trace_packages)
         except Exception:
-            pass  # instrumentation must never break init()
+            pass
     return _instance
 
 
 def _install_function_tracing(client: EvalKitClient, trace_packages: Optional[List[str]]) -> None:
-    """Resolve the caller's source directory and install the import-time tracer."""
     import inspect
 
     from .instrumentation.functrace import install_function_tracer
@@ -280,73 +279,50 @@ def patch_google_genai() -> None:
 
 
 def patch_langchain() -> Any:
-    """Register the global LangChain/LangGraph callback handler. Called by
-    init() automatically; returns the handler (also usable as callbacks=[h])."""
     return _patch_langchain(_get_instance())
 
 
 def patch_litellm() -> None:
-    """Instrument litellm.completion/acompletion. Called by init() automatically."""
     _patch_litellm(_get_instance())
 
 
 def patch_ollama() -> None:
-    """Instrument ollama.Client/AsyncClient.chat. Called by init() automatically."""
     _patch_ollama(_get_instance())
 
 
 def patch_pinecone() -> None:
-    """Instrument pinecone.Index.query/upsert as db_query spans. Called by init() automatically."""
     _patch_pinecone(_get_instance())
 
 
 def patch_qdrant() -> None:
-    """Instrument qdrant_client.QdrantClient.query_points/upsert as db_query spans. Called by init() automatically."""
     _patch_qdrant(_get_instance())
 
 
 def patch_chroma() -> None:
-    """Instrument chromadb Collection.query/add/upsert as db_query spans. Called by init() automatically."""
     _patch_chroma(_get_instance())
 
 
 def patch_weaviate() -> None:
-    """Instrument weaviate-client near_vector query + insert/insert_many as db_query spans.
-    Called by init() automatically."""
     _patch_weaviate(_get_instance())
 
 
 def patch_llamaindex() -> None:
-    """Register evalkit's handlers on LlamaIndex's instrumentation dispatcher, capturing
-    llm/embedding/retrieval/query/rerank spans. Called by init() automatically."""
     _patch_llamaindex(_get_instance())
 
 
 def patch_openai_audio() -> None:
-    """Instrument openai's audio.speech/transcriptions/translations as llm_call spans
-    (character/duration/token-billed as appropriate). Called by init() automatically."""
     _patch_openai_audio(_get_instance())
 
 
 def patch_elevenlabs() -> None:
-    """Instrument elevenlabs TextToSpeechClient.convert as llm_call spans. Called by
-    init() automatically."""
     _patch_elevenlabs(_get_instance())
 
 
 def patch_assemblyai() -> None:
-    """Instrument assemblyai Transcriber.transcribe as llm_call spans. Called by
-    init() automatically."""
     _patch_assemblyai(_get_instance())
 
 
 def patch_claude_agent_sdk() -> None:
-    """Instrument ``claude_agent_sdk.query`` and ``ClaudeSDKClient.receive_response``
-    to capture token/cost/latency data from ``ResultMessage`` as ``llm_call`` spans.
-
-    Called automatically by ``init()`` when ``claude_agent_sdk`` is installed.
-    Call explicitly if you install the package after calling ``init()``.
-    """
     _patch_claude_agent_sdk(_get_instance())
 
 
@@ -363,14 +339,6 @@ def trace_google_live(
     model: Optional[str] = None,
     config: Any = None,
 ) -> Any:
-    """Explicit drop-in for ``client.aio.live.connect(model=, config=)`` (Gemini Live).
-
-    Returns an async context manager that opens a ``voice.session`` trace and emits
-    ``voice.turn`` / ``tool_call`` spans as the WebSocket streams. Use::
-
-        async with evalkit.trace_google_live(genai_client, model=..., config=...) as session:
-            ...
-    """
     return _trace_google_live(_get_instance(), genai_client, model=model, config=config)
 
 
@@ -379,26 +347,14 @@ def trace_openai_realtime(
     *,
     model: Optional[str] = None,
 ) -> Any:
-    """Explicit drop-in for ``client.beta.realtime.connect(model=)`` (OpenAI Realtime).
-
-    Returns an async context manager that opens a ``voice.session`` trace and emits
-    ``voice.turn`` / ``tool_call`` spans as the WebSocket streams. Use::
-
-        async with evalkit.trace_openai_realtime(openai_client, model=...) as connection:
-            ...
-    """
     return _trace_openai_realtime(_get_instance(), openai_client, model=model)
 
 
 def patch_google_genai_live() -> None:
-    """Best-effort: auto-wrap ``Live.connect`` so plain Gemini Live connects are
-    traced. Called automatically by ``init()`` when ``google.genai`` is installed."""
     _patch_google_genai_live(_get_instance())
 
 
 def patch_openai_realtime() -> None:
-    """Best-effort: auto-wrap ``AsyncRealtime.connect`` so plain OpenAI Realtime
-    connects are traced. Called automatically by ``init()`` when ``openai`` is installed."""
     _patch_openai_realtime(_get_instance())
 
 
@@ -477,24 +433,10 @@ def trace_tool(
     attributes: Optional[Dict[str, Any]] = None,
     capture_io: bool = True,
 ) -> Callable:
-    """Decorator that traces a function as a first-class ``tool_call`` span
-    (renders in the Input/Output panels and counts toward tool metrics). Use it
-    on your own client-side tools."""
     return _get_instance().trace_tool(name, attributes, capture_io=capture_io)
 
 
 def traced(cls: Any = None, *, prefix: Optional[str] = None, capture_io: bool = True) -> Any:
-    """Class decorator — trace EVERY user-defined method of the class as a
-    function_call span, APM-style, without decorating each method:
-
-        @evalkit.traced
-        class OrderService:
-            def place(self, ...): ...
-            def cancel(self, ...): ...
-
-    Both ``@evalkit.traced`` and ``@evalkit.traced(prefix="orders")`` work.
-    Call ``init()`` before the class is defined.
-    """
     def wrap(klass: Any) -> Any:
         label = prefix or klass.__name__
         for attr_name, member in list(vars(klass).items()):
@@ -523,15 +465,6 @@ def trace_module(
     capture_io: bool = True,
     include_private: bool = False,
 ) -> int:
-    """Trace every function DEFINED IN ``module`` (in place), APM-style. One call
-    instruments all of your app's functions in a module:
-
-        import myapp.services as svc
-        evalkit.trace_module(svc)
-
-    Skips imported functions (only wraps those defined in the module) and, by
-    default, names starting with ``_``. Returns the number of functions wrapped.
-    """
     import types as _types
     inst = _get_instance()
     mod_name = getattr(module, "__name__", "")
@@ -541,14 +474,14 @@ def trace_module(
         if not isinstance(member, _types.FunctionType):
             continue
         if getattr(member, "__module__", None) != mod_name:
-            continue  # only functions defined here, not imports
+            continue
         if not include_private and attr_name.startswith("_"):
             continue
         if getattr(member, "_evalkit_traced", False):
             continue
         wrapped = inst.trace_function(f"{label}.{attr_name}", capture_io=capture_io)(member)
         try:
-            wrapped._evalkit_traced = True  # type: ignore[attr-defined]
+            wrapped._evalkit_traced = True
         except Exception:
             pass
         setattr(module, attr_name, wrapped)
@@ -563,15 +496,6 @@ def trace_package(
     capture_io: bool = True,
     include_private: bool = False,
 ) -> int:
-    """Recursively trace every function in every module of a package, APM-style.
-    Framework-agnostic — works for FastAPI / Flask / Django / any Python app:
-
-        import myapp
-        evalkit.trace_package(myapp)   # traces functions across all of myapp.*
-
-    Imports each submodule (so import side effects run) and wraps its functions
-    with trace_function. Returns the total number of functions wrapped.
-    """
     import importlib
     import pkgutil
 
@@ -581,7 +505,7 @@ def trace_package(
     pkg_path = getattr(package, "__path__", None)
     pkg_name = getattr(package, "__name__", "")
     if not pkg_path:
-        return total  # a plain module, not a package
+        return total
     for mod_info in pkgutil.walk_packages(pkg_path, prefix=pkg_name + "."):
         try:
             mod = importlib.import_module(mod_info.name)

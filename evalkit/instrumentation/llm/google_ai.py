@@ -11,10 +11,6 @@ from ._bodies import _dump, _safe_body
 
 
 def patch_google_ai(client: EvalKitClient, model: Any) -> None:
-    """
-    Patch a google.generativeai.GenerativeModel instance to trace generate_content calls.
-    Works with @google/generative-ai Python SDK.
-    """
     if getattr(model.generate_content, "_evalkit", False):
         return
 
@@ -77,10 +73,6 @@ def patch_google_ai(client: EvalKitClient, model: Any) -> None:
         usage_metadata = getattr(result, "usage_metadata", None)
         tokens_in = getattr(usage_metadata, "prompt_token_count", 0) or 0
         tokens_out = getattr(usage_metadata, "candidates_token_count", 0) or 0
-        # Subset of tokens_in Gemini served from its (much cheaper) context
-        # cache — already included in tokens_in, never additive. Surfaced
-        # separately so downstream cost math isn't forced to price an entire
-        # long, mostly-cached prompt at the full fresh-input-token rate.
         cached_tokens = getattr(usage_metadata, "cached_content_token_count", 0) or 0
 
         safety_ratings = []
@@ -129,7 +121,7 @@ def patch_google_ai(client: EvalKitClient, model: Any) -> None:
         ))
         return result
 
-    traced_generate_content._evalkit = True  # type: ignore[attr-defined]
+    traced_generate_content._evalkit = True
     model.generate_content = traced_generate_content
 
 

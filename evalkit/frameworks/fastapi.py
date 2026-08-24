@@ -7,21 +7,10 @@ from ..core.client import EvalKitClient
 from ..core.context import SpanContext, _current_span
 from ..utils.headers import parse_traceparent, sanitize_headers
 
-_BODY_MAX = 10 * 1024 * 1024  # default; overridden from client options per request
+_BODY_MAX = 10 * 1024 * 1024
 
 
 class EvalKitMiddleware:
-    """
-    ASGI middleware for FastAPI / Starlette / any ASGI app.
-
-    Usage (FastAPI):
-        app = FastAPI()
-        evalkit.init(subscription_key="...", base_url="...")
-        app.add_middleware(evalkit.EvalKitMiddleware)
-
-    Reads W3C traceparent header, buffers request body (up to 4 KB),
-    captures sanitized headers, records status code on span completion.
-    """
 
     def __init__(self, app: Any, client: "EvalKitClient | None" = None) -> None:
         self._app = app
@@ -61,9 +50,6 @@ class EvalKitMiddleware:
         if tp:
             upstream_trace_id, upstream_span_id = parse_traceparent(tp)
 
-        # Drain all ASGI body messages until more_body=False so the span sees
-        # the full body even when the ASGI server chunks large payloads across
-        # multiple http.request messages.
         _chunks: list[bytes] = []
         _msgs: list[Any] = []
         _total_len = 0
@@ -108,7 +94,6 @@ class EvalKitMiddleware:
             )
             token = _current_span.set(ctx)
         except Exception:
-            # Tracing setup failed — run the app untraced, replaying the consumed body.
             await self._app(scope, receive_replay, send)
             return
 
@@ -121,13 +106,11 @@ class EvalKitMiddleware:
                 msg_type = message.get("type")
                 if msg_type == "http.response.start":
                     status_code_holder[0] = message.get("status", 200)
-                    # Capture response headers for span attributes.
                     raw_resp_headers = {
                         k.decode(): v.decode()
                         for k, v in message.get("headers", [])
                     }
                     response_headers_holder[0] = raw_resp_headers
-                    # Inject trace_id into response headers so clients can correlate.
                     headers = list(message.get("headers", []))
                     headers.append((b"x-trace-id", trace_id.encode()))
                     headers.append((
@@ -139,7 +122,7 @@ class EvalKitMiddleware:
                     if len(response_body_holder[0]) < _BODY_MAX:
                         response_body_holder[0] += message.get("body", b"")
             except Exception:
-                pass  # span bookkeeping must never corrupt the response
+                pass
             await send(message)
 
         try:

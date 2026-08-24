@@ -147,7 +147,7 @@ def patch_mistral(
         ))
         return result
 
-    traced_complete._evalkit = True  # type: ignore[attr-defined]
+    traced_complete._evalkit = True
     chat.complete = traced_complete
 
 
@@ -240,5 +240,5 @@ def patch_async_mistral(
         ))
         return result
 
-    traced_complete_async._evalkit = True  # type: ignore[attr-defined]
+    traced_complete_async._evalkit = True
     chat.complete_async = traced_complete_async

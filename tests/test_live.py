@@ -1,11 +1,3 @@
-"""Live integration tests — hit the real EvalKit ingest endpoint.
-
-Only runs when EVALKIT_LIVE=1 is set in the environment.
-
-    EVALKIT_LIVE=1 python -m pytest tests/test_live.py -v
-
-The default key is embedded below. Override with EVALKIT_KEY env var.
-"""
 from __future__ import annotations
 
 import asyncio
@@ -34,8 +26,6 @@ def _live_client():
     )
 
 
-# ── Test cases ────────────────────────────────────────────────────────────────
-
 @skip_unless_live
 class TestLiveIngest(unittest.TestCase):
     def setUp(self):
@@ -61,7 +51,6 @@ class TestLiveIngest(unittest.TestCase):
         self.assertTrue(ok)
 
     def test_llm_call_span_via_fake(self):
-        """Sends a real llm_call span to ingest without calling any LLM."""
         import sys
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
         from tests.helpers import install_fake_openai_sync, OResp, reset_context

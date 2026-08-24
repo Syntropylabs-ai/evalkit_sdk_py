@@ -1,24 +1,3 @@
-"""Trace OpenAI Realtime (voice/realtime over a WebSocket).
-
-Nothing auto-instruments a WebSocket, so we wrap the Realtime connection:
-open a ``voice.session`` trace, accumulate the assistant's output transcript, emit
-one ``voice.turn`` llm_call span per completed response (text + latency), emit a
-``tool_call`` span per function call, and close the session span when the socket
-closes. Same span model as the Gemini Live tracer (google_live.py).
-
-The Python API is async:
-
-    client = openai.AsyncOpenAI(...)
-    async with client.beta.realtime.connect(model=...) as connection:
-        await connection.session.update(...)
-        async for event in connection:
-            ...
-
-``connect()`` is an *async context manager*. We wrap the connection and forward
-async iteration through an observing generator. Event shapes vary by version, so
-everything is duck-typed and defensive. Tracing must NEVER break the host: every
-wrapper path falls back to the real connection on any error.
-"""
 from __future__ import annotations
 
 import json
@@ -65,14 +44,7 @@ def _event_get(event: Any, key: str) -> Any:
 
 
 class _ObservedConnection:
-    """Wraps a real Realtime connection: forwards everything, observes events.
 
-    Proxies unknown attributes (``.session``, ``.send``, ``.response``, …) to the
-    underlying connection so the host's usage is unchanged. Ends the session span
-    when the connection closes.
-    """
-
-    # Delta event types that carry assistant text (transcript or text response).
     _DELTA_TYPES = (
         "response.audio_transcript.delta",
         "response.text.delta",
@@ -126,7 +98,6 @@ class _ObservedConnection:
             pass
 
     def _scan_output_items(self, response: Any) -> None:
-        """Pull function_call output items from a completed response object."""
         try:
             output = _event_get(response, "output") or []
             for item in output:
@@ -148,11 +119,11 @@ class _ObservedConnection:
             events = self._tool_events
             if response is not None:
                 self._scan_output_items(response)
-                events = self._tool_events  # _scan_output_items may have appended more
+                events = self._tool_events
             self._reset_turn()
 
             if not prompt and not completion:
-                return  # skip audio-only turns with no transcript at all
+                return
 
             attrs = dict(self._base)
             usage = _event_get(response, "usage") if response is not None else None
@@ -281,12 +252,6 @@ class _ObservedConnection:
 
 
 class _TracedConnect:
-    """Async-context-manager wrapper around ``realtime.connect(...)``.
-
-    Opens the ``voice.session`` trace on ``__aenter__`` and returns an
-    ``_ObservedConnection``; ends the session span on ``__aexit__``. Falls back to
-    the raw connection if anything in our wrapping fails.
-    """
 
     def __init__(self, client: "EvalKitClient", cm: Any, model: str) -> None:
         self._ek = client
@@ -303,7 +268,7 @@ class _TracedConnect:
             self._observed = _ObservedConnection(self._ek, conn, _base_attrs(self._model), ctx, end)
             return self._observed
         except Exception:
-            return conn  # fail open — host gets the unwrapped connection
+            return conn
 
     async def __aexit__(self, exc_type, exc, tb):
         try:
@@ -317,7 +282,6 @@ class _TracedConnect:
 
 
 def _resolve_realtime(openai_client: Any) -> Any:
-    """Return the object exposing ``connect`` (client.beta.realtime)."""
     beta = getattr(openai_client, "beta", None)
     realtime = getattr(beta, "realtime", None) if beta is not None else None
     if realtime is None:
@@ -331,19 +295,10 @@ def trace_openai_realtime(
     *,
     model: Optional[str] = None,
 ) -> Any:
-    """Explicit drop-in for ``client.beta.realtime.connect(model=)``.
-
-    Returns an async context manager — use it exactly like the original::
-
-        async with evalkit.trace_openai_realtime(openai_client, model=...) as connection:
-            ...
-
-    On any error, falls back to the real connect so the host is never broken.
-    """
     try:
         realtime = _resolve_realtime(openai_client)
         if realtime is None or not hasattr(realtime, "connect"):
-            return realtime.connect(model=model)  # let it raise naturally
+            return realtime.connect(model=model)
         kwargs: dict = {}
         if model is not None:
             kwargs["model"] = model
@@ -355,8 +310,6 @@ def trace_openai_realtime(
 
 
 def patch_openai_realtime(client: "EvalKitClient") -> None:
-    """Best-effort: wrap ``AsyncRealtime.connect`` so plain
-    ``client.beta.realtime.connect(...)`` is traced. Idempotent. Never raises."""
     try:
         from openai.resources.beta.realtime.realtime import AsyncRealtime
     except Exception:
@@ -376,7 +329,7 @@ def patch_openai_realtime(client: "EvalKitClient") -> None:
             except Exception:
                 return original(self, *args, **kwargs)
 
-        traced_connect._evalkit = True  # type: ignore[attr-defined]
+        traced_connect._evalkit = True
         AsyncRealtime.connect = traced_connect
     except Exception:
         pass

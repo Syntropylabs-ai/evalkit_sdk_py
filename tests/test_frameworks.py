@@ -118,7 +118,6 @@ class TestASGIMiddleware(unittest.TestCase):
         self.assertEqual(len(http), 0, "websocket must not emit http_call span")
 
     def test_chunked_body_fully_captured(self):
-        """ASGI multi-chunk bodies (more_body=True then False) must be fully captured."""
         chunks = [b'{"key":', b'"value"}']
 
         async def chunked_receive(_iter=[iter(chunks)]):
@@ -127,7 +126,6 @@ class TestASGIMiddleware(unittest.TestCase):
                 return {"type": "http.request", "body": chunk, "more_body": True}
             return {"type": "http.request", "body": b"", "more_body": False}
 
-        # app must be able to read the body via receive (replay must work)
         app_body = []
 
         async def app(scope, receive, send):
@@ -157,10 +155,8 @@ class TestASGIMiddleware(unittest.TestCase):
         self.client.flush()
         http = [e for e in self.captured if e.span_type == "http_call"]
         self.assertTrue(http)
-        # span must see the assembled body
         body_attr = http[0].attributes.get("http.request.body", "")
         self.assertIn("key", body_attr, "assembled body must appear in span attributes")
-        # app must have received all chunks via replay
         reassembled = b"".join(app_body)
         self.assertEqual(reassembled, b'{"key":"value"}', "app must receive full body via replay")
 

@@ -1,14 +1,3 @@
-"""Patch ``chromadb.api.models.Collection.Collection.query``/``.add``/``.upsert``
-at the class level.
-
-Same rationale as ``vectordb/pinecone.py`` — makes retrieval calls visible as
-``db_query`` spans instead of invisible-until-the-LLM-call-downstream. Never
-captures raw embedding vectors or full document text — only ids/distances and
-counts.
-
-Degrades to a no-op if ``chromadb`` isn't installed and never raises into the
-caller.
-"""
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -21,8 +10,6 @@ if TYPE_CHECKING:
 
 
 def _query_result_summary(result: Any) -> List[Dict[str, Any]]:
-    """Flatten Chroma's per-query-batch ``QueryResult`` (lists of lists) into
-    a single list of {id, distance} dicts across all query batches."""
     out: List[Dict[str, Any]] = []
     try:
         ids = (result or {}).get("ids") or []
@@ -38,7 +25,6 @@ def _query_result_summary(result: Any) -> List[Dict[str, Any]]:
 
 
 def patch_chroma(client: "EvalKitClient") -> None:
-    """Patch ``chromadb.api.models.Collection.Collection``. Idempotent."""
     try:
         from chromadb.api.models.Collection import Collection
     except ImportError:
@@ -88,7 +74,7 @@ def _patch_query(ek: "EvalKitClient", Collection: Any) -> None:
         end("OK", extra=extra, rows=len(matches))
         return result
 
-    traced_query._evalkit = True  # type: ignore[attr-defined]
+    traced_query._evalkit = True
     Collection.query = traced_query
 
 
@@ -119,7 +105,7 @@ def _patch_add(ek: "EvalKitClient", Collection: Any) -> None:
         end("OK", extra=extra, rows=count)
         return result
 
-    traced_add._evalkit = True  # type: ignore[attr-defined]
+    traced_add._evalkit = True
     Collection.add = traced_add
 
 
@@ -150,5 +136,5 @@ def _patch_upsert(ek: "EvalKitClient", Collection: Any) -> None:
         end("OK", extra=extra, rows=count)
         return result
 
-    traced_upsert._evalkit = True  # type: ignore[attr-defined]
+    traced_upsert._evalkit = True
     Collection.upsert = traced_upsert

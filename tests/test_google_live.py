@@ -64,8 +64,6 @@ def install_fake_live(client, session):
         async def connect(self, *, model=None, config=None):
             return session
 
-    # `connect` must be an async-context-manager factory (matches the real API's
-    # @contextlib.asynccontextmanager decoration) — wrap it the same way.
     original_connect = AsyncLive.connect
 
     @asynccontextmanager

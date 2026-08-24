@@ -1,17 +1,3 @@
-"""Patch ``pinecone.Index.query``/``.upsert`` at the class level.
-
-RAG pipelines retrieve context from a vector DB before generating a response —
-without this, that lookup is invisible (only the downstream LLM call gets
-traced), which makes it impossible to tell whether a bad answer came from
-retrieval (wrong/no matches) or generation (bad prompt, bad model). Emits
-``db_query`` spans using the same shared helper every other DB integration in
-this SDK uses (``instrumentation/db/_common.py``), with vector-specific
-attributes: namespace, top_k, match count/scores. Never captures raw embedding
-vectors — they're large and not useful for a trace.
-
-Degrades to a no-op if ``pinecone`` isn't installed and never raises into the
-caller.
-"""
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -34,7 +20,6 @@ def _matches_summary(response: Any) -> List[Dict[str, Any]]:
 
 
 def patch_pinecone(client: "EvalKitClient") -> None:
-    """Patch ``pinecone.data.index.Index`` (aka ``pinecone.Index``). Idempotent."""
     try:
         from pinecone import Index
     except ImportError:
@@ -80,7 +65,7 @@ def _patch_query(ek: "EvalKitClient", Index: Any) -> None:
         end("OK", extra=extra, rows=len(matches))
         return result
 
-    traced_query._evalkit = True  # type: ignore[attr-defined]
+    traced_query._evalkit = True
     Index.query = traced_query
 
 
@@ -111,5 +96,5 @@ def _patch_upsert(ek: "EvalKitClient", Index: Any) -> None:
         end("OK", extra=extra, rows=upserted)
         return result
 
-    traced_upsert._evalkit = True  # type: ignore[attr-defined]
+    traced_upsert._evalkit = True
     Index.upsert = traced_upsert

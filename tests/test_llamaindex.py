@@ -145,7 +145,6 @@ class TestLlamaIndexTracker(unittest.TestCase):
         self.assertEqual(fc[0].attributes["rerank.output_count"], 1)
 
     def test_span_without_event_is_not_emitted(self):
-        """Framework-internal spans (no *StartEvent inside) must be filtered out."""
         t = self._tracker()
         t.on_span_enter("s7", None, instance=FakeLLM())
         t.on_span_exit("s7")
@@ -165,9 +164,6 @@ class TestLlamaIndexTracker(unittest.TestCase):
         self.assertIn("index unavailable", fc[0].status_message)
 
     def test_nested_recognized_span_gets_correct_parent(self):
-        """query -> retrieve nesting: retrieve's parent_span_id must resolve to
-        query's evalkit span_id, even though retrieve's llama-index parent_id
-        is query's llama-index id_ (a different id space)."""
         t = self._tracker()
         t.on_span_enter("query-1", None, instance=FakeLLM())
         t.on_event(QueryStartEvent(span_id="query-1", query="q"))
@@ -186,13 +182,11 @@ class TestLlamaIndexTracker(unittest.TestCase):
         self.assertEqual(retrieve_span.parent_span_id, query_evalkit_span_id)
 
     def test_nested_span_walks_past_uninteresting_ancestor(self):
-        """query -> (uninteresting wrapper) -> retrieve: retrieve should still
-        parent to query's evalkit span_id, skipping the unrecognized middle span."""
         t = self._tracker()
         t.on_span_enter("query-2", None, instance=FakeLLM())
         t.on_event(QueryStartEvent(span_id="query-2", query="q"))
 
-        t.on_span_enter("wrapper-2", "query-2", instance=FakeLLM())  # no event -> uninteresting
+        t.on_span_enter("wrapper-2", "query-2", instance=FakeLLM())
 
         t.on_span_enter("retrieve-2", "wrapper-2", instance=FakeLLM())
         t.on_event(RetrievalStartEvent(span_id="retrieve-2", str_or_query_bundle="q"))
@@ -210,17 +204,6 @@ class TestLlamaIndexTracker(unittest.TestCase):
 
 
 class TestLlamaIndexPatchIntegration(unittest.TestCase):
-    """End-to-end through the real dispatcher, proving auto_instrument() wiring works.
-
-    Deliberately does NOT call patch_llamaindex() itself: llama-index-core is
-    installed in this environment, so evalkit.init() (via fresh(), in setUp of the
-    TestLlamaIndexTracker class above, which always runs first in this process)
-    already triggers auto_instrument() -> _try_patch_llamaindex() exactly once
-    against the shared singleton client. Calling patch_llamaindex() again here
-    would register a *second* handler on the process-wide dispatcher (handlers are
-    additive, never replaced) and double-emit — that's not a bug, just not how a
-    real process (which calls init() once) ever exercises this path.
-    """
 
     def setUp(self):
         reset_context()

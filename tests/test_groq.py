@@ -4,7 +4,6 @@ from tests.helpers import OResp, fresh, reset_context
 
 
 class TestGroq(unittest.TestCase):
-    """Groq uses the same OpenAI-compatible patch with provider='groq'."""
 
     def setUp(self):
         reset_context()
@@ -36,7 +35,6 @@ class TestGroq(unittest.TestCase):
         _patch_openai_class_sync(self.client, FakeGroqCompletions, provider="groq")
         FakeGroqCompletions().create(model="llama3-70b-8192", messages=[])
         self.client.flush()
-        # Client-side function tool -> event on the llm_call span, no child span.
         llm = [e for e in self.captured if e.span_type == "llm_call"][0]
         self.assertTrue(llm.events)
         self.assertEqual(llm.events[0].attributes["gen_ai.tool.name"], "web_search")

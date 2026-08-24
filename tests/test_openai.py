@@ -31,8 +31,6 @@ class TestOpenAI(unittest.TestCase):
         self.assertEqual(llm[0].status, "OK")
 
     def test_sync_tool_call_event(self):
-        # Client-side function tools surface as a gen_ai.tool.call event on the
-        # llm_call span (no result -> no child tool_call span; wrap execution for that).
         fc = install_fake_openai_sync(self.client, OResp(tool=("search", '{"q":"weather"}')))
         fc.create(model="gpt-4o", messages=[{"role": "user", "content": "weather?"}])
         self.client.flush()
@@ -104,7 +102,6 @@ class TestOpenAI(unittest.TestCase):
         self.assertGreaterEqual(ttft, 0)
 
     def test_non_streaming_has_no_ttft(self):
-        # TTFT only makes sense for streaming responses.
         fc = install_fake_openai_sync(self.client, OResp("hello"))
         fc.create(model="gpt-4o-mini", messages=[{"role": "user", "content": "hi"}])
         self.client.flush()
@@ -168,7 +165,6 @@ class TestOpenAIResponsesAPI(unittest.TestCase):
         self.assertEqual(llm[0].tokens_out, 9)
 
     def test_responses_tool_call_event(self):
-        # A function_call output item is a client-side tool (no result) -> event only.
         resp = ORespResult(tool=("get_weather", '{"city":"Paris"}'))
         fc = install_fake_openai_responses_sync(self.client, resp)
         fc.create(model="gpt-4o", input="Weather in Paris?")

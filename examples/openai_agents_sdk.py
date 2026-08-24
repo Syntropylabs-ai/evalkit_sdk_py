@@ -1,17 +1,3 @@
-"""
-EvalKit + OpenAI (async agent loop) demo
-
-Just call evalkit.init() — auto-instruments AsyncOpenAI at the class level.
-Every messages.create() call in the agentic loop appears as an llm_call span.
-
-Install:
-    pip install openai python-dotenv
-    pip install -e ../../sdk-py
-
-Run:
-    EVALKIT_KEY=tk_live_... OPENAI_API_KEY=sk-... python openai_agents_sdk.py
-"""
-
 import asyncio
 import json
 import os
@@ -56,7 +42,6 @@ def handle_tool(name: str, args: dict) -> str:
 
 
 async def run_agent(user_message: str) -> str:
-    """Simple agentic loop with automatic tracing."""
     trace_id, end_trace, ctx = evalkit.start_trace(
         "agent.run", {"user.message": user_message[:100]}
     )

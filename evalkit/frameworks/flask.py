@@ -6,7 +6,7 @@ from ..core.client import EvalKitClient
 from ..core.context import _current_span
 from ..utils.headers import parse_traceparent, sanitize_headers
 
-_BODY_MAX = 10 * 1024 * 1024  # default; overridden from client options at instrument time
+_BODY_MAX = 10 * 1024 * 1024
 
 
 def instrument_flask(app: Any, client: EvalKitClient) -> None:
@@ -43,7 +43,7 @@ def instrument_flask(app: Any, client: EvalKitClient) -> None:
             g._ek_ended = False
             g._ek_token = _current_span.set(ctx)
         except Exception:
-            pass  # tracing setup must never break the request
+            pass
 
     @app.after_request
     def _evalkit_after(response: Any) -> Any:
@@ -52,7 +52,6 @@ def instrument_flask(app: Any, client: EvalKitClient) -> None:
             trace_id = getattr(g, "_ek_trace_id", None)
             ctx = getattr(g, "_ek_ctx", None)
             if end and not getattr(g, "_ek_ended", False):
-                # Capture response headers + body (bounded) for parity with the ASGI middleware.
                 resp_headers = None
                 resp_body: Any = None
                 try:
@@ -84,8 +83,6 @@ def instrument_flask(app: Any, client: EvalKitClient) -> None:
     @app.teardown_request
     def _evalkit_teardown(exc: Any) -> None:
         try:
-            # On an UNHANDLED exception Flask skips after_request, so close the span
-            # here as an error — otherwise the request span would be silently dropped.
             end = getattr(g, "_ek_end", None)
             if end and not getattr(g, "_ek_ended", False):
                 try:

@@ -1,31 +1,3 @@
-"""LlamaIndex instrumentation via its native event/span dispatcher.
-
-LlamaIndex ships a first-class instrumentation API (``llama_index.core.instrumentation``)
-built exactly for this purpose — it's what OpenInference/OpenLLMetry integrate against
-too, rather than monkeypatching individual classes. Two parallel signal types make up
-that API and we use both:
-
-  * **Events** (``BaseEventHandler.handle``) — typed pydantic payloads (messages,
-    responses, chunks, nodes, ...) dispatched at well-known points (LLM chat/complete,
-    embed, retrieve, query, rerank). These give us prompt/completion/token content.
-  * **Spans** (``BaseSpanHandler``) — every method decorated with ``@dispatcher.span``
-    (which is most of the public API surface, not just the six calls above) reports
-    enter/exit/drop with the caller's ``instance`` and the *true* parent/child nesting.
-    These give us timing, error status, and hierarchy.
-
-A span only turns into a trace if a recognized *StartEvent fired inside it (gated via
-``span_type`` being set) — this filters out the many framework-internal spans (node
-parsing, index bookkeeping, etc.) that aren't interesting on their own, while still
-using their span_id chain to find the nearest interesting *ancestor* so nesting stays
-correct even when an uninteresting span sits in between.
-
-Error paths only surface through span_drop (LlamaIndex's event API has no *ErrorEvent
-variants for retrieve/query/embed/rerank), which is why the span handler — not just the
-event handler — is required for correctness.
-
-Never captures raw embedding vectors. Degrades to a no-op if llama-index-core isn't
-installed and never raises into the host.
-"""
 from __future__ import annotations
 
 import logging
@@ -147,19 +119,12 @@ def _extract_tokens(response: Any) -> Tuple[int, int]:
 
 
 class _Tracker:
-    """Bridges LlamaIndex's dispatcher signals to evalkit TraceEnvelopes.
-
-    Not a pydantic model (unlike the event/span handlers that hold it) so it can
-    freely keep a plain mutable dict of in-flight spans keyed by LlamaIndex's own
-    ``id_`` strings.
-    """
 
     def __init__(self, client: "EvalKitClient") -> None:
         self.client = client
         self._spans: Dict[str, Dict[str, Any]] = {}
         self._lock = Lock()
 
-    # ── span lifecycle (hierarchy + timing + error path) ──────────────────
     def on_span_enter(self, id_: str, parent_id: Optional[str], instance: Any = None) -> None:
         with self._lock:
             parent_span_id = None
@@ -247,8 +212,8 @@ class _Tracker:
             trace_id=rec["trace_id"],
             span_id=rec["span_id"],
             parent_span_id=rec["parent_span_id"],
-            span_type=rec["span_type"],  # type: ignore[arg-type]
-            status=status,  # type: ignore[arg-type]
+            span_type=rec["span_type"],
+            status=status,
             status_message=status_message,
             operation=rec["operation"] or rec["span_type"],
             service_name=self.client._opts.service_name,
@@ -270,7 +235,6 @@ class _Tracker:
             sdk_version=SDK_VERSION,
         ))
 
-    # ── events (payload enrichment) ────────────────────────────────────────
     def on_event(self, event: Any) -> None:
         try:
             name = event.class_name()
@@ -460,11 +424,6 @@ _Tracker._EVENT_HANDLERS = {
 
 
 def patch_llamaindex(client: "EvalKitClient") -> Optional[_Tracker]:
-    """Register evalkit's event + span handlers on LlamaIndex's root dispatcher.
-
-    Idempotent (module-global guard, since the dispatcher is a process-wide
-    singleton) and dependency-free: a no-op if llama-index-core isn't installed.
-    """
     global _registered
     if _registered:
         return None
@@ -478,7 +437,7 @@ def patch_llamaindex(client: "EvalKitClient") -> Optional[_Tracker]:
 
     tracker = _Tracker(client)
 
-    class _EvalKitEventHandler(BaseEventHandler):  # type: ignore[misc]
+    class _EvalKitEventHandler(BaseEventHandler):
         @classmethod
         def class_name(cls) -> str:
             return "EvalKitEventHandler"
@@ -489,7 +448,7 @@ def patch_llamaindex(client: "EvalKitClient") -> Optional[_Tracker]:
             except Exception:
                 pass
 
-    class _EvalKitSpanHandler(BaseSpanHandler):  # type: ignore[misc]
+    class _EvalKitSpanHandler(BaseSpanHandler):
         @classmethod
         def class_name(cls) -> str:
             return "EvalKitSpanHandler"

@@ -7,7 +7,7 @@ from ..core.client import EvalKitClient
 from ..core.context import _current_span
 from ..utils.headers import parse_traceparent, sanitize_headers
 
-_BODY_MAX = 10 * 1024 * 1024  # default; overridden from client options per request
+_BODY_MAX = 10 * 1024 * 1024
 
 
 def create_litestar_middleware(client: "EvalKitClient | None" = None) -> Any:
@@ -91,7 +91,6 @@ def create_litestar_middleware(client: "EvalKitClient | None" = None) -> Any:
                 )
                 token = _current_span.set(ctx)
             except Exception:
-                # Tracing setup failed — run untraced, replaying the consumed body.
                 await self.app(scope, receive_replay, send)
                 return
 
@@ -120,7 +119,7 @@ def create_litestar_middleware(client: "EvalKitClient | None" = None) -> Any:
                         if len(response_body_holder[0]) < _BODY_MAX:
                             response_body_holder[0] += message.get("body", b"")
                 except Exception:
-                    pass  # span bookkeeping must never corrupt the response
+                    pass
                 await send(message)
 
             try:

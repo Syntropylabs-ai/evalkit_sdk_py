@@ -29,10 +29,6 @@ def with_simulation(sim: SimulationContext):
 
 @contextmanager
 def _scenario_trace(name: str):
-    """One OpenTelemetry parent span per scenario so a framework's own OTel spans
-    (e.g. Google ADK invocations) and EvalKit's native spans share ONE trace per
-    scenario instead of each turn starting a new root. start_trace() called inside
-    joins this span's trace id. No-op when the OTel SDK isn't active."""
     span_cm = None
     try:
         from ..core.otel_provider import otel_active
@@ -49,21 +45,17 @@ def _scenario_trace(name: str):
 
 
 def _run_coro_blocking(coro: Any) -> Any:
-    """Run a coroutine to completion from sync code, even if an event loop is
-    already running in this thread (in which case we run it on a private loop in
-    a worker thread so we never collide with the caller's loop)."""
     try:
         asyncio.get_running_loop()
     except RuntimeError:
         return asyncio.run(coro)
 
-    # A loop is already running in this thread — run on a dedicated thread.
     result: Dict[str, Any] = {}
 
     def _worker() -> None:
         try:
             result["value"] = asyncio.run(coro)
-        except Exception as exc:  # surface to caller
+        except Exception as exc:
             result["error"] = exc
 
     t = threading.Thread(target=_worker, daemon=True)
@@ -75,8 +67,6 @@ def _run_coro_blocking(coro: Any) -> Any:
 
 
 def _resolve(value: Any) -> Any:
-    """Resolve an entrypoint return value for the synchronous driver: await it
-    if it is a coroutine/awaitable, otherwise return as-is."""
     if inspect.isawaitable(value):
         return _run_coro_blocking(value)
     return value
@@ -98,11 +88,6 @@ def _user_turns(scenario: Dict[str, Any]) -> List[str]:
 
 
 def _tools_from_collector(sim: SimulationContext) -> List[Dict[str, Any]]:
-    """Reconstruct the agent's actual tool calls from spans captured during the
-    scenario. Handles both explicit ``tool_call`` spans and the ``gen_ai.tool.call``
-    events that the LLM patchers (OpenAI / Anthropic / Google / ADK) attach to the
-    ``llm_call`` span — so deterministic tool metrics work without the user having
-    to return an AgentTurnResult."""
     span_tools: List[Dict[str, Any]] = []
     event_tools: List[Dict[str, Any]] = []
     for env in sim.collector:
@@ -118,8 +103,6 @@ def _tools_from_collector(sim: SimulationContext) -> List[Dict[str, Any]]:
                 name = ev_attrs.get("gen_ai.tool.name")
                 if name:
                     event_tools.append({"name": name, "args": ev_attrs.get("gen_ai.tool.call.arguments")})
-    # Prefer first-class tool_call spans; fall back to the LLM span's tool events
-    # (avoids double-counting now that enqueue promotes events → tool_call spans).
     return span_tools or event_tools
 
 
@@ -289,10 +272,6 @@ def simulate_user(
     }
     scenario_list = list(scenarios)
 
-    # Pin ONE ambient trace ID before any scenario runs. Every copy_context() /
-    # ensure_future() below inherits this ID from the parent context, so all
-    # scenarios — and any pre-run ops like generate_scenarios() — land in the
-    # same trace instead of each minting an isolated ID.
     get_or_create_ambient_trace_id()
 
     if inspect.iscoroutinefunction(entrypoint):

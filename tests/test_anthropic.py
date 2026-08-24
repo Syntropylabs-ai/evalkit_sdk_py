@@ -26,7 +26,6 @@ class TestAnthropicClaude(unittest.TestCase):
         self.assertEqual(llm[0].completion, "hi")
         self.assertEqual(llm[0].tokens_in, 3)
         self.assertEqual(llm[0].tokens_out, 5)
-        # Client-side tool: gen_ai.tool.call event on the llm_call span, no child span.
         self.assertTrue(llm[0].events)
         self.assertEqual(llm[0].events[0].attributes["gen_ai.tool.name"], "get_weather")
         tools = [e for e in self.captured if e.span_type == "tool_call"]

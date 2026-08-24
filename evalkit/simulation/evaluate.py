@@ -18,47 +18,6 @@ def evaluate_simulation(
     max_tokens: Optional[int] = None,
     api_url: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Evaluate a completed scenario-simulation run against an evaluator collection.
-
-    Runs the project's evaluator collection over every scenario of a simulation
-    (server-side) and returns per-scenario, per-criterion scores + reasons. The
-    judge is bring-your-own-key: ``provider`` + ``model`` + ``api_key`` are used
-    for the judge call only and never stored.
-
-    Args:
-        simulation_id: The ``simulation_id`` returned by ``simulate_user``.
-        collection_id: Mongo id of the evaluator collection whose rules to run.
-        provider: Judge provider, e.g. ``"openai"``, ``"anthropic"``, ``"google"``.
-        model: Judge model id, e.g. ``"gpt-4o"``.
-        api_key: Judge API key (BYOK).
-        run_id: A specific run of the simulation. Defaults to the most recent run.
-        max_tokens: Judge output token cap (defaults to the backend's value).
-        api_url: Override the control-plane URL (default: the value from ``init``).
-
-    Returns:
-        A dict shaped like::
-
-            {
-              "simulationId": str,
-              "runId": str,
-              "scenarios": [
-                {
-                  "scenarioId": str, "name": str, "traceId": str,
-                  "status": "OK" | "ERROR" | "skipped",
-                  "overallScore": float, "passed": bool,
-                  "metrics": [
-                    {"ruleId": str, "ruleName": str, "category": str,
-                     "score": float, "passed": bool, "reason": str}
-                  ],
-                  "error": str   # only when status == "skipped"
-                }
-              ],
-              "aggregate": {
-                "averageScore": float, "passRate": float,
-                "totalScenarios": int, "evaluatedScenarios": int
-              }
-            }
-    """
     from .. import _get_instance
 
     client = _get_instance()
@@ -88,8 +47,6 @@ def evaluate_simulation(
         method="POST",
     )
 
-    # urllib is not auto-instrumented, so trace this backend hop explicitly. The span
-    # nests under whatever trace is active. Don't log the BYOK api_key in the body.
     import evalkit as _ek
 
     logged_body = json.dumps({k: v for k, v in body.items() if k != "apiKey"}, default=str)
@@ -108,7 +65,6 @@ def evaluate_simulation(
         if ctx is not None:
             token = _ek._current_span.set(ctx)
         try:
-            # Evaluating many scenarios can take minutes; give the judge room.
             with urllib.request.urlopen(req, timeout=300) as resp:
                 raw = resp.read()
                 attrs["http.status_code"] = resp.getcode()

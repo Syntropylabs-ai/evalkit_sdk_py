@@ -11,10 +11,6 @@ from ._bodies import _dump, _safe_body
 
 
 def patch_cohere(client: EvalKitClient, cohere_client: Any) -> None:
-    """
-    Patch CohereClient.chat() to trace every call.
-    Supports cohere-ai v2 SDK (CohereClient.chat).
-    """
     if getattr(cohere_client.chat, "_evalkit", False):
         return
 
@@ -129,5 +125,5 @@ def patch_cohere(client: EvalKitClient, cohere_client: Any) -> None:
         ))
         return result
 
-    traced_chat._evalkit = True  # type: ignore[attr-defined]
+    traced_chat._evalkit = True
     cohere_client.chat = traced_chat

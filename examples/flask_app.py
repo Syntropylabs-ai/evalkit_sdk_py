@@ -1,20 +1,3 @@
-"""
-EvalKit + Flask demo
-
-Just call evalkit.init() — everything is auto-instrumented:
-  • All OpenAI calls traced automatically
-  • HTTP requests/responses traced via Flask middleware
-  • DB calls traced if sqlalchemy is installed
-
-Install:
-    pip install flask openai python-dotenv
-    pip install -e ../../sdk-py
-
-Run:
-    EVALKIT_KEY=tk_live_... OPENAI_API_KEY=sk-... python flask_app.py
-    curl "http://localhost:5000/ask?q=What+is+the+capital+of+France"
-"""
-
 import os
 from flask import Flask, request, jsonify
 from openai import OpenAI
@@ -33,14 +16,13 @@ evalkit.init(
 
 openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY") or "demo-key")
 app = Flask(__name__)
-evalkit.instrument_flask(app)  # adds request-level trace spans to every route
+evalkit.instrument_flask(app)
 
 
 @app.route("/ask")
 def ask():
     question = request.args.get("q", "What is 2+2?")
 
-    # Optional: wrap in a named trace for richer hierarchy in the dashboard.
     trace_id, end_trace, ctx = evalkit.start_trace("ask", {"question": question[:100]})
     with evalkit.with_trace(ctx):
         response = openai_client.chat.completions.create(

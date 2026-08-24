@@ -1,22 +1,3 @@
-"""
-EvalKit + FastAPI demo
-
-Just call evalkit.init() — everything is auto-instrumented:
-  • All Anthropic calls traced automatically (sync + async)
-  • Every HTTP route traced via EvalKitMiddleware
-  • httpx / requests outbound calls traced
-
-Install:
-    pip install fastapi uvicorn anthropic python-dotenv
-    pip install -e ../../sdk-py
-
-Run:
-    EVALKIT_KEY=tk_live_... ANTHROPIC_API_KEY=sk-ant-... uvicorn fastapi_app:app --reload
-    curl -X POST http://localhost:8000/chat \\
-         -H 'Content-Type: application/json' \\
-         -d '{"message": "Explain quantum entanglement in one sentence."}'
-"""
-
 import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
@@ -45,7 +26,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="EvalKit FastAPI Demo", lifespan=lifespan)
-app.add_middleware(evalkit.EvalKitMiddleware)  # traces every HTTP request
+app.add_middleware(evalkit.EvalKitMiddleware)
 
 
 class ChatRequest(BaseModel):

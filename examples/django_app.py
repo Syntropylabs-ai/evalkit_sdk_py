@@ -1,20 +1,3 @@
-"""
-EvalKit + Django demo (single-file for testing)
-
-Just call evalkit.init() — everything is auto-instrumented:
-  • All OpenAI calls traced automatically
-  • Every Django request traced via EvalKitDjangoMiddleware
-  • DB calls traced via SQLAlchemy patcher (if used)
-
-Install:
-    pip install django openai python-dotenv
-    pip install -e ../../sdk-py
-
-Run:
-    EVALKIT_KEY=tk_live_... OPENAI_API_KEY=sk-... python django_app.py
-    curl "http://localhost:7000/ask/?q=What+is+Python"
-"""
-
 import os
 import sys
 from dotenv import load_dotenv

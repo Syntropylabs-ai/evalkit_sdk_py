@@ -1,23 +1,3 @@
-"""Patch OpenAI's audio.speech (TTS) and audio.transcriptions/translations
-(Whisper) at the class level.
-
-Neither is token-billed the way chat.completions is:
-  - TTS (``speech.create``) returns raw audio bytes with no usage at all — cost
-    is proportional to input text length (``gen_ai.audio.input_characters``).
-  - Transcription/translation is billed either by audio duration (whisper-1 —
-    ``response.duration`` on the verbose_json format) or, for the newer
-    gpt-4o-transcribe family, by token (``response.usage`` is a discriminated
-    union: ``{type: "duration", seconds}`` or ``{type: "tokens", input_tokens,
-    output_tokens, input_token_details: {audio_tokens, text_tokens}}``).
-
-All of these span_type="llm_call" so they get the same detail-view treatment
-(model badge, request/response body, token/cost summary) as everything else —
-just with ``gen_ai.audio.*`` attributes standing in for tokens where the API
-genuinely has no tokens to report.
-
-Degrades to a no-op if ``openai`` isn't installed and never raises into the
-caller.
-"""
 from __future__ import annotations
 
 import time
@@ -36,7 +16,6 @@ _TEXT_MAX = 8192
 
 
 def patch_openai_audio(client: "EvalKitClient") -> None:
-    """Patch openai.resources.audio's Speech/Transcriptions/Translations (sync + async). Idempotent."""
     try:
         from openai.resources.audio.speech import AsyncSpeech, Speech
         from openai.resources.audio.transcriptions import AsyncTranscriptions, Transcriptions
@@ -134,7 +113,7 @@ def _patch_speech(ek: "EvalKitClient", Speech: Any, is_async: bool) -> None:
         return result
 
     wrapper = _arun if is_async else _run
-    wrapper._evalkit = True  # type: ignore[attr-defined]
+    wrapper._evalkit = True
     Speech.create = wrapper
 
 
@@ -180,7 +159,6 @@ def _patch_transcribe(ek: "EvalKitClient", Cls: Any, operation: str, is_async: b
         req_body = _safe_body({k: v for k, v in kwargs.items() if k != "file"})
         end = _start(ek, operation, model, f"[{file_name}]", req_body)
         if kwargs.get("stream"):
-            # Streaming transcription events aren't captured — best-effort pass-through.
             return original(self, *args, **kwargs)
         try:
             result = original(self, *args, **kwargs)
@@ -219,5 +197,5 @@ def _patch_transcribe(ek: "EvalKitClient", Cls: Any, operation: str, is_async: b
         return result
 
     wrapper = _arun if is_async else _run
-    wrapper._evalkit = True  # type: ignore[attr-defined]
+    wrapper._evalkit = True
     Cls.create = wrapper

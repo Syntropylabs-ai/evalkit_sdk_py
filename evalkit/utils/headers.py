@@ -12,7 +12,6 @@ SENSITIVE_RE = re.compile(
 
 
 def sanitize_headers(headers: Any) -> Dict[str, str]:
-    """Return a copy of headers with sensitive keys removed."""
     out: Dict[str, str] = {}
     if not headers:
         return out
@@ -28,7 +27,6 @@ def make_traceparent(trace_id: str, span_id: str) -> str:
 
 
 def parse_traceparent(header: str) -> tuple[str | None, str | None]:
-    """Parse W3C traceparent. Returns (trace_id, span_id) or (None, None)."""
     parts = header.split("-")
     if len(parts) == 4 and parts[0] == "00" and len(parts[1]) == 32 and len(parts[2]) == 16:
         return parts[1], parts[2]

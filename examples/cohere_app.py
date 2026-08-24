@@ -1,16 +1,3 @@
-"""
-EvalKit + Cohere demo
-
-Just call evalkit.init() — auto-instruments cohere.Client.chat at the class level.
-
-Install:
-    pip install cohere python-dotenv
-    pip install -e ../../sdk-py
-
-Run:
-    EVALKIT_KEY=tk_live_... COHERE_API_KEY=... python cohere_app.py
-"""
-
 import os
 from dotenv import load_dotenv
 import cohere

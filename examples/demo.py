@@ -1,12 +1,3 @@
-"""
-EvalKit Python SDK — demo script.
-
-Usage:
-    pip install openai anthropic
-    pip install -e ../  # install evalkit from source
-    OPENAI_API_KEY=sk-... python demo.py
-"""
-
 import os
 import evalkit
 from openai import OpenAI

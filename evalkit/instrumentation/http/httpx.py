@@ -11,7 +11,7 @@ from ...core.types import TraceEnvelope
 from ...utils.headers import make_traceparent, path_from_url, sanitize_headers
 
 _SKIP = {"/v1/ingest", "/health", "/healthz"}
-_BODY_MAX = 10 * 1024 * 1024  # default; overridden from client options at patch time
+_BODY_MAX = 10 * 1024 * 1024
 
 
 def _should_skip(url: str) -> bool:
@@ -29,9 +29,6 @@ def _req_body(request: Any) -> Optional[str]:
 
 
 def _resp_body(resp: Any) -> Optional[str]:
-    # Only read the body if httpx has already buffered it (non-streaming response).
-    # For a live stream is_stream_consumed=False — touching .content would consume
-    # the caller's stream, so we skip it and return None instead.
     try:
         is_streaming = getattr(resp, "is_stream_consumed", None) is False
         if is_streaming:
@@ -60,9 +57,6 @@ def patch_httpx(client: EvalKitClient) -> None:
             if _should_skip(url):
                 return _orig_sync(self, request, **kwargs)
 
-            # If an outer HTTP instrumentation is already tracing this call (one
-            # client delegating to another — e.g. httpx → aiohttp transport), don't
-            # emit a second http_call span for the same network request.
             if _in_http_span.get():
                 return _orig_sync(self, request, **kwargs)
 
@@ -104,8 +98,8 @@ def patch_httpx(client: EvalKitClient) -> None:
             )
             return resp
 
-        traced_sync_send._evalkit = True  # type: ignore[attr-defined]
-        httpx.Client.send = traced_sync_send  # type: ignore[method-assign]
+        traced_sync_send._evalkit = True
+        httpx.Client.send = traced_sync_send
 
     if not getattr(httpx.AsyncClient.send, "_evalkit", False):
         _orig_async = httpx.AsyncClient.send
@@ -115,8 +109,6 @@ def patch_httpx(client: EvalKitClient) -> None:
             if _should_skip(url):
                 return await _orig_async(self, request, **kwargs)
 
-            # See traced_sync_send: skip if an outer HTTP wrapper is already tracing
-            # this call (e.g. litellm routes httpx through its aiohttp transport).
             if _in_http_span.get():
                 return await _orig_async(self, request, **kwargs)
 
@@ -158,8 +150,8 @@ def patch_httpx(client: EvalKitClient) -> None:
             )
             return resp
 
-        traced_async_send._evalkit = True  # type: ignore[attr-defined]
-        httpx.AsyncClient.send = traced_async_send  # type: ignore[method-assign]
+        traced_async_send._evalkit = True
+        httpx.AsyncClient.send = traced_async_send
 
 
 def _emit_http_span(

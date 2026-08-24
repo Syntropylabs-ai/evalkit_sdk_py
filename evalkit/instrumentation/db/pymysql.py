@@ -1,4 +1,3 @@
-"""PyMySQL instrumentation (also used by Django/SQLAlchemy MySQL via PyMySQL) → db_query spans."""
 from __future__ import annotations
 
 from typing import Any
@@ -28,5 +27,5 @@ def patch_pymysql(client: Any) -> None:
         end("OK", rows=r if isinstance(r, int) else None)
         return r
 
-    traced._evalkit = True  # type: ignore[attr-defined]
+    traced._evalkit = True
     cls.execute = traced

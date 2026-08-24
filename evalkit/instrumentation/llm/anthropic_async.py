@@ -114,8 +114,6 @@ def patch_async_anthropic(
         tokens_out = getattr(usage, "output_tokens", 0) or 0
         cache_read_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
         cache_creation_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
-        # See anthropic.py: Anthropic's input_tokens excludes cache reads/writes
-        # (additive, unlike OpenAI/Gemini) — normalize to inclusive-of-cache here.
         tokens_in = (getattr(usage, "input_tokens", 0) or 0) + cache_read_tokens + cache_creation_tokens
 
         attrs: Dict[str, Any] = {
@@ -156,5 +154,5 @@ def patch_async_anthropic(
         ))
         return result
 
-    traced_create._evalkit = True  # type: ignore[attr-defined]
+    traced_create._evalkit = True
     messages_api.create = traced_create

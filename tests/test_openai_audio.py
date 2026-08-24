@@ -112,10 +112,6 @@ class TestOpenAIAudio(unittest.TestCase):
         self.assertEqual(span.attributes["gen_ai.audio.duration_seconds"], 3.2)
 
     def test_async_transcription_uses_await_not_sync_call(self):
-        # Regression test: openai's @required_args decorator makes
-        # inspect.iscoroutinefunction() return False for AsyncTranscriptions.create
-        # even though it IS declared `async def` — is_async must come from the
-        # caller (which class was patched), never from introspecting `original`.
         from evalkit.instrumentation.llm.openai_audio import _patch_transcribe
 
         class FakeAsyncTranscriptions:

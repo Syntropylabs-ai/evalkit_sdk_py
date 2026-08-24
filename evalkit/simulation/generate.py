@@ -81,8 +81,6 @@ def generate_scenarios(
         method="POST",
     )
 
-    # urllib is not auto-instrumented, so trace this backend hop explicitly. The span
-    # nests under whatever trace is active (e.g. the POST /api/simulate request).
     import evalkit as _ek
 
     attrs: Dict[str, Any] = {

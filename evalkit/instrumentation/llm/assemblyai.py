@@ -1,26 +1,3 @@
-"""Patch AssemblyAI's Transcriber.transcribe at the class level.
-
-Billed by audio duration, not tokens — cost is proportional to
-``response.audio_duration`` (seconds). Deliberately NOT the length of
-``response.audio_url``: a shared OpenLit helper conflates the two (treats any
-non-empty "prompt"-like string as character-billed), which silently prices
-AssemblyAI transcripts off the length of the audio URL string rather than the
-actual audio duration — confirmed by reading their real source. We use
-audio_duration only.
-
-AssemblyAI also doesn't raise on a failed transcription — a failed job comes
-back as a normal ``Transcript`` with ``.error`` set (and ``.status ==
-"error"``), not an exception — so success/failure must be read off the
-response, not just caught in a try/except.
-
-Only ``transcribe()`` is patched. ``transcribe_async()`` returns a
-``concurrent.futures.Future`` (thread-pool based, not an asyncio coroutine),
-a genuinely different concurrency model this wrapper doesn't attempt to
-bridge — same scope OpenLit itself covers.
-
-Degrades to a no-op if ``assemblyai`` isn't installed and never raises into
-the caller.
-"""
 from __future__ import annotations
 
 import time
@@ -39,7 +16,6 @@ _TEXT_MAX = 8192
 
 
 def patch_assemblyai(client: "EvalKitClient") -> None:
-    """Patch assemblyai.transcriber.Transcriber.transcribe. Idempotent."""
     try:
         from assemblyai.transcriber import Transcriber
     except ImportError:
@@ -116,5 +92,5 @@ def _patch_transcribe(ek: "EvalKitClient", Transcriber: Any) -> None:
         end("OK", completion=getattr(result, "text", None), extra=extra)
         return result
 
-    traced._evalkit = True  # type: ignore[attr-defined]
+    traced._evalkit = True
     Transcriber.transcribe = traced

@@ -1,23 +1,3 @@
-"""Automatic function tracing via an import hook.
-
-`init()` installs a `sys.meta_path` finder that, as each of your app's own modules
-is imported, wraps its module-level functions with `trace_function` (one
-`function_call` span per call, APM-style). This is the same strategy OpenTelemetry
-uses — instrument at import time rather than asking the user to wire every module —
-and it's necessary because `init()` runs *before* the app's modules are imported, so
-there is nothing to wrap yet at init time.
-
-Scope is deliberately narrow and safe:
-  - only modules whose file lives under the app's own source directory (the dir of
-    the file that called `init()`), or under an explicitly named `extra_packages`;
-  - never third-party libraries (site-packages / dist-packages / venv) or evalkit;
-  - only module-level functions (never class methods), via the existing
-    `trace_module`, which uses `functools.wraps` so framework signature
-    introspection (FastAPI `Depends`, etc.) keeps working.
-
-Everything is wrapped in `try/except`: a failure here must never break an import.
-"""
-
 from __future__ import annotations
 
 import os
@@ -36,7 +16,6 @@ _EXCLUDED_PATH_MARKERS = (
     os.sep + "lib" + os.sep + "python",
 )
 
-# Process-global guard so we never install more than one finder.
 _installed = False
 
 
@@ -47,7 +26,6 @@ def install_function_tracer(
     capture_io: bool = True,
     extra_packages: Iterable[str] = (),
 ) -> None:
-    """Install the import hook. Idempotent and exception-safe."""
     global _installed
     if _installed:
         return
@@ -63,7 +41,6 @@ def install_function_tracer(
         name = getattr(module, "__name__", "") or ""
         if not name or name.startswith("evalkit"):
             return False
-        # Explicitly requested packages (covers sibling packages outside root_dir).
         top = name.split(".")[0]
         if top in extra or name in extra:
             return True
@@ -84,15 +61,14 @@ def install_function_tracer(
             if name in traced_names or not _in_scope(module):
                 return
             traced_names.add(name)
-            from .. import trace_module  # imported lazily; uses the active client
+            from .. import trace_module
             trace_module(module, capture_io=capture_io)
         except Exception:
             pass
 
     class _EvalKitTracingFinder:
-        """MetaPathFinder that wraps each in-scope module's loader to trace on import."""
 
-        def find_spec(self, fullname, path=None, target=None):  # noqa: ANN001
+        def find_spec(self, fullname, path=None, target=None):
             try:
                 for finder in list(sys.meta_path):
                     if finder is self:
@@ -115,14 +91,14 @@ def install_function_tracer(
                         try:
                             real_exec = loader.exec_module
 
-                            def exec_module(module, _real=real_exec):  # noqa: ANN001
+                            def exec_module(module, _real=real_exec):
                                 _real(module)
                                 _trace_loaded(module)
 
-                            loader.exec_module = exec_module  # type: ignore[method-assign]
-                            loader._evalkit_wrapped = True  # type: ignore[attr-defined]
+                            loader.exec_module = exec_module
+                            loader._evalkit_wrapped = True
                         except Exception:
-                            pass  # C loaders / __slots__ — leave untouched
+                            pass
                     return spec
             except Exception:
                 return None
@@ -134,7 +110,6 @@ def install_function_tracer(
     except Exception:
         return
 
-    # Trace anything already imported and in scope (rare at init time, but possible).
     for module in list(sys.modules.values()):
         if isinstance(module, types.ModuleType):
             _trace_loaded(module)

@@ -44,7 +44,6 @@ class TestGoogleGenAI(unittest.TestCase):
         self.assertEqual(llm.events[0].attributes["gen_ai.tool.name"], "get_weather")
 
     def test_client_side_tool_no_child_span(self):
-        # Client-side function tool -> event only, no empty zero-duration child span.
         m = install_fake_genai(self.client, response=GenAIResp(tool=("get_weather", {"city": "london"})))
         m.generate_content(model="g", contents="weather?")
         self.client.flush()
@@ -62,8 +61,6 @@ class TestGoogleGenAI(unittest.TestCase):
         self.assertTrue(llm.attributes.get("gen_ai.streaming"))
 
     def test_streaming_captures_request_and_response_body(self):
-        # Regression test: the streaming path used to never attach body attrs
-        # (only the non-streaming generate_content path did).
         chunks = [GenAIResp(text="Hel"), GenAIResp(text="lo!", pin=0, pout=7)]
         m = install_fake_genai(self.client, stream_chunks=chunks)
         list(m.generate_content_stream(model="g", contents="hi"))
@@ -101,10 +98,6 @@ class TestGoogleGenAI(unittest.TestCase):
         self.assertEqual(llm.attributes.get("gen_ai.usage.reasoning_tokens"), 12)
 
     def test_cached_tokens_captured_non_streaming(self):
-        # Regression test: cached_content_token_count (Gemini's context-cache
-        # discount signal) must be surfaced separately from tokens_in, or
-        # downstream cost math has no way to avoid pricing an entire long,
-        # mostly-cached prompt at the full fresh-input-token rate.
         m = install_fake_genai(self.client, response=GenAIResp(text="42", pin=394505, cached_tokens=392425))
         m.generate_content(model="g", contents="what is 6*7?")
         self.client.flush()

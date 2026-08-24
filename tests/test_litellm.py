@@ -50,7 +50,6 @@ class TestLiteLLM(unittest.TestCase):
         sys.modules.pop("litellm", None)
 
     def test_prefixed_model_preserved(self):
-        """Provider prefix must NOT be stripped — full model name is passed through."""
         self._mod.completion(model="gemini/gemini-2.0-flash", messages=[{"role": "user", "content": "hello"}])
         self.client.flush()
         llm = [e for e in self.captured if e.span_type == "llm_call"]
@@ -59,7 +58,6 @@ class TestLiteLLM(unittest.TestCase):
         self.assertEqual(llm[0].provider, "litellm")
 
     def test_async_prefixed_model_preserved(self):
-        """Async path keeps full model name with prefix; provider is always 'litellm'."""
         asyncio.run(
             self._mod.acompletion(model="anthropic/claude-sonnet-4-6", messages=[{"role": "user", "content": "hi"}])
         )
@@ -76,7 +74,6 @@ class TestLiteLLM(unittest.TestCase):
         self.assertEqual(llm[0].provider, "litellm")
 
     def test_no_cost_attribute_sync(self):
-        """Cost must not be extracted from _hidden_params — no llm.cost_usd in attrs."""
         self._mod.completion(model="gpt-4o-mini", messages=[{"role": "user", "content": "cost"}])
         self.client.flush()
         llm = [e for e in self.captured if e.span_type == "llm_call"][0]
@@ -121,7 +118,7 @@ class TestLiteLLM(unittest.TestCase):
 
     def test_idempotent_no_double_span(self):
         from evalkit.instrumentation.llm.litellm import patch_litellm
-        patch_litellm(self.client)  # second call: no-op via sentinel
+        patch_litellm(self.client)
         self._mod.completion(model="gpt-4o-mini", messages=[])
         self.client.flush()
         llm = [e for e in self.captured if e.span_type == "llm_call"]

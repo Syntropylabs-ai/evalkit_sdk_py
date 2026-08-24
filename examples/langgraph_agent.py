@@ -1,19 +1,3 @@
-"""
-EvalKit + LangGraph demo
-
-Just call evalkit.init() — it registers a global LangChain callback handler, so every
-LangGraph node/chain, LLM/chat-model call, tool, and retriever run is traced automatically
-as a nested span tree (no callbacks=[...] needed). The optional start_trace / trace_function
-calls below add your own custom spans on top.
-
-Install:
-    pip install langgraph langchain-openai openai python-dotenv
-    pip install -e ../../sdk-py
-
-Run:
-    EVALKIT_KEY=tk_live_... OPENAI_API_KEY=sk-... python langgraph_agent.py
-"""
-
 import os
 from dotenv import load_dotenv
 import evalkit
@@ -34,13 +18,10 @@ from typing import TypedDict, Annotated
 import operator
 
 
-# ── Tools (wrapped in trace spans) ───────────────────────────────────────────
-
 @evalkit.trace_function("tool.calculator")
 def calculator(expression: str) -> str:
-    """Evaluate a simple math expression."""
     try:
-        result = eval(expression, {"__builtins__": {}})  # noqa: S307
+        result = eval(expression, {"__builtins__": {}})
         return str(result)
     except Exception as exc:
         return f"Error: {exc}"
@@ -48,11 +29,8 @@ def calculator(expression: str) -> str:
 
 @evalkit.trace_function("tool.lookup")
 def lookup(query: str) -> str:
-    """Simulate a knowledge lookup (stub for demo)."""
     return f"[stub] Top result for '{query}': This is a demo response."
 
-
-# ── State ─────────────────────────────────────────────────────────────────────
 
 class AgentState(TypedDict):
     question: str
@@ -62,8 +40,6 @@ class AgentState(TypedDict):
 
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
-
-# ── Nodes ─────────────────────────────────────────────────────────────────────
 
 def think(state: AgentState) -> AgentState:
     question = state["question"]
@@ -92,8 +68,6 @@ def router(state: AgentState) -> str:
     return "answer"
 
 
-# ── Graph ─────────────────────────────────────────────────────────────────────
-
 builder = StateGraph(AgentState)
 builder.add_node("think", think)
 builder.add_node("use_tool", use_tool)
@@ -102,8 +76,6 @@ builder.add_conditional_edges("think", router, {"use_tool": "use_tool", "answer"
 builder.add_edge("use_tool", END)
 graph = builder.compile()
 
-
-# ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     questions = [

@@ -59,10 +59,6 @@ class TestSQLAlchemy(unittest.TestCase):
         self.assertIn("db.statement", db[0].attributes)
 
     def test_skips_adk_session_tables_but_not_others(self):
-        # Regression test: an ADK-based agent's own DatabaseSessionService
-        # queries `sessions`/`app_states`/`user_states` several times per
-        # turn — near-zero-duration bookkeeping that used to flood a trace
-        # with low-signal spans around every real tool/model call.
         try:
             from sqlalchemy import create_engine, text
         except ImportError:
@@ -190,7 +186,6 @@ class TestPsycopg(unittest.TestCase):
             sys.modules.pop(n, None)
 
     def test_psycopg_execute(self):
-        # patch_psycopg patches psycopg.Cursor.execute — NOT Connection.execute
         psycopg_mod = types.ModuleType("psycopg")
 
         class FakeCursor:
@@ -200,7 +195,7 @@ class TestPsycopg(unittest.TestCase):
                 return None
 
         psycopg_mod.Cursor = FakeCursor
-        psycopg_mod.AsyncCursor = FakeCursor  # same class is fine for this test
+        psycopg_mod.AsyncCursor = FakeCursor
         sys.modules["psycopg"] = psycopg_mod
         self._injected.append("psycopg")
 
@@ -270,7 +265,6 @@ class TestPyMongo(unittest.TestCase):
             sys.modules.pop(n, None)
 
     def test_pymongo_find_one(self):
-        # patch_pymongo patches "find_one", "insert_one", etc. — not bare "find"
         pymongo_mod = types.ModuleType("pymongo")
         collection_mod = types.ModuleType("pymongo.collection")
 
@@ -354,7 +348,6 @@ class TestAsyncSQLAlchemy(unittest.TestCase):
         try:
             asyncio.run(run())
         except Exception as exc:
-            # aiosqlite may not be installed — skip gracefully
             if "aiosqlite" in str(exc) or "No module" in str(exc):
                 self.skipTest("aiosqlite not installed")
             raise
@@ -367,14 +360,11 @@ class TestAsyncSQLAlchemy(unittest.TestCase):
     def test_patch_async_engine_idempotent(self):
         from evalkit.instrumentation.db.sqlalchemy import patch_sqlalchemy_async
 
-        # Simulate an already-instrumented async engine: the guard must bail out
-        # without calling patch_sqlalchemy (which requires a real Engine target).
         class FakeAsyncEngine:
-            _evalkit_instrumented = True  # pre-set — already patched
-            sync_engine = None  # would be None if guard somehow missed
+            _evalkit_instrumented = True
+            sync_engine = None
 
         engine = FakeAsyncEngine()
-        # Must not raise even though sync_engine is None
         patch_sqlalchemy_async(self.client, engine)
         self.assertTrue(engine._evalkit_instrumented)
 

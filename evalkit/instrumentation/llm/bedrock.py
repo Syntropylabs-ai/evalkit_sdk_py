@@ -12,10 +12,6 @@ from ._bodies import _dump, _safe_body
 
 
 def patch_bedrock(client: EvalKitClient, bedrock_runtime_client: Any) -> None:
-    """
-    Patch BedrockRuntimeClient to trace ConverseCommand calls.
-    Intercepts client.converse() which is the unified multi-model Bedrock API.
-    """
     if getattr(bedrock_runtime_client, "_evalkit", False):
         return
 
@@ -126,18 +122,12 @@ def patch_bedrock(client: EvalKitClient, bedrock_runtime_client: Any) -> None:
         ))
         return result
 
-    traced_converse._evalkit = True  # type: ignore[attr-defined]
+    traced_converse._evalkit = True
     bedrock_runtime_client.converse = traced_converse
     bedrock_runtime_client._evalkit = True
 
 
 def _extract_reasoning(content: list) -> "tuple[str, bool]":
-    """Pulls Converse API reasoningContent blocks out of the output message.
-
-    Anthropic (and other reasoning-capable) models on Bedrock surface their
-    chain-of-thought as `{"reasoningContent": {"reasoningText": {"text": ...}}}`;
-    redacted variants carry only an opaque encrypted payload, so we just flag them.
-    """
     parts: list = []
     has_redacted = False
     for c in content or []:

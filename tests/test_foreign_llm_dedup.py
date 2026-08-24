@@ -8,7 +8,6 @@ class _Ctx:
 
 
 class _Span:
-    """Minimal ReadableSpan stand-in (no opentelemetry import needed)."""
 
     def __init__(self, attrs):
         self._a = attrs
@@ -28,7 +27,6 @@ class _Span:
 
 
 def test_foreign_gen_ai_span_defers_for_cost():
-    # Foreign/bridged OTel gen_ai span (e.g. Google ADK) — no evalkit marker.
     foreign = _Span({
         "gen_ai.system": "gemini",
         "gen_ai.request.model": "gemini-2.5-flash",

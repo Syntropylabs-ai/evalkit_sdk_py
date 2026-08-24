@@ -1,4 +1,3 @@
-"""PyMongo + Motor instrumentation → db_query spans (per collection operation)."""
 from __future__ import annotations
 
 from typing import Any
@@ -14,7 +13,6 @@ _METHODS = [
 
 
 def patch_pymongo(client: Any) -> None:
-    # Sync collections
     try:
         from pymongo.collection import Collection
         for name in _METHODS:
@@ -23,7 +21,6 @@ def patch_pymongo(client: Any) -> None:
         pass
     except Exception:
         pass
-    # Motor (async)
     try:
         from motor.motor_asyncio import AsyncIOMotorCollection
         for name in _METHODS:
@@ -54,7 +51,7 @@ def _wrap_sync(client: Any, cls: Any, name: str) -> None:
         return r
 
     try:
-        traced._evalkit = True  # type: ignore[attr-defined]
+        traced._evalkit = True
         setattr(cls, name, traced)
     except Exception:
         pass
@@ -76,7 +73,7 @@ def _wrap_async(client: Any, cls: Any, name: str) -> None:
         return r
 
     try:
-        traced._evalkit = True  # type: ignore[attr-defined]
+        traced._evalkit = True
         setattr(cls, name, traced)
     except Exception:
         pass

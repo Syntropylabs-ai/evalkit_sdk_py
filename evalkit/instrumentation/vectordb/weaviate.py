@@ -1,14 +1,3 @@
-"""Patch ``weaviate.collections.Collection``'s ``query.near_vector`` and
-``data.insert``/``.insert_many`` at the class level (both sync and async
-client variants — weaviate-client ships parallel sync/async implementations).
-
-Same rationale as ``vectordb/pinecone.py`` — makes retrieval calls visible as
-``db_query`` spans. Never captures raw vectors or object ``properties``
-(may contain full document text/PII) — only ids and distance/score metadata.
-
-Degrades to a no-op if ``weaviate-client`` isn't installed and never raises
-into the caller.
-"""
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -38,9 +27,8 @@ def _objects_summary(result: Any) -> List[Dict[str, Any]]:
 
 
 def patch_weaviate(client: "EvalKitClient") -> None:
-    """Patch ``weaviate.collections`` query/data classes (sync + async). Idempotent."""
     try:
-        import weaviate  # noqa: F401
+        import weaviate
     except ImportError:
         return
 
@@ -99,7 +87,7 @@ def _patch_near_vector_sync(ek: "EvalKitClient", QueryCls: Any) -> None:
         end("OK", extra=_query_extra(self, near_vector, kwargs, result))
         return result
 
-    traced_near_vector._evalkit = True  # type: ignore[attr-defined]
+    traced_near_vector._evalkit = True
     QueryCls.near_vector = traced_near_vector
 
 
@@ -122,7 +110,7 @@ def _patch_near_vector_async(ek: "EvalKitClient", QueryCls: Any) -> None:
 
         return _run()
 
-    traced_near_vector._evalkit = True  # type: ignore[attr-defined]
+    traced_near_vector._evalkit = True
     QueryCls.near_vector = traced_near_vector
 
 
@@ -173,7 +161,7 @@ def _patch_insert(ek: "EvalKitClient", DataCls: Any, *, is_async: bool) -> None:
             end("OK", extra=_extra(self), rows=1)
             return result
 
-    traced_insert._evalkit = True  # type: ignore[attr-defined]
+    traced_insert._evalkit = True
     DataCls.insert = traced_insert
 
 
@@ -222,5 +210,5 @@ def _patch_insert_many(ek: "EvalKitClient", DataCls: Any, *, is_async: bool) -> 
             end("ERROR" if failed else "OK", extra=extra, rows=extra.get("db.vector.count"))
             return result
 
-    traced_insert_many._evalkit = True  # type: ignore[attr-defined]
+    traced_insert_many._evalkit = True
     DataCls.insert_many = traced_insert_many

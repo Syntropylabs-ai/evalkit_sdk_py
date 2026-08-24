@@ -5,8 +5,6 @@ from tests.helpers import evalkit
 class TestImport(unittest.TestCase):
     def test_version(self):
         from evalkit._version import SDK_VERSION
-        # Keep the asserted version sourced from the single source of truth so it
-        # can't drift behind pyproject.toml / _version.py again.
         self.assertEqual(evalkit.__version__, SDK_VERSION)
 
     def test_public_api(self):

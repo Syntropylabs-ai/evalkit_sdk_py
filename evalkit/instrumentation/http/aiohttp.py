@@ -10,7 +10,7 @@ from ...core.context import _current_span, current_span_ctx, _in_http_span, get_
 from ...core.types import TraceEnvelope
 from ...utils.headers import make_traceparent, path_from_url, sanitize_headers
 
-_BODY_MAX = 10 * 1024 * 1024  # default; overridden from client options at patch time
+_BODY_MAX = 10 * 1024 * 1024
 _SKIP = {"/v1/ingest", "/health", "/healthz"}
 
 
@@ -19,7 +19,6 @@ def _should_skip(url: str) -> bool:
 
 
 def patch_aiohttp(client: EvalKitClient) -> None:
-    """Patch aiohttp.ClientSession._request to trace every outgoing HTTP call."""
     global _BODY_MAX
     _BODY_MAX = client._opts.max_body_bytes
     try:
@@ -42,9 +41,6 @@ def patch_aiohttp(client: EvalKitClient) -> None:
         if _should_skip(url):
             return await orig_request(self, method, str_or_url, **kwargs)
 
-        # Skip if an outer HTTP wrapper already traced this call — e.g. litellm
-        # routes the OpenAI SDK's httpx client through this aiohttp transport, so
-        # the httpx wrapper already emitted the span for this same request.
         if _in_http_span.get():
             return await orig_request(self, method, str_or_url, **kwargs)
 
@@ -134,5 +130,5 @@ def patch_aiohttp(client: EvalKitClient) -> None:
         ))
         return resp
 
-    traced_request._evalkit = True  # type: ignore[attr-defined]
-    aiohttp.ClientSession._request = traced_request  # type: ignore[method-assign]
+    traced_request._evalkit = True
+    aiohttp.ClientSession._request = traced_request

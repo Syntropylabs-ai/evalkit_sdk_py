@@ -5,7 +5,6 @@ from typing import Callable, Optional
 
 
 class _StreamState:
-    """Shared accumulator/parsing logic for the sync and async stream tracers."""
 
     def __init__(self, start_ms: Optional[float] = None) -> None:
         self.chunks: list[str] = []
@@ -69,9 +68,6 @@ class _StreamState:
                 if usage:
                     self.cache_read_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
                     self.cache_creation_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
-                    # Anthropic's input_tokens excludes cache reads/writes (additive,
-                    # unlike OpenAI) — normalize to inclusive-of-cache like every
-                    # other provider's tokens_in (see llm/anthropic.py).
                     self.tokens_in = (getattr(usage, "input_tokens", 0) or 0) + self.cache_read_tokens + self.cache_creation_tokens
         elif etype == "message_delta":
             usage = getattr(event, "usage", None)
@@ -100,9 +96,9 @@ class _SyncStreamTracer:
                 s.ttft_ms, s.cache_read_tokens, s.cache_creation_tokens,
             )
 
-    def __iter__(self):  # type: ignore[return]
+    def __iter__(self):
         try:
-            for chunk in self._stream:  # type: ignore[union-attr]
+            for chunk in self._stream:
                 if self._is_anthropic:
                     self._state.process_anthropic_chunk(chunk)
                 else:
@@ -113,13 +109,13 @@ class _SyncStreamTracer:
 
     def __enter__(self) -> "_SyncStreamTracer":
         if hasattr(self._stream, "__enter__"):
-            self._stream.__enter__()  # type: ignore[union-attr]
+            self._stream.__enter__()
         return self
 
     def __exit__(self, *args: object) -> object:
         self._finish()
         if hasattr(self._stream, "__exit__"):
-            return self._stream.__exit__(*args)  # type: ignore[union-attr]
+            return self._stream.__exit__(*args)
         return False
 
     def __getattr__(self, name: str) -> object:
@@ -147,9 +143,9 @@ class _AsyncStreamTracer:
                 s.ttft_ms, s.cache_read_tokens, s.cache_creation_tokens,
             )
 
-    async def __aiter__(self):  # type: ignore[return]
+    async def __aiter__(self):
         try:
-            async for chunk in self._stream:  # type: ignore[union-attr]
+            async for chunk in self._stream:
                 if self._is_anthropic:
                     self._state.process_anthropic_chunk(chunk)
                 else:
@@ -160,13 +156,13 @@ class _AsyncStreamTracer:
 
     async def __aenter__(self) -> "_AsyncStreamTracer":
         if hasattr(self._stream, "__aenter__"):
-            await self._stream.__aenter__()  # type: ignore[union-attr]
+            await self._stream.__aenter__()
         return self
 
     async def __aexit__(self, *args: object) -> object:
         self._finish()
         if hasattr(self._stream, "__aexit__"):
-            return await self._stream.__aexit__(*args)  # type: ignore[union-attr]
+            return await self._stream.__aexit__(*args)
         return False
 
     def __getattr__(self, name: str) -> object:

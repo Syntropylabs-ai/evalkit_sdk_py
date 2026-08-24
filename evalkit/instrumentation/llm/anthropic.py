@@ -112,12 +112,6 @@ def patch_anthropic(
         tokens_out = getattr(usage, "output_tokens", 0) or 0
         cache_read_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
         cache_creation_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
-        # Unlike OpenAI/Gemini, Anthropic's input_tokens EXCLUDES cache reads/writes —
-        # all three are separate, additive counts (confirmed in Anthropic's own docs:
-        # "the input count is split across input_tokens, cache_read_input_tokens, and
-        # cache_creation_input_tokens"). Normalize tokens_in to the total here so it's
-        # inclusive-of-cache like every other provider, and downstream cost math (which
-        # subtracts the cache portion back out of tokens_in) works the same way everywhere.
         tokens_in = (getattr(usage, "input_tokens", 0) or 0) + cache_read_tokens + cache_creation_tokens
 
         attrs: Dict[str, Any] = {
@@ -158,16 +152,11 @@ def patch_anthropic(
         ))
         return result
 
-    traced_create._evalkit = True  # type: ignore[attr-defined]
+    traced_create._evalkit = True
     messages_api.create = traced_create
 
 
 def _extract_thinking(blocks: List[Any]) -> "tuple[str, bool]":
-    """Pulls extended-thinking text out of an Anthropic response's content blocks.
-
-    Returns (thinking_text, has_redacted_thinking). Redacted blocks carry only an
-    opaque encrypted payload (no readable text), so we just flag their presence.
-    """
     parts: List[str] = []
     has_redacted = False
     for block in blocks or []:

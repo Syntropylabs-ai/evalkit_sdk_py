@@ -39,7 +39,6 @@ def patch_mcp(client: EvalKitClient) -> None:
     orig = ClientSession.call_tool
 
     async def traced_call_tool(self: Any, name: str, arguments: Any = None, *args: Any, **kwargs: Any) -> Any:
-        # Tracing must never break the tool call: if setup throws, run untraced.
         try:
             ctx = current_span_ctx()
             trace_id = ctx.trace_id if ctx else get_or_create_ambient_trace_id()
@@ -98,5 +97,5 @@ def patch_mcp(client: EvalKitClient) -> None:
             pass
         return result
 
-    traced_call_tool._evalkit = True  # type: ignore[attr-defined]
-    ClientSession.call_tool = traced_call_tool  # type: ignore[method-assign]
+    traced_call_tool._evalkit = True
+    ClientSession.call_tool = traced_call_tool

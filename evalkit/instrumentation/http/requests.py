@@ -11,7 +11,7 @@ from ...core.types import TraceEnvelope
 from ...utils.headers import make_traceparent, path_from_url, sanitize_headers
 
 _SKIP = {"/v1/ingest", "/health", "/healthz"}
-_BODY_MAX = 10 * 1024 * 1024  # default; overridden from client options at patch time
+_BODY_MAX = 10 * 1024 * 1024
 
 
 def _should_skip(url: str) -> bool:
@@ -19,7 +19,6 @@ def _should_skip(url: str) -> bool:
 
 
 def patch_requests(client: EvalKitClient) -> None:
-    """Patch requests.Session.request to trace every outgoing HTTP call."""
     global _BODY_MAX
     _BODY_MAX = client._opts.max_body_bytes
     try:
@@ -37,8 +36,6 @@ def patch_requests(client: EvalKitClient) -> None:
         if _should_skip(url):
             return original(self, method, url, **kwargs)
 
-        # Skip if an outer HTTP wrapper is already tracing this call (one client
-        # delegating to another), to avoid a duplicate http_call span.
         if _in_http_span.get():
             return original(self, method, url, **kwargs)
 
@@ -136,5 +133,5 @@ def patch_requests(client: EvalKitClient) -> None:
         ))
         return resp
 
-    traced_request._evalkit = True  # type: ignore[attr-defined]
-    Session.request = traced_request  # type: ignore[method-assign]
+    traced_request._evalkit = True
+    Session.request = traced_request

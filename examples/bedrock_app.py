@@ -1,20 +1,3 @@
-"""
-EvalKit + AWS Bedrock demo
-
-Just call evalkit.init() — auto-instruments botocore at the class level
-so every bedrock-runtime Converse call is traced automatically.
-
-Install:
-    pip install boto3 python-dotenv
-    pip install -e ../../sdk-py
-
-Configure:
-    aws configure   # or set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
-
-Run:
-    EVALKIT_KEY=tk_live_... AWS_DEFAULT_REGION=us-east-1 python bedrock_app.py
-"""
-
 import os
 from dotenv import load_dotenv
 import boto3

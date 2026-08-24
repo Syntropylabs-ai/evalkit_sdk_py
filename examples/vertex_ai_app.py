@@ -1,24 +1,3 @@
-"""
-EvalKit + Google Vertex AI / google.genai demo
-
-Just call evalkit.init() — auto-instruments google.genai.Models and AsyncModels
-at the class level. Every generate_content() call is traced automatically,
-including calls from Google ADK.
-
-Install:
-    pip install google-genai google-cloud-aiplatform python-dotenv
-    pip install -e ../../sdk-py
-
-Authenticate:
-    gcloud auth application-default login
-
-Run:
-    EVALKIT_KEY=tk_live_...  \\
-    GOOGLE_CLOUD_PROJECT=your-project  \\
-    GOOGLE_GENAI_USE_VERTEXAI=True  \\
-    python vertex_ai_app.py
-"""
-
 import asyncio
 import os
 from dotenv import load_dotenv
@@ -27,7 +6,6 @@ load_dotenv()
 
 import evalkit
 
-# One line — auto-instruments google.genai (sync + async).
 evalkit.init(
     subscription_key=os.environ.get("EVALKIT_KEY", "demo-key"),
     base_url=os.environ.get("EVALKIT_URL", "http://localhost:8085"),

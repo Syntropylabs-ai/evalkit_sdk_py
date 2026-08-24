@@ -1,18 +1,3 @@
-"""Instrumentation for the Claude Agent SDK (claude_agent_sdk).
-
-The Claude Agent SDK runs the actual Anthropic API call in a subprocess (the
-Claude Code CLI), so EvalKit's normal in-process anthropic patch never fires.
-Instead, we wrap the two public entry points that the SDK exposes back to Python:
-
-  • ``query()`` — the stateless async-generator API
-  • ``ClaudeSDKClient.receive_response()`` — the stateful multi-turn API
-
-Both yield a ``ResultMessage`` as their final item, which carries token counts,
-cost, latency, stop reason, and model usage. We read those fields and emit an
-``llm_call`` TraceEnvelope — giving EvalKit full visibility without any change
-to application code.
-"""
-
 from __future__ import annotations
 
 import time
@@ -49,14 +34,6 @@ def _get_attr(obj: Any, *names: str) -> Any:
 
 
 def _extract_text_and_tool_events(blocks: Any, ts: str) -> tuple:
-    """Split an AssistantMessage's content blocks into completion text and
-    tool_use SpanEvents.
-
-    claude_agent_sdk's own TextBlock/ToolUseBlock dataclasses (distinct from
-    anthropic.types' same-named classes) carry no `.type` discriminator field
-    at all — only `anthropic.types` blocks do — so this dispatches on the
-    block's class name instead of a `.type` attribute that doesn't exist here.
-    """
     text = ""
     events: list = []
     for block in (blocks or []):
@@ -81,7 +58,6 @@ async def _traced_gen(
     prompt: str,
     model_hint: str,
 ) -> AsyncIterator[Any]:
-    """Yield messages from *original*, emitting a llm_call span on completion."""
     ctx_parent = current_span_ctx()
     trace_id = ctx_parent.trace_id if ctx_parent else get_or_create_ambient_trace_id()
     span_id = _new_span_id()
@@ -89,7 +65,6 @@ async def _traced_gen(
     start_ms = time.time() * 1000
     ts = _now_iso()
 
-    # Publish the span context so child spans (tool calls, sub-agents) nest here.
     span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
     token = _current_span.set(span_ctx)
 
@@ -197,18 +172,11 @@ async def _traced_gen(
 
 
 def patch_claude_agent_sdk(ek: "EvalKitClient") -> None:
-    """Monkey-patch ``claude_agent_sdk.query`` and ``ClaudeSDKClient.receive_response``
-    to emit ``llm_call`` spans sourced from ``ResultMessage`` usage data.
-
-    Safe to call multiple times — idempotent via the ``_evalkit`` sentinel.
-    No-op if ``claude_agent_sdk`` is not installed.
-    """
     try:
         import claude_agent_sdk as _sdk
     except ImportError:
         return
 
-    # ── patch query() ──────────────────────────────────────────────────────────
     if not getattr(_sdk.query, "_evalkit", False):
         _original_query = _sdk.query
 
@@ -224,10 +192,9 @@ def patch_claude_agent_sdk(ek: "EvalKitClient") -> None:
             original = _original_query(prompt=prompt, options=options, **kwargs)
             return _traced_gen(ek, original, prompt, model_hint)
 
-        _traced_query._evalkit = True  # type: ignore[attr-defined]
+        _traced_query._evalkit = True
         _sdk.query = _traced_query
 
-    # ── patch ClaudeSDKClient.receive_response() ───────────────────────────────
     cls = getattr(_sdk, "ClaudeSDKClient", None)
     if cls is None:
         return
@@ -246,5 +213,5 @@ def patch_claude_agent_sdk(ek: "EvalKitClient") -> None:
         async for msg in _traced_gen(ek, _original_receive(self), prompt, model_hint):
             yield msg
 
-    _traced_receive._evalkit = True  # type: ignore[attr-defined]
+    _traced_receive._evalkit = True
     cls.receive_response = _traced_receive

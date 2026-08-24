@@ -1,9 +1,3 @@
-"""psycopg (v3) instrumentation — raw Postgres, sync + async cursors → db_query spans.
-
-Covers psycopg3 directly (and Django 4.2+ which uses it). psycopg2's cursor is a C
-type that can't be monkey-patched; SQLAlchemy users get psycopg2 coverage via
-patch_sqlalchemy_engine().
-"""
 from __future__ import annotations
 
 from typing import Any
@@ -42,7 +36,7 @@ def _wrap_sync(client: Any, cls: Any) -> None:
         end("OK", rows=getattr(self, "rowcount", None))
         return r
 
-    traced._evalkit = True  # type: ignore[attr-defined]
+    traced._evalkit = True
     cls.execute = traced
 
 
@@ -61,5 +55,5 @@ def _wrap_async(client: Any, cls: Any) -> None:
         end("OK", rows=getattr(self, "rowcount", None))
         return r
 
-    traced._evalkit = True  # type: ignore[attr-defined]
+    traced._evalkit = True
     cls.execute = traced

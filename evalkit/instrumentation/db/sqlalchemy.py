@@ -11,24 +11,10 @@ from ...core.types import TraceEnvelope
 
 _BODY_MAX = 2048
 
-# Tables to never emit a db_query span for — low-signal, near-zero-duration
-# internal bookkeeping that floods a trace without adding debuggable signal.
-# Defaults to Google ADK's own DatabaseSessionService tables: an ADK-based
-# agent hits these several times per turn (session read, app/user state
-# reads, then a write) around every single tool/model call, which is real
-# framework behavior, not something the traced agent's own code chose to do.
-# Mutable — add/remove table names for your own deployment same as the HTTP
-# instrumentation's _SKIP (evalkit.instrumentation.http.*): `from evalkit.instrumentation.db.sqlalchemy
-# import _SKIP_TABLES; _SKIP_TABLES.add("my_table")`.
 _SKIP_TABLES = {"sessions", "app_states", "user_states"}
 
 
 def patch_sqlalchemy(client: EvalKitClient, engine: Any) -> None:
-    """
-    Instrument a SQLAlchemy Engine to trace every query execution.
-    Uses SQLAlchemy's core event system (before_cursor_execute / after_cursor_execute).
-    Works with both Core queries and ORM sessions.
-    """
     try:
         from sqlalchemy import event
     except ImportError:
@@ -148,13 +134,6 @@ def patch_sqlalchemy(client: EvalKitClient, engine: Any) -> None:
 
 
 def patch_sqlalchemy_async(client: EvalKitClient, async_engine: Any) -> None:
-    """
-    Instrument an async SQLAlchemy engine (created with create_async_engine).
-
-    Delegates to patch_sqlalchemy on the underlying sync engine — SQLAlchemy's
-    cursor-level events fire synchronously inside greenlet_spawn even for async
-    drivers, so this captures all queries including those from AsyncSession.
-    """
     if getattr(async_engine, "_evalkit_instrumented", False):
         return
     sync_engine = getattr(async_engine, "sync_engine", None)

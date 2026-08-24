@@ -8,7 +8,7 @@ from .types import TraceEnvelope
 
 _log = logging.getLogger("evalkit")
 
-_started = False  # set_tracer_provider may only run once per process
+_started = False
 
 
 def otel_active() -> bool:
@@ -94,8 +94,8 @@ def _readable_to_envelope(span: Any) -> TraceEnvelope:
         trace_id=format(ctx.trace_id, "032x"),
         span_id=format(ctx.span_id, "016x"),
         parent_span_id=format(parent.span_id, "016x") if parent else None,
-        span_type=span_type,  # type: ignore[arg-type]
-        status=status,  # type: ignore[arg-type]
+        span_type=span_type,
+        status=status,
         operation=span.name,
         service_name=svc_name,
         model=attrs.get("gen_ai.response.model") or attrs.get("gen_ai.request.model"),
@@ -111,20 +111,15 @@ def _readable_to_envelope(span: Any) -> TraceEnvelope:
 
 
 def _register_all_instrumentors(provider: Any) -> None:
-    """Auto-enable EVERY installed OTel community instrumentation (max compatibility),
-    except the libraries EvalKit keeps hand-rolled (_SKIP_INSTRUMENTORS). Uses the
-    standard `opentelemetry_instrumentor` entry-point group — the same discovery
-    mechanism as the `opentelemetry-instrument` CLI. One broken instrumentor never
-    breaks the others or the host."""
     try:
         from importlib.metadata import entry_points
     except Exception:
         return
     try:
         try:
-            eps = list(entry_points(group="opentelemetry_instrumentor"))  # py3.10+
+            eps = list(entry_points(group="opentelemetry_instrumentor"))
         except TypeError:
-            eps = list(entry_points().get("opentelemetry_instrumentor", []))  # py3.9
+            eps = list(entry_points().get("opentelemetry_instrumentor", []))
     except Exception:
         return
     for ep in eps:
@@ -137,11 +132,6 @@ def _register_all_instrumentors(provider: Any) -> None:
 
 
 def setup_otel(client: Any) -> bool:
-    """Put the Python SDK on the OpenTelemetry SDK: an OTel TracerProvider whose spans
-    are mapped to TraceEnvelope and pushed through the existing client pipeline
-    (→ /v1/ingest → dashboard), plus OTel community instrumentation for libraries we
-    don't hand-roll. No-op (returns False) unless opentelemetry-sdk is installed
-    (pip install "syntropylabs-evalkit[otel]"). Never raises into the host."""
     global _started
     if _started:
         return True
@@ -168,7 +158,7 @@ def setup_otel(client: Any) -> bool:
                     _log.debug("otel→envelope failed: %s", exc)
             return SpanExportResult.SUCCESS
 
-        def shutdown(self) -> None:  # noqa: D401
+        def shutdown(self) -> None:
             return None
 
         def force_flush(self, timeout_millis: int = 30000) -> bool:

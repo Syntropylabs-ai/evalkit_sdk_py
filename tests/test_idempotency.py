@@ -11,7 +11,6 @@ from tests.helpers import (
 
 
 class TestIdempotency(unittest.TestCase):
-    """Patching the same provider twice must never emit double spans."""
 
     def setUp(self):
         reset_context()
@@ -26,7 +25,7 @@ class TestIdempotency(unittest.TestCase):
                 return OResp("once")
 
         _patch_openai_class_sync(self.client, FreshCompletions)
-        _patch_openai_class_sync(self.client, FreshCompletions)  # no-op
+        _patch_openai_class_sync(self.client, FreshCompletions)
         FreshCompletions().create(model="gpt-4o-mini", messages=[])
         self.client.flush()
         llm = [e for e in self.captured if e.span_type == "llm_call"]
@@ -40,7 +39,7 @@ class TestIdempotency(unittest.TestCase):
                 return AResp("once")
 
         _auto._patch_anthropic_class_sync(self.client, FreshMessages)
-        _auto._patch_anthropic_class_sync(self.client, FreshMessages)  # no-op
+        _auto._patch_anthropic_class_sync(self.client, FreshMessages)
         FreshMessages().create(model="claude-3-5-sonnet", messages=[{"role": "user", "content": "hi"}])
         self.client.flush()
         llm = [e for e in self.captured if e.span_type == "llm_call"]
@@ -59,7 +58,7 @@ class TestIdempotency(unittest.TestCase):
         try:
             from evalkit.instrumentation.llm.claude_agent_sdk import patch_claude_agent_sdk
             patch_claude_agent_sdk(self.client)
-            patch_claude_agent_sdk(self.client)  # sentinel prevents re-wrap
+            patch_claude_agent_sdk(self.client)
 
             async def run():
                 async for _ in sdk_mod.query(prompt="hi"):
@@ -85,7 +84,7 @@ class TestIdempotency(unittest.TestCase):
         try:
             from evalkit.instrumentation.llm.litellm import patch_litellm
             patch_litellm(self.client)
-            patch_litellm(self.client)  # second call: no-op
+            patch_litellm(self.client)
 
             mod.completion(model="gpt-4o-mini", messages=[])
             self.client.flush()
@@ -97,7 +96,7 @@ class TestIdempotency(unittest.TestCase):
     def test_auto_instrumentation_idempotent(self):
         from evalkit.instrumentation.auto import setup_auto_instrumentation
         setup_auto_instrumentation(self.client)
-        setup_auto_instrumentation(self.client)  # must not raise
+        setup_auto_instrumentation(self.client)
 
     def test_no_crash_noop_patches(self):
         evalkit.patch_langchain()

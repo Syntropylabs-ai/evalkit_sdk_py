@@ -1,4 +1,3 @@
-"""redis-py instrumentation (sync + asyncio) → db_query spans."""
 from __future__ import annotations
 
 from typing import Any
@@ -15,17 +14,15 @@ def _stmt(args) -> str:
 
 def patch_redis(client: Any) -> None:
     try:
-        import redis  # noqa: F401
+        import redis
     except ImportError:
         return
 
-    # Sync client
     try:
         from redis.client import Redis as SyncRedis
         _patch_sync(client, SyncRedis)
     except Exception:
         pass
-    # Async client (redis.asyncio)
     try:
         from redis.asyncio.client import Redis as AsyncRedis
         _patch_async(client, AsyncRedis)
@@ -49,7 +46,7 @@ def _patch_sync(client: Any, cls: Any) -> None:
         end("OK")
         return r
 
-    traced._evalkit = True  # type: ignore[attr-defined]
+    traced._evalkit = True
     cls.execute_command = traced
 
 
@@ -69,5 +66,5 @@ def _patch_async(client: Any, cls: Any) -> None:
         end("OK")
         return r
 
-    traced._evalkit = True  # type: ignore[attr-defined]
+    traced._evalkit = True
     cls.execute_command = traced

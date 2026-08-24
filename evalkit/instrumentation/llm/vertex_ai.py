@@ -11,17 +11,11 @@ from .._toolcalls import from_anthropic_blocks
 from ._bodies import _dump, _safe_body
 
 
-# ── Anthropic on Vertex AI ────────────────────────────────────────────────────
-
 def patch_anthropic_vertex(
     client: EvalKitClient,
     anthropic_vertex_client: Any,
     parent_ctx: Optional[SpanContext] = None,
 ) -> None:
-    """
-    Patch AnthropicVertex.messages.create (same API surface as direct Anthropic client).
-    Import from anthropic-sdk-python package with Vertex AI backend.
-    """
     messages_api = anthropic_vertex_client.messages
     if getattr(messages_api.create, "_evalkit", False):
         return
@@ -88,8 +82,6 @@ def patch_anthropic_vertex(
         tokens_out = getattr(usage, "output_tokens", 0) or 0
         cache_read_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
         cache_creation_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
-        # See llm/anthropic.py: Anthropic's input_tokens excludes cache reads/writes
-        # (additive, unlike OpenAI/Gemini) — normalize to inclusive-of-cache here.
         tokens_in = (getattr(usage, "input_tokens", 0) or 0) + cache_read_tokens + cache_creation_tokens
 
         attrs: Dict[str, Any] = {
@@ -126,19 +118,14 @@ def patch_anthropic_vertex(
         ))
         return result
 
-    traced_create._evalkit = True  # type: ignore[attr-defined]
+    traced_create._evalkit = True
     messages_api.create = traced_create
 
-
-# ── Google Cloud Vertex AI GenerativeModel ────────────────────────────────────
 
 def patch_vertex_generative_model(
     client: EvalKitClient,
     model: Any,
 ) -> None:
-    """
-    Patch a vertexai.generative_models.GenerativeModel instance to trace generate_content calls.
-    """
     if getattr(model.generate_content, "_evalkit", False):
         return
 
@@ -201,10 +188,6 @@ def patch_vertex_generative_model(
         usage_metadata = getattr(result, "usage_metadata", None)
         tokens_in = getattr(usage_metadata, "prompt_token_count", 0) or 0
         tokens_out = getattr(usage_metadata, "candidates_token_count", 0) or 0
-        # Subset of tokens_in Gemini served from its (much cheaper) context
-        # cache — already included in tokens_in, never additive. Surfaced
-        # separately so downstream cost math isn't forced to price an entire
-        # long, mostly-cached prompt at the full fresh-input-token rate.
         cached_tokens = getattr(usage_metadata, "cached_content_token_count", 0) or 0
 
         attrs: Dict[str, Any] = {
@@ -247,7 +230,7 @@ def patch_vertex_generative_model(
         ))
         return result
 
-    traced_generate_content._evalkit = True  # type: ignore[attr-defined]
+    traced_generate_content._evalkit = True
     model.generate_content = traced_generate_content
 
 

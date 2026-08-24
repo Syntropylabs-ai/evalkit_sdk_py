@@ -1,19 +1,3 @@
-"""LangChain / LangGraph instrumentation.
-
-LangGraph is built on LangChain Core, so a single LangChain ``BaseCallbackHandler``
-captures every chain/node, LLM, chat model, tool, and retriever run in a LangGraph
-graph. The handler is registered **globally** by patching
-``BaseCallbackManager.__init__`` to add it as an inheritable handler on every
-callback manager LangChain constructs, so — true to ``init()`` does everything —
-the user never has to pass ``callbacks=[...]``.
-
-The handler builds the span tree from LangChain's own ``run_id`` / ``parent_run_id``
-graph (independent of ContextVar timing across async tasks), and nests the whole
-graph under any active evalkit trace (e.g. an HTTP request or a simulation scenario).
-
-Nothing here imports LangChain at module top level; everything degrades to a no-op
-if LangChain is not installed, and no callback may ever raise into the host graph.
-"""
 from __future__ import annotations
 
 import logging
@@ -34,7 +18,6 @@ _log = logging.getLogger("evalkit")
 
 _ATTR_MAX = 4096
 
-# Module-level sentinel so the BaseCallbackManager.__init__ patch is only applied once.
 _registered = False
 
 
@@ -50,7 +33,6 @@ def _provider_from_serialized(serialized: Any) -> Optional[str]:
     try:
         ident = (serialized or {}).get("id")
         if isinstance(ident, list) and ident:
-            # e.g. ["langchain","chat_models","openai","ChatOpenAI"]
             for token in ("openai", "anthropic", "google", "vertexai", "cohere", "mistral", "bedrock", "ollama", "groq"):
                 if token in ident:
                     return token if token != "vertexai" else "vertex-ai"
@@ -61,7 +43,6 @@ def _provider_from_serialized(serialized: Any) -> Optional[str]:
 
 
 def _model_from(serialized: Any, kwargs: Dict[str, Any]) -> str:
-    # invocation_params is the most reliable source at call time.
     inv = (kwargs or {}).get("invocation_params") or {}
     for key in ("model", "model_name", "model_id", "deployment_name"):
         v = inv.get(key)
@@ -76,7 +57,6 @@ def _model_from(serialized: Any, kwargs: Dict[str, Any]) -> str:
 
 
 def _messages_to_prompt(messages: Any) -> str:
-    # messages: List[List[BaseMessage]] (one inner list per generation batch).
     parts: List[str] = []
     try:
         batch = messages[0] if messages else []
@@ -117,7 +97,6 @@ def _llm_result_tokens(response: Any):
     except Exception:
         pass
     if not (tokens_in or tokens_out):
-        # Newer LangChain attaches usage_metadata to the AIMessage.
         try:
             for batch in (getattr(response, "generations", None) or []):
                 for g in batch:
@@ -138,7 +117,6 @@ def _build_handler(client: "EvalKitClient"):
         return None
 
     class EvalKitLangChainHandler(BaseCallbackHandler):
-        """Maps LangChain/LangGraph runs to evalkit spans. Never raises."""
 
         raise_error = False
 
@@ -146,7 +124,6 @@ def _build_handler(client: "EvalKitClient"):
             self._runs: Dict[str, Dict[str, Any]] = {}
             self._lock = Lock()
 
-        # ── span lifecycle ────────────────────────────────────────────────
         def _start(
             self,
             run_id: Any,
@@ -231,8 +208,8 @@ def _build_handler(client: "EvalKitClient"):
                     trace_id=rec["trace_id"],
                     span_id=rec["span_id"],
                     parent_span_id=rec["parent_span_id"],
-                    span_type=rec["span_type"],  # type: ignore[arg-type]
-                    status=status,  # type: ignore[arg-type]
+                    span_type=rec["span_type"],
+                    status=status,
                     status_message=status_message,
                     operation=rec["operation"],
                     service_name=client._opts.service_name,
@@ -257,7 +234,6 @@ def _build_handler(client: "EvalKitClient"):
             except Exception as exc:
                 _log.debug("[evalkit] langchain end failed: %s", exc)
 
-        # ── chains / graph nodes ──────────────────────────────────────────
         def on_chain_start(self, serialized, inputs, *, run_id, parent_run_id=None, tags=None, metadata=None, **kwargs):
             name = None
             if isinstance(serialized, dict):
@@ -274,7 +250,6 @@ def _build_handler(client: "EvalKitClient"):
         def on_chain_error(self, error, *, run_id, **kwargs):
             self._end(run_id, status="ERROR", status_message=str(error))
 
-        # ── LLMs / chat models ────────────────────────────────────────────
         def on_llm_start(self, serialized, prompts, *, run_id, parent_run_id=None, **kwargs):
             model = _model_from(serialized, kwargs)
             provider = _provider_from_serialized(serialized)
@@ -313,7 +288,6 @@ def _build_handler(client: "EvalKitClient"):
         def on_llm_error(self, error, *, run_id, **kwargs):
             self._end(run_id, status="ERROR", status_message=str(error))
 
-        # ── tools ─────────────────────────────────────────────────────────
         def on_tool_start(self, serialized, input_str, *, run_id, parent_run_id=None, **kwargs):
             name = None
             if isinstance(serialized, dict):
@@ -331,7 +305,6 @@ def _build_handler(client: "EvalKitClient"):
             self._start(run_id, parent_run_id, "tool_call", str(name), attrs=attrs)
 
         def on_tool_end(self, output, *, run_id, **kwargs):
-            # output may be a ToolMessage (newer LangChain) or a raw string/value
             if hasattr(output, "content"):
                 raw = output.content
             else:
@@ -345,7 +318,6 @@ def _build_handler(client: "EvalKitClient"):
         def on_tool_error(self, error, *, run_id, **kwargs):
             self._end(run_id, status="ERROR", status_message=str(error))
 
-        # ── retrievers ────────────────────────────────────────────────────
         def on_retriever_start(self, serialized, query, *, run_id, parent_run_id=None, **kwargs):
             name = None
             if isinstance(serialized, dict):
@@ -367,28 +339,6 @@ def _build_handler(client: "EvalKitClient"):
 
 
 def patch_langchain(client: "EvalKitClient") -> Optional[Any]:
-    """Register a global evalkit callback handler for LangChain / LangGraph.
-
-    Wraps ``BaseCallbackManager.__init__`` so every callback manager LangChain
-    constructs — for any chain/graph run, regardless of whether the caller
-    passed ``callbacks=[...]`` — gets the evalkit handler added as an
-    inheritable handler, exactly the technique OpenLIT and OpenLLMetry/Traceloop
-    use. This replaced an earlier version built on
-    ``langchain_core.callbacks.manager.register_configure_hook``: that function
-    was removed in the LangChain 1.0 stabilization release (confirmed via a
-    live install of langchain-core 1.5.0 — the import raises `ImportError`,
-    which the old code's ``except Exception: return handler`` swallowed
-    silently, so the handler was built but never actually attached to
-    anything and zero spans were ever emitted). ``BaseCallbackManager.__init__``
-    is core plumbing every LangChain version constructs internally regardless
-    of whichever global-hook API does or doesn't exist in that version, so
-    this is resilient to exactly the kind of breaking change that broke the
-    old approach.
-
-    Idempotent and dependency-free: if LangChain is not installed, this is a
-    silent no-op. Returns the handler instance (also usable manually via
-    ``callbacks=[handler]``) or ``None``.
-    """
     global _registered
 
     handler = _build_handler(client)
@@ -420,8 +370,8 @@ def patch_langchain(client: "EvalKitClient") -> Optional[Any]:
             except Exception as exc:
                 _log.debug("[evalkit] langchain handler injection failed: %s", exc)
 
-        patched_init._evalkit = True  # type: ignore[attr-defined]
-        BaseCallbackManager.__init__ = patched_init  # type: ignore[method-assign]
+        patched_init._evalkit = True
+        BaseCallbackManager.__init__ = patched_init
         _registered = True
     except Exception as exc:
         _log.debug("[evalkit] langchain global registration failed: %s", exc)

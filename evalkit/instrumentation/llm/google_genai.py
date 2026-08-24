@@ -1,18 +1,3 @@
-"""Patch google.genai (new unified Google AI SDK, used by Google ADK) at the class level.
-
-Unlike the instance-level patchers, this patches Models and AsyncModels **classes**
-so every Client instance — including those created internally by Google ADK — is traced.
-
-Covers both the unary (`generate_content`) and streaming (`generate_content_stream`)
-methods, sync and async, so ADK runs (which fan out across many internal Gemini calls
-and sub-agents) are captured regardless of the run mode.
-
-Usage:
-    import evalkit
-    evalkit.init(...)
-    # auto-instrumented by init(); manual call is also available:
-    evalkit.patch_google_genai()   # works for ADK, direct genai, etc.
-"""
 from __future__ import annotations
 
 import json
@@ -35,13 +20,6 @@ if TYPE_CHECKING:
 
 
 def patch_google_genai(client: EvalKitClient) -> None:
-    """
-    Patch google.genai.Models and google.genai.AsyncModels at the class level.
-
-    This intercepts every `client.models.generate_content[_stream]()` call across ALL
-    google.genai Client instances, including those created by Google ADK internally.
-    Call once at startup after evalkit.init(). Safe to call repeatedly (idempotent).
-    """
     try:
         from google.genai import models as _gm
     except ImportError:
@@ -51,14 +29,9 @@ def patch_google_genai(client: EvalKitClient) -> None:
     _patch_async_models(client, _gm)
 
 
-# ── extraction helpers ────────────────────────────────────────────────────────
-
-
 def _extract_prompt(contents: Any, config: Any = None) -> str:
-    """Convert google.genai contents to a readable prompt string."""
     parts: List[str] = []
 
-    # System instruction from config
     if config is not None:
         si = getattr(config, "system_instruction", None)
         if si:
@@ -99,12 +72,6 @@ def _extract_prompt(contents: Any, config: Any = None) -> str:
 
 
 def _extract_completion(response: Any) -> str:
-    """Pull text from a generate_content response, joining all non-thought text parts.
-
-    When the model returns only function calls (no text), we return a compact
-    JSON summary of the calls so the span is never silently empty. Thinking
-    (``part.thought``) parts are excluded here — see ``_extract_thinking``.
-    """
     text_parts: List[str] = []
     fn_parts: List[str] = []
     try:
@@ -134,7 +101,6 @@ def _extract_completion(response: Any) -> str:
         return "".join(text_parts)
     if fn_parts:
         return "\n".join(fn_parts)
-    # Fall back to the .text shortcut.
     try:
         text = getattr(response, "text", None)
         if text:
@@ -145,8 +111,6 @@ def _extract_completion(response: Any) -> str:
 
 
 def _extract_thinking(response: Any) -> str:
-    """Pull Gemini's extended-thinking text (``part.thought`` parts) out of a
-    generate_content response or streaming chunk. Never raises."""
     parts: List[str] = []
     try:
         for candidate in (getattr(response, "candidates", None) or []):
@@ -164,16 +128,10 @@ def _extract_thinking(response: Any) -> str:
 
 
 def _extract_tool_events(response: Any, ts: str) -> List[SpanEvent]:
-    """Extract function calls from response as SpanEvent list."""
     return from_google_parts(response, ts)
 
 
 def _usage_tokens(response: Any):
-    """Return (input_tokens, output_tokens, reasoning_tokens, cached_tokens) from a response
-    or streaming chunk. `cached_tokens` is the subset of input_tokens Gemini served from its
-    (much cheaper) context cache — it's already included in input_tokens, never additive.
-    Surfaced separately (gen_ai.usage.cached_tokens attribute) so downstream cost math isn't
-    forced to price an entire long, mostly-cached prompt at full fresh-input-token rate."""
     meta = getattr(response, "usage_metadata", None)
     if meta is None:
         return 0, 0, 0, 0
@@ -185,13 +143,6 @@ def _usage_tokens(response: Any):
 
 
 def _resolve_trace(ek: EvalKitClient):
-    """Resolve (trace_id, parent_span_id, session_id, device_id) for a new llm_call.
-
-    Falls back to the context's ambient trace id (NOT a brand-new id) when there
-    is no active span, so the many internal Gemini calls an ADK run makes share a
-    single trace instead of each fragmenting into its own. Pins the ambient id so
-    sequential sibling calls in the same execution context join too.
-    """
     ctx_parent = current_span_ctx()
     if ctx_parent is not None:
         trace_id = ctx_parent.trace_id
@@ -216,8 +167,6 @@ def _dump(o: Any) -> Any:
 
 
 def _safe_body(obj: Any, limit: int = 16384) -> Optional[str]:
-    """Best-effort JSON of a request/response object for the trace body. Never raises;
-    truncated to keep the span small (the exporter's fitEvent drops it first anyway)."""
     if obj is None:
         return None
     import json as _json
@@ -309,11 +258,7 @@ def _build_envelope(
     )
 
 
-# ── sync patchers ──────────────────────────────────────────────────────────────
-
-
 def _patch_sync_models(ek: EvalKitClient, gm: Any) -> None:
-    """Patch google.genai.Models.{generate_content,generate_content_stream}."""
     Models = getattr(gm, "Models", None)
     if Models is None:
         return
@@ -372,7 +317,7 @@ def _patch_sync_models(ek: EvalKitClient, gm: Any) -> None:
             ))
             return result
 
-        traced_generate_content._evalkit = True  # type: ignore[attr-defined]
+        traced_generate_content._evalkit = True
         Models.generate_content = traced_generate_content
 
     if not getattr(getattr(Models, "generate_content_stream", None), "_evalkit", False):
@@ -459,15 +404,11 @@ def _patch_sync_models(ek: EvalKitClient, gm: Any) -> None:
 
                 return _gen()
 
-            traced_generate_content_stream._evalkit = True  # type: ignore[attr-defined]
+            traced_generate_content_stream._evalkit = True
             Models.generate_content_stream = traced_generate_content_stream
 
 
-# ── async patchers ─────────────────────────────────────────────────────────────
-
-
 def _patch_async_models(ek: EvalKitClient, gm: Any) -> None:
-    """Patch google.genai.AsyncModels.{generate_content,generate_content_stream}."""
     AsyncModels = getattr(gm, "AsyncModels", None)
     if AsyncModels is None:
         return
@@ -526,7 +467,7 @@ def _patch_async_models(ek: EvalKitClient, gm: Any) -> None:
             ))
             return result
 
-        traced_generate_content_async._evalkit = True  # type: ignore[attr-defined]
+        traced_generate_content_async._evalkit = True
         AsyncModels.generate_content = traced_generate_content_async
 
     if not getattr(getattr(AsyncModels, "generate_content_stream", None), "_evalkit", False):
@@ -613,5 +554,5 @@ def _patch_async_models(ek: EvalKitClient, gm: Any) -> None:
 
                 return _agen()
 
-            traced_generate_content_stream_async._evalkit = True  # type: ignore[attr-defined]
+            traced_generate_content_stream_async._evalkit = True
             AsyncModels.generate_content_stream = traced_generate_content_stream_async

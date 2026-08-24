@@ -32,7 +32,6 @@ class TestSimulateUser(unittest.TestCase):
         self.assertTrue(sim_spans)
         self.assertTrue(all(e.simulation_id == report["simulation_id"] for e in sim_spans))
         scenario_roots = [e for e in self.captured if (e.operation or "").startswith("scenario:")]
-        # All scenarios in the same simulate_user() call share one ambient trace.
         self.assertEqual(len({e.trace_id for e in scenario_roots}), 1)
 
     def test_async_entrypoint(self):

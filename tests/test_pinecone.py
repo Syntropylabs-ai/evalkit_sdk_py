@@ -34,7 +34,6 @@ class TestPinecone(unittest.TestCase):
         self.assertEqual(db[0].attributes["db.vector.top_k"], 5)
         self.assertEqual(db[0].attributes["db.vector.match_count"], 2)
         self.assertIn("gen_ai.response.body", db[0].attributes)
-        # Raw vector floats must never be captured.
         self.assertNotIn("0.1", db[0].attributes.get("gen_ai.request.body", ""))
 
     def test_query_error_emits_error_span(self):

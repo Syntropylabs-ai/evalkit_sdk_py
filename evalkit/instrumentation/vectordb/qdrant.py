@@ -1,13 +1,3 @@
-"""Patch ``qdrant_client.QdrantClient.query_points``/``.upsert`` at the class level.
-
-Same rationale as ``vectordb/pinecone.py`` — makes retrieval calls visible as
-``db_query`` spans instead of invisible-until-the-LLM-call-downstream. Never
-captures raw vectors — only IDs, scores, and (small, useful-for-debugging)
-payload/filter metadata.
-
-Degrades to a no-op if ``qdrant-client`` isn't installed and never raises into
-the caller.
-"""
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -24,7 +14,7 @@ def _points_summary(response: Any) -> List[Dict[str, Any]]:
     try:
         points = getattr(response, "points", None)
         if points is None:
-            points = response  # some qdrant calls return a bare list of ScoredPoint
+            points = response
         for p in points or []:
             out.append({"id": getattr(p, "id", None), "score": getattr(p, "score", None)})
     except Exception:
@@ -33,7 +23,6 @@ def _points_summary(response: Any) -> List[Dict[str, Any]]:
 
 
 def patch_qdrant(client: "EvalKitClient") -> None:
-    """Patch ``qdrant_client.QdrantClient``. Idempotent."""
     try:
         from qdrant_client import QdrantClient
     except ImportError:
@@ -77,7 +66,7 @@ def _patch_query(ek: "EvalKitClient", QdrantClient: Any) -> None:
         end("OK", extra=extra, rows=len(points))
         return result
 
-    traced_query_points._evalkit = True  # type: ignore[attr-defined]
+    traced_query_points._evalkit = True
     QdrantClient.query_points = traced_query_points
 
 
@@ -108,5 +97,5 @@ def _patch_upsert(ek: "EvalKitClient", QdrantClient: Any) -> None:
         end("OK", extra=extra, rows=point_count)
         return result
 
-    traced_upsert._evalkit = True  # type: ignore[attr-defined]
+    traced_upsert._evalkit = True
     QdrantClient.upsert = traced_upsert

@@ -1,6 +1,3 @@
-"""Shared helper for DB-driver instrumentation — builds a `db_query` span that
-nests under the active trace (or the ambient one), following the same attribute
-conventions as the SQLAlchemy patcher."""
 from __future__ import annotations
 
 import re
@@ -36,7 +33,6 @@ def start_db(
     operation: Optional[str] = None,
     table: Optional[str] = None,
 ) -> Callable[..., None]:
-    """Open a db_query span. Returns an `end(status, error, extra, rows)` closure."""
     ctx = current_span_ctx()
     trace_id = ctx.trace_id if ctx else get_or_create_ambient_trace_id()
     parent_span_id = ctx.span_id if ctx else None
@@ -83,6 +79,6 @@ def start_db(
                 sdk_version=SDK_VERSION,
             ))
         except Exception:
-            pass  # tracing must never break the query
+            pass
 
     return end

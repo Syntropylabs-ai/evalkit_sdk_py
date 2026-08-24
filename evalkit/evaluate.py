@@ -1,9 +1,3 @@
-"""
-Offline evaluation metrics — computed locally without LLM calls.
-
-Results are pushed as a span to the trace service for observability when
-the EvalKit SDK has been initialised via evalkit.init().
-"""
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -21,13 +15,7 @@ OFFLINE_METRICS = frozenset(
 )
 
 
-# ---------------------------------------------------------------------------
-# Individual metric implementations
-# ---------------------------------------------------------------------------
-
-
 def _lcs_length(a: List[str], b: List[str]) -> int:
-    """Return the length of the Longest Common Subsequence of a and b."""
     m, n = len(a), len(b)
     dp = [[0] * (n + 1) for _ in range(m + 1)]
     for i in range(1, m + 1):
@@ -140,15 +128,10 @@ def _score_contextual_recall(
     return covered / len(expected), {"covered": covered, "total": len(expected)}
 
 
-# ---------------------------------------------------------------------------
-# Public evaluate() function
-# ---------------------------------------------------------------------------
-
-
 def evaluate(
     output: str,
     *,
-    input: Optional[str] = None,  # noqa: A002  (shadows builtin intentionally)
+    input: Optional[str] = None,
     expected_output: Optional[str] = None,
     tool_calls: Optional[List[Dict[str, Any]]] = None,
     expected_tools: Optional[List[str]] = None,
@@ -157,54 +140,6 @@ def evaluate(
     constraints: Optional[Dict[str, Any]] = None,
     metrics: Optional[List[str]] = None,
 ) -> Dict[str, float]:
-    """
-    Compute offline evaluation metrics locally without any LLM call.
-
-    Results are returned as a dict of metric_name → score (0.0–1.0).
-    If the EvalKit SDK is initialised, scores are also pushed as an
-    ``eval_result`` span so they appear in the trace service dashboard.
-
-    Parameters
-    ----------
-    output:
-        The agent or model output to evaluate. Required.
-    input:
-        The original user query (optional, logged for context).
-    expected_output:
-        Reference / expected output (reserved for future metrics).
-    tool_calls:
-        List of ``{"name": str, "args": {...}}`` dicts representing
-        the actual tool calls made by the agent.
-    expected_tools:
-        Ordered list of expected tool names.
-    retrieved_context:
-        Retrieved RAG context chunks (list of strings).
-    expected_context:
-        Expected / relevant context chunks (list of strings).
-    constraints:
-        Dict with optional keys: ``required_terms`` (list[str]),
-        ``has_citations`` (bool), ``slide_count`` (int).
-    metrics:
-        Which metrics to compute. Defaults to all applicable metrics.
-
-    Returns
-    -------
-    dict[str, float]
-        Metric name → score mapping for all computed metrics.
-
-    Example
-    -------
-    >>> import evalkit
-    >>> evalkit.init(subscription_key="tk_live_...")
-    >>> scores = evalkit.evaluate(
-    ...     output="The answer covers AWS and Azure.",
-    ...     expected_tools=["search", "render"],
-    ...     tool_calls=[{"name": "search"}, {"name": "render"}],
-    ...     constraints={"required_terms": ["AWS", "Azure"]},
-    ... )
-    >>> scores["tool_f1"]   # 1.0
-    >>> scores["response_match"]  # 1.0
-    """
     requested = set(metrics) if metrics else set(OFFLINE_METRICS)
 
     actual_tool_names = [t["name"] for t in (tool_calls or [])]
@@ -257,9 +192,8 @@ def evaluate(
         scores["contextual_recall"] = s
         details["contextual_recall"] = d
 
-    # Push scores as an eval_result span when the SDK is initialised
     try:
-        from . import _get_instance  # type: ignore[attr-defined]
+        from . import _get_instance
 
         client = _get_instance()
         span_attrs: Dict[str, Any] = {
@@ -271,7 +205,7 @@ def evaluate(
 
         end_fn, _ = client.start_span("evaluation", span_attrs)
         end_fn("OK")
-    except Exception:  # SDK not initialised or any other error — skip silently
+    except Exception:
         pass
 
     return scores

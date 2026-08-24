@@ -138,12 +138,11 @@ class TestManualSpans(unittest.TestCase):
         mul.__module__ = "ek_fake_svc"
         mod.add = add
         mod.mul = mul
-        mod.dumps = _json.dumps  # imported FunctionType -> must be skipped (different __module__)
+        mod.dumps = _json.dumps
 
         count = evalkit.trace_module(mod)
         self.assertEqual(count, 2, "should wrap only the 2 functions defined in this module")
 
-        # behaviour preserved
         self.assertEqual(mod.add(2, 3), 5)
         self.assertEqual(mod.mul(2, 3), 6)
         self.client.flush()
@@ -153,7 +152,6 @@ class TestManualSpans(unittest.TestCase):
         self.assertIn("ek_fake_svc.add", ops)
         self.assertIn("ek_fake_svc.mul", ops)
         self.assertNotIn("ek_fake_svc.dumps", ops)
-        # I/O captured on at least one
         add_span = next(e for e in fns if e.operation == "ek_fake_svc.add")
         self.assertIn("function.args", add_span.attributes or {})
         self.assertIn("function.result", add_span.attributes or {})
@@ -178,12 +176,11 @@ class TestManualSpans(unittest.TestCase):
             )
         sys.path.insert(0, tmp)
         try:
-            import ek_fake_pkg  # noqa: F401
+            import ek_fake_pkg
             n = evalkit.trace_package(ek_fake_pkg)
             self.assertGreaterEqual(n, 2, "should wrap functions across the package's submodules")
 
             import ek_fake_pkg.services as svc
-            # wrapping preserved behaviour
             self.assertEqual(svc.place("o-1"), {"placed": "o-1"})
             self.assertEqual(svc.cancel("c-1"), "c-1")
             self.client.flush()

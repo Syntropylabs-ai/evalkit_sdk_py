@@ -1,21 +1,3 @@
-"""Single source of truth for tool-call extraction.
-
-Every provider/agent instrumentation funnels through here to turn a raw LLM
-response into a list of ``gen_ai.tool.call`` ``SpanEvent`` objects. Previously
-this logic was copy-pasted across ~18 sites and drifted out of sync; centralizing
-it means a fix or a new field lands in exactly one place.
-
-The emitted attribute keys MUST stay in lock-step with
-``EvalKitClient._maybe_emit_tool_spans`` (core/client.py), which promotes each
-event into a first-class child ``tool_call`` span:
-    gen_ai.tool.name            -> tool.name
-    gen_ai.tool.call.arguments  -> tool.arguments
-    gen_ai.tool.call.id         -> (kept as-is)
-    gen_ai.tool.call.result     -> tool.result
-
-Nothing here may ever raise into the host application: every extractor wraps its
-body in try/except and degrades to ``[]``.
-"""
 from __future__ import annotations
 
 import json
@@ -35,8 +17,6 @@ def _truncate(value: Any, limit: int = _ARGS_MAX) -> str:
 
 
 def _to_json(value: Any) -> str:
-    """Serialize tool arguments. Strings pass through unchanged (they are already
-    JSON from OpenAI-style providers); everything else is json-dumped."""
     if isinstance(value, str):
         return value
     try:
@@ -53,11 +33,6 @@ def tool_event(
     result: Optional[Any] = None,
     ts: str,
 ) -> Optional[SpanEvent]:
-    """Build ONE ``gen_ai.tool.call`` SpanEvent — the only place these are made.
-
-    Returns ``None`` for a falsy ``name`` so callers uniformly skip nameless calls.
-    ``gen_ai.tool.call.result`` is included only when ``result`` is not None.
-    """
     try:
         if not name:
             return None
@@ -73,10 +48,7 @@ def tool_event(
         return None
 
 
-# ── Shape 1: OpenAI Chat Completions (also Groq / LiteLLM / Mistral) ───────────
-
 def from_openai_chat(result: Any, ts: str) -> List[SpanEvent]:
-    """choices[*].message.tool_calls[*] with .id, .function.name, .function.arguments"""
     events: List[SpanEvent] = []
     try:
         for choice in (getattr(result, "choices", None) or []):
@@ -96,10 +68,7 @@ def from_openai_chat(result: Any, ts: str) -> List[SpanEvent]:
     return events
 
 
-# ── Shape 2: Anthropic content blocks (also Vertex Claude / Claude Agent SDK) ──
-
 def from_anthropic_blocks(blocks: Any, ts: str) -> List[SpanEvent]:
-    """blocks where type=="tool_use" with .id, .name, .input. Handles dict or object."""
     events: List[SpanEvent] = []
     try:
         for block in (blocks or []):
@@ -123,10 +92,7 @@ def from_anthropic_blocks(blocks: Any, ts: str) -> List[SpanEvent]:
     return events
 
 
-# ── Shape 3: Google GenAI parts ───────────────────────────────────────────────
-
 def from_google_parts(result: Any, ts: str) -> List[SpanEvent]:
-    """candidates[*].content.parts[*].function_call with .name, .args (no native id)."""
     events: List[SpanEvent] = []
     try:
         for candidate in (getattr(result, "candidates", None) or []):
@@ -155,10 +121,7 @@ def from_google_parts(result: Any, ts: str) -> List[SpanEvent]:
     return events
 
 
-# ── Shape 4: OpenAI Responses API ─────────────────────────────────────────────
-
 def _responses_citations(output_items: list) -> str:
-    """URL citations live on message-type items under content[*].annotations[*]."""
     citations: List[str] = []
     try:
         for item in output_items:
@@ -178,9 +141,6 @@ def _responses_citations(output_items: list) -> str:
 
 
 def from_openai_responses(items: Any, ts: str) -> List[SpanEvent]:
-    """output[*]: type=="function_call" -> {call_id|id, name, arguments};
-    type endswith "_call" (e.g. web_search_call) -> {id, type[:-5], action.query},
-    with URL citations attached as the call result."""
     events: List[SpanEvent] = []
     try:
         output_items = list(items or [])
@@ -213,10 +173,7 @@ def from_openai_responses(items: Any, ts: str) -> List[SpanEvent]:
     return events
 
 
-# ── Shape 5: LangChain / LangGraph AIMessage ──────────────────────────────────
-
 def from_langchain_message(message: Any, ts: str) -> List[SpanEvent]:
-    """message.tool_calls[*] — each a dict or object with name/args/id."""
     events: List[SpanEvent] = []
     try:
         for tc in (getattr(message, "tool_calls", None) or []):
@@ -237,7 +194,6 @@ def from_langchain_message(message: Any, ts: str) -> List[SpanEvent]:
 
 
 def from_langchain_result(response: Any, ts: str) -> List[SpanEvent]:
-    """Walk an LLMResult's generations[*][*].message and extract from each."""
     events: List[SpanEvent] = []
     try:
         for batch in (getattr(response, "generations", None) or []):
@@ -250,11 +206,7 @@ def from_langchain_result(response: Any, ts: str) -> List[SpanEvent]:
     return events
 
 
-# ── Auto-detect dispatcher (tests + shape-agnostic callers) ───────────────────
-
 def extract_tool_events(result: Any, ts: str) -> List[SpanEvent]:
-    """Best-effort shape detection. Prefer the named extractors when the provider
-    is known; use this only when it isn't."""
     try:
         if getattr(result, "choices", None) is not None:
             return from_openai_chat(result, ts)
