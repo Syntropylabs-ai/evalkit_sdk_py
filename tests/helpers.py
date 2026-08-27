@@ -56,15 +56,18 @@ class _Candidate:
 
 
 class _GenAIUsage:
-    def __init__(self, pin, pout, thoughts=0, cached=0):
+    def __init__(self, pin, pout, thoughts=0, cached=0, tool_use=0, total=0):
         self.prompt_token_count = pin
         self.candidates_token_count = pout
         self.thoughts_token_count = thoughts
         self.cached_content_token_count = cached
+        self.tool_use_prompt_token_count = tool_use
+        self.total_token_count = total
 
 
 class GenAIResp:
-    def __init__(self, text="", tool=None, pin=3, pout=5, thinking=None, thoughts_tokens=0, cached_tokens=0):
+    def __init__(self, text="", tool=None, pin=3, pout=5, thinking=None, thoughts_tokens=0,
+                 cached_tokens=0, tool_use_tokens=0, total_tokens=0):
         parts = []
         if thinking:
             parts.append(_Part(text=thinking, thought=True))
@@ -73,7 +76,8 @@ class GenAIResp:
         if tool:
             parts.append(_Part(function_call=_FC(tool[0], tool[1])))
         self.candidates = [_Candidate(parts)]
-        self.usage_metadata = _GenAIUsage(pin, pout, thoughts=thoughts_tokens, cached=cached_tokens)
+        self.usage_metadata = _GenAIUsage(pin, pout, thoughts=thoughts_tokens, cached=cached_tokens,
+                                          tool_use=tool_use_tokens, total=total_tokens)
         self.text = text
 
 
@@ -138,6 +142,223 @@ def install_fake_anthropic(client, resp):
 
     _auto._patch_anthropic_class_sync(client, FakeMessages)
     return FakeMessages()
+
+
+class ACacheUsage(AUsage):
+    def __init__(self, i, o, cache_read=0, cache_creation=0):
+        super().__init__(i, o)
+        self.cache_read_input_tokens = cache_read
+        self.cache_creation_input_tokens = cache_creation
+
+
+class FakeMessageStream:
+    def __init__(self, snapshot, snapshot_error=None):
+        self._snapshot = snapshot
+        self._snapshot_error = snapshot_error
+        self.forced_drain = False
+        self.closed = False
+
+    @property
+    def current_message_snapshot(self):
+        if self._snapshot_error is not None:
+            raise self._snapshot_error
+        return self._snapshot
+
+    def __iter__(self):
+        return iter(())
+
+    def get_final_message(self):
+        self.forced_drain = True
+        return self._snapshot
+
+    def close(self):
+        self.closed = True
+
+
+class FakeAsyncMessageStream(FakeMessageStream):
+    def __aiter__(self):
+        async def _gen():
+            if False:
+                yield None
+
+        return _gen()
+
+    async def get_final_message(self):
+        self.forced_drain = True
+        return self._snapshot
+
+
+class FakeStreamManager:
+    def __init__(self, stream, enter_error=None):
+        self.stream_obj = stream
+        self.enter_error = enter_error
+        self.entered = False
+        self.exited = False
+
+    def __enter__(self):
+        self.entered = True
+        if self.enter_error is not None:
+            raise self.enter_error
+        return self.stream_obj
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.exited = True
+        return False
+
+
+class FakeAsyncStreamManager(FakeStreamManager):
+    async def __aenter__(self):
+        self.entered = True
+        if self.enter_error is not None:
+            raise self.enter_error
+        return self.stream_obj
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        self.exited = True
+        return False
+
+
+class FakeStreamMessages:
+    def __init__(self, manager, resp=None):
+        self._manager = manager
+        self._resp = resp
+        self.stream_kwargs = None
+
+    def create(self, *a, **k):
+        return self._resp
+
+    def stream(self, *a, **k):
+        self.stream_kwargs = k
+        return self._manager
+
+
+class FakeAsyncStreamMessages(FakeStreamMessages):
+    async def create(self, *a, **k):
+        return self._resp
+
+
+def install_fake_anthropic_streaming(client, manager, resp=None, flavor="sync"):
+    from evalkit.instrumentation.llm.anthropic import patch_anthropic
+    from evalkit.instrumentation.llm.anthropic_async import patch_async_anthropic
+    from evalkit.instrumentation.llm.vertex_ai import patch_anthropic_vertex
+
+    messages = (FakeAsyncStreamMessages if flavor == "async" else FakeStreamMessages)(
+        manager, resp if resp is not None else AResp()
+    )
+    fake_client = types.SimpleNamespace(messages=messages)
+    {"sync": patch_anthropic, "async": patch_async_anthropic, "vertex": patch_anthropic_vertex}[flavor](
+        client, fake_client
+    )
+    return messages
+
+
+def install_fake_anthropic_class_stream(client, manager):
+    from evalkit.instrumentation import auto as _auto
+
+    class FakeMessages:
+        def stream(self, *a, **k):
+            self.stream_kwargs = k
+            return manager
+
+    _auto._patch_anthropic_stream_sync(client, FakeMessages)
+    return FakeMessages()
+
+
+def stream_usage(**fields):
+    return types.SimpleNamespace(**fields)
+
+
+class OStreamToolCall:
+    def __init__(self, index, id=None, name=None, arguments=None):
+        self.index = index
+        self.id = id
+        self.type = "function"
+        self.function = (
+            types.SimpleNamespace(name=name, arguments=arguments)
+            if (name is not None or arguments is not None) else None
+        )
+
+
+class OStreamToolDelta:
+    def __init__(self, content=None, tool_calls=None, refusal=None, function_call=None):
+        self.content = content
+        self.tool_calls = tool_calls
+        self.refusal = refusal
+        self.function_call = function_call
+
+
+class OStreamToolChoice:
+    def __init__(self, content=None, tool_calls=None, refusal=None,
+                 finish_reason=None, function_call=None):
+        self.delta = OStreamToolDelta(content, tool_calls, refusal, function_call)
+        self.finish_reason = finish_reason
+        self.index = 0
+
+
+class OStreamToolChunk:
+    def __init__(self, content=None, tool_calls=None, refusal=None, finish_reason=None,
+                 usage=None, id="chatcmpl-stream", model="gpt-4o-mini", function_call=None):
+        self.choices = [OStreamToolChoice(content, tool_calls, refusal, finish_reason, function_call)]
+        self.usage = usage
+        self.id = id
+        self.model = model
+
+
+class AStreamMessageStart:
+    def __init__(self, input_tokens=0, output_tokens=0, cache_read=None, cache_creation=None,
+                 id="msg_stream", model="claude-sonnet-4-5"):
+        usage_fields = {"input_tokens": input_tokens, "output_tokens": output_tokens}
+        if cache_read is not None:
+            usage_fields["cache_read_input_tokens"] = cache_read
+        if cache_creation is not None:
+            usage_fields["cache_creation_input_tokens"] = cache_creation
+        self.type = "message_start"
+        self.message = types.SimpleNamespace(
+            id=id, model=model, usage=types.SimpleNamespace(**usage_fields),
+        )
+
+
+class AStreamBlockStart:
+    def __init__(self, index, type="tool_use", name=None, id=None, text=None):
+        self.type = "content_block_start"
+        self.index = index
+        fields = {"type": type}
+        if name is not None:
+            fields["name"] = name
+        if id is not None:
+            fields["id"] = id
+        if text is not None:
+            fields["text"] = text
+        self.content_block = types.SimpleNamespace(**fields)
+
+
+class AStreamTextDelta:
+    def __init__(self, text, index=0):
+        self.type = "content_block_delta"
+        self.index = index
+        self.delta = types.SimpleNamespace(type="text_delta", text=text)
+
+
+class AStreamJsonDelta:
+    def __init__(self, index, partial_json):
+        self.type = "content_block_delta"
+        self.index = index
+        self.delta = types.SimpleNamespace(type="input_json_delta", partial_json=partial_json)
+
+
+class AStreamMessageDelta:
+    def __init__(self, output_tokens=0, stop_reason=None, input_tokens=None,
+                 cache_read=None, cache_creation=None):
+        usage_fields = {"output_tokens": output_tokens}
+        if input_tokens is not None:
+            usage_fields["input_tokens"] = input_tokens
+        if cache_read is not None:
+            usage_fields["cache_read_input_tokens"] = cache_read
+        if cache_creation is not None:
+            usage_fields["cache_creation_input_tokens"] = cache_creation
+        self.type = "message_delta"
+        self.usage = types.SimpleNamespace(**usage_fields)
+        self.delta = types.SimpleNamespace(stop_reason=stop_reason)
 
 
 class OCompletionTokensDetails:

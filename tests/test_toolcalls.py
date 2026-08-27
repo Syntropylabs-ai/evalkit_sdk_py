@@ -79,6 +79,26 @@ class TestAnthropicBlocks(unittest.TestCase):
     def test_text_only(self):
         self.assertEqual(tc.from_anthropic_blocks(AResp(text="hi").content, TS), [])
 
+    def test_server_tool_use_blocks_are_tool_calls_too(self):
+        blocks = [{"type": "server_tool_use", "name": "web_search", "id": "srvtoolu_1",
+                   "input": {"query": "weather"}}]
+        events = tc.from_anthropic_blocks(blocks, TS)
+        self.assertEqual(
+            len(events), 1,
+            "web_search, web_fetch and code_execution come back as server_tool_use rather than tool_use; skipping "
+            "that type meant a Claude call that really did search the web recorded no tool activity at all",
+        )
+        self.assertEqual(events[0].attributes["gen_ai.tool.name"], "web_search")
+        self.assertEqual(json.loads(events[0].attributes["gen_ai.tool.call.arguments"]), {"query": "weather"})
+
+    def test_other_block_types_are_still_skipped(self):
+        blocks = [{"type": "text", "text": "hi"}, {"type": "thinking", "thinking": "hmm"},
+                  {"type": "tool_result", "content": "42"}]
+        self.assertEqual(
+            tc.from_anthropic_blocks(blocks, TS), [],
+            "widening the accepted block types must not turn text or thinking blocks into phantom tool calls",
+        )
+
 
 class TestGoogleParts(unittest.TestCase):
     def test_function_call(self):

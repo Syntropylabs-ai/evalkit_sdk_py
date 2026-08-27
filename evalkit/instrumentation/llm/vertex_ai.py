@@ -7,8 +7,12 @@ from ..._version import SDK_VERSION
 from ...core.client import EvalKitClient, _new_span_id, _now_iso
 from ...core.context import SpanContext, _current_span, current_span_ctx, get_or_create_ambient_trace_id
 from ...core.types import SpanEvent, TraceEnvelope
-from .._toolcalls import from_anthropic_blocks
+from .._google_usage import EMPTY_GOOGLE_USAGE, extract_google_usage, google_usage_attrs, merge_google_usage
+from .._streaming import _StreamState, _SyncStreamTracer, stream_response_attrs, stream_tool_events
+from .._toolcalls import from_anthropic_blocks, from_google_parts
+from ._anthropic_stream import patch_messages_stream
 from ._bodies import _dump, _safe_body
+from .google_genai import _extract_completion, _extract_thinking
 
 
 def patch_anthropic_vertex(
@@ -17,15 +21,13 @@ def patch_anthropic_vertex(
     parent_ctx: Optional[SpanContext] = None,
 ) -> None:
     messages_api = anthropic_vertex_client.messages
+    patch_messages_stream(client, messages_api, "anthropic-vertex", parent_ctx)
     if getattr(messages_api.create, "_evalkit", False):
         return
 
     original_create = messages_api.create
 
     def traced_create(*args: Any, **kwargs: Any) -> Any:
-        if kwargs.get("stream"):
-            return original_create(*args, **kwargs)
-
         ctx_parent = parent_ctx or current_span_ctx()
         trace_id = ctx_parent.trace_id if ctx_parent else get_or_create_ambient_trace_id()
         span_id = _new_span_id()
@@ -45,6 +47,58 @@ def patch_anthropic_vertex(
         parts.extend(f"{m.get('role', '')}: {m.get('content', '')}" for m in messages)
         prompt_text = "\n".join(parts)
         request_body = _safe_body(_dump(kwargs))
+
+        if kwargs.get("stream"):
+            state = _StreamState(start_ms)
+
+            def on_stream_done(
+                completion: str, tokens_in: int, tokens_out: int,
+                thinking: str, reasoning_tokens: int, has_redacted_thinking: bool,
+                ttft_ms: Optional[int],
+                cache_read_tokens: int = 0, cache_creation_tokens: int = 0,
+                error: Optional[BaseException] = None,
+            ) -> None:
+                end_ts = _now_iso()
+                latency = int(time.time() * 1000 - start_ms)
+                stream_attrs: Dict[str, Any] = {
+                    **client._meta_attrs(),
+                    "gen_ai.request.model": model,
+                    "gen_ai.streaming": True,
+                }
+                if request_body:
+                    stream_attrs["gen_ai.request.body"] = request_body
+                if temperature is not None:
+                    stream_attrs["gen_ai.request.temperature"] = temperature
+                if max_tokens is not None:
+                    stream_attrs["gen_ai.request.max_tokens"] = max_tokens
+                if thinking:
+                    stream_attrs["gen_ai.response.thinking"] = thinking
+                if has_redacted_thinking:
+                    stream_attrs["gen_ai.response.has_redacted_thinking"] = True
+                if ttft_ms is not None:
+                    stream_attrs["gen_ai.server.time_to_first_token_ms"] = ttft_ms
+                stream_attrs.update(stream_response_attrs(state))
+                client.enqueue(TraceEnvelope(
+                    trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
+                    span_type="llm_call",
+                    status="ERROR" if error is not None else "OK",
+                    status_message=str(error) if error is not None else None,
+                    operation="messages.create",
+                    service_name=client._opts.service_name, provider="anthropic-vertex", model=model,
+                    prompt=prompt_text, completion=completion,
+                    tokens_in=tokens_in, tokens_out=tokens_out,
+                    cache_read_tokens=cache_read_tokens or None,
+                    cache_creation_tokens=cache_creation_tokens or None,
+                    latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
+                    events=stream_tool_events(state, end_ts) or None,
+                    attributes=stream_attrs,
+                    environment=client._opts.environment, app_version=client._opts.app_version,
+                    sdk_version=SDK_VERSION,
+                ))
+            return _SyncStreamTracer(
+                original_create(*args, **kwargs), on_stream_done,
+                is_anthropic=True, start_ms=start_ms, state=state,
+            )
 
         span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
         token = _current_span.set(span_ctx)
@@ -153,6 +207,103 @@ def patch_vertex_generative_model(
         prompt_text = _vertex_contents_to_text(contents)
         request_body = _safe_body({"contents": _dump(contents), **({"config": _dump(kwargs)} if kwargs else {})})
 
+        if kwargs.get("stream"):
+            try:
+                stream = original(contents, **kwargs)
+            except Exception as exc:
+                end_ts = _now_iso()
+                client.enqueue(TraceEnvelope(
+                    trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
+                    span_type="llm_call", status="ERROR", status_message=str(exc),
+                    operation="generate_content",
+                    service_name=client._opts.service_name, provider="vertex-ai", model=model_name,
+                    prompt=prompt_text, latency_ms=int(time.time() * 1000 - start_ms),
+                    start_time=ts, end_time=end_ts, created_at=ts,
+                    attributes={**client._meta_attrs(), "gen_ai.request.model": model_name,
+                                "gen_ai.streaming": True,
+                                **({"gen_ai.request.body": request_body} if request_body else {})},
+                    environment=client._opts.environment, app_version=client._opts.app_version,
+                    sdk_version=SDK_VERSION,
+                ))
+                raise
+
+            def _gen():
+                text_parts: List[str] = []
+                thinking_parts: List[str] = []
+                chunk_dumps: List[Any] = []
+                events: List[SpanEvent] = []
+                usage = EMPTY_GOOGLE_USAGE
+                ttft_ms: Optional[int] = None
+                status = "OK"
+                status_message: Optional[str] = None
+                try:
+                    for chunk in stream:
+                        try:
+                            t = _extract_completion(chunk)
+                            if t:
+                                if ttft_ms is None:
+                                    ttft_ms = int(time.time() * 1000 - start_ms)
+                                text_parts.append(t)
+                            th = _extract_thinking(chunk)
+                            if th:
+                                if ttft_ms is None:
+                                    ttft_ms = int(time.time() * 1000 - start_ms)
+                                thinking_parts.append(th)
+                            usage = merge_google_usage(
+                                usage, extract_google_usage(getattr(chunk, "usage_metadata", None)),
+                            )
+                            evs = from_google_parts(chunk, _now_iso())
+                            if evs:
+                                events.extend(evs)
+                            chunk_dumps.append(_dump(chunk))
+                        except Exception:
+                            pass
+                        yield chunk
+                except Exception as exc:
+                    status, status_message = "ERROR", str(exc)
+                    raise
+                finally:
+                    try:
+                        end_ts = _now_iso()
+                        stream_attrs: Dict[str, Any] = {
+                            **client._meta_attrs(),
+                            "gen_ai.request.model": model_name,
+                            "gen_ai.response.model": model_name,
+                            "gen_ai.streaming": True,
+                            **google_usage_attrs(usage),
+                        }
+                        if temperature is not None:
+                            stream_attrs["gen_ai.request.temperature"] = temperature
+                        if max_tokens is not None:
+                            stream_attrs["gen_ai.request.max_tokens"] = max_tokens
+                        if ttft_ms is not None and status == "OK":
+                            stream_attrs["gen_ai.server.time_to_first_token_ms"] = ttft_ms
+                        if thinking_parts:
+                            stream_attrs["gen_ai.response.thinking"] = "".join(thinking_parts)
+                        if request_body:
+                            stream_attrs["gen_ai.request.body"] = request_body
+                        response_body = _safe_body(chunk_dumps) if chunk_dumps else None
+                        if response_body:
+                            stream_attrs["gen_ai.response.body"] = response_body
+                        client.enqueue(TraceEnvelope(
+                            trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
+                            span_type="llm_call", status=status, status_message=status_message,
+                            operation="generate_content",
+                            service_name=client._opts.service_name, provider="vertex-ai", model=model_name,
+                            prompt=prompt_text, completion="".join(text_parts),
+                            tokens_in=usage.tokens_in, tokens_out=usage.tokens_out,
+                            cache_read_tokens=usage.cached_tokens or None,
+                            latency_ms=int(time.time() * 1000 - start_ms),
+                            start_time=ts, end_time=end_ts, created_at=ts,
+                            events=events or None, attributes=stream_attrs,
+                            environment=client._opts.environment, app_version=client._opts.app_version,
+                            sdk_version=SDK_VERSION,
+                        ))
+                    except Exception:
+                        pass
+
+            return _gen()
+
         span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
         token = _current_span.set(span_ctx)
         try:
@@ -179,25 +330,21 @@ def patch_vertex_generative_model(
         end_ts = _now_iso()
         latency = int(time.time() * 1000 - start_ms)
 
-        completion = ""
-        try:
-            completion = result.text or ""
-        except Exception:
-            pass
+        completion = _extract_completion(result)
+        thinking_text = _extract_thinking(result)
+        events: List[SpanEvent] = from_google_parts(result, end_ts)
 
-        usage_metadata = getattr(result, "usage_metadata", None)
-        tokens_in = getattr(usage_metadata, "prompt_token_count", 0) or 0
-        tokens_out = getattr(usage_metadata, "candidates_token_count", 0) or 0
-        cached_tokens = getattr(usage_metadata, "cached_content_token_count", 0) or 0
+        usage = extract_google_usage(getattr(result, "usage_metadata", None))
+        tokens_in = usage.tokens_in
+        tokens_out = usage.tokens_out
+        cached_tokens = usage.cached_tokens
 
         attrs: Dict[str, Any] = {
             **client._meta_attrs(),
             "gen_ai.request.model": model_name,
             "gen_ai.response.model": model_name,
-            "gen_ai.usage.total_tokens": tokens_in + tokens_out,
+            **google_usage_attrs(usage),
         }
-        if cached_tokens:
-            attrs["gen_ai.usage.cached_tokens"] = cached_tokens
         try:
             candidates = getattr(result, "candidates", None) or []
             if candidates:
@@ -210,6 +357,8 @@ def patch_vertex_generative_model(
             attrs["gen_ai.request.temperature"] = temperature
         if max_tokens is not None:
             attrs["gen_ai.request.max_tokens"] = max_tokens
+        if thinking_text:
+            attrs["gen_ai.response.thinking"] = thinking_text
         if request_body:
             attrs["gen_ai.request.body"] = request_body
         response_body = _safe_body(_dump(result))
@@ -224,7 +373,7 @@ def patch_vertex_generative_model(
             prompt=prompt_text, completion=completion,
             tokens_in=tokens_in, tokens_out=tokens_out, cache_read_tokens=cached_tokens or None,
             latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
-            attributes=attrs,
+            events=events or None, attributes=attrs,
             environment=client._opts.environment, app_version=client._opts.app_version,
             sdk_version=SDK_VERSION,
         ))
@@ -232,6 +381,27 @@ def patch_vertex_generative_model(
 
     traced_generate_content._evalkit = True
     model.generate_content = traced_generate_content
+
+
+def _safe_attr(obj: Any, name: str) -> Any:
+    try:
+        return getattr(obj, name, None)
+    except Exception:
+        return None
+
+
+def _vertex_item_text(item: Any) -> str:
+    texts: List[str] = []
+    for part in (_safe_attr(item, "parts") or []):
+        t = _safe_attr(part, "text")
+        if t:
+            texts.append(str(t))
+    if not texts:
+        t = _safe_attr(item, "text")
+        return str(t) if t else ""
+    role = _safe_attr(item, "role")
+    body = "".join(texts)
+    return f"{role}: {body}" if role else body
 
 
 def _vertex_contents_to_text(contents: Any) -> str:
@@ -245,8 +415,12 @@ def _vertex_contents_to_text(contents: Any) -> str:
             elif isinstance(item, dict):
                 parts.append(item.get("text", str(item)))
             else:
-                text = getattr(item, "text", None)
+                text = _vertex_item_text(item)
                 if text:
-                    parts.append(str(text))
+                    parts.append(text)
         return "\n".join(parts)
+    if contents is not None and not isinstance(contents, (int, float, bool)):
+        text = _vertex_item_text(contents)
+        if text:
+            return text
     return str(contents)

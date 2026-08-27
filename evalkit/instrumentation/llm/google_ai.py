@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from ..._version import SDK_VERSION
 from ...core.client import EvalKitClient, _new_span_id, _now_iso
 from ...core.context import SpanContext, _current_span, current_span_ctx, get_or_create_ambient_trace_id
-from ...core.types import TraceEnvelope
+from ...core.types import SpanEvent, TraceEnvelope
+from .._google_usage import google_usage_attrs
+from .._streaming import _StreamState, _SyncStreamTracer
+from .._toolcalls import from_stream_tool_calls
 from ._bodies import _dump, _safe_body
 
 
@@ -23,6 +26,7 @@ def patch_google_ai(client: EvalKitClient, model: Any) -> None:
         parent_span_id = ctx_parent.span_id if ctx_parent else None
         start_ms = time.time() * 1000
         ts = _now_iso()
+        streaming = bool(kwargs.get("stream"))
 
         model_name = getattr(model, "model_name", "unknown")
         generation_config = kwargs.get("generation_config", {})
@@ -38,6 +42,59 @@ def patch_google_ai(client: EvalKitClient, model: Any) -> None:
         prompt_text = _contents_to_text(contents)
         request_body = _safe_body({"contents": _dump(contents), **({"config": _dump(kwargs)} if kwargs else {})})
 
+        def base_attrs() -> Dict[str, Any]:
+            attrs: Dict[str, Any] = {
+                **client._meta_attrs(),
+                "gen_ai.request.model": model_name,
+            }
+            if temperature is not None:
+                attrs["gen_ai.request.temperature"] = temperature
+            if max_tokens is not None:
+                attrs["gen_ai.request.max_tokens"] = max_tokens
+            if request_body:
+                attrs["gen_ai.request.body"] = request_body
+            if streaming:
+                attrs["gen_ai.streaming"] = True
+            return attrs
+
+        def emit(
+            state: _StreamState, *, completion: str, thinking: str, response_body: Optional[str],
+            safety_ratings: List[Dict[str, str]], ttft_ms: Optional[int],
+            error: Optional[BaseException],
+        ) -> None:
+            end_ts = _now_iso()
+            latency = int(time.time() * 1000 - start_ms)
+            attrs = base_attrs()
+            attrs["gen_ai.response.model"] = state.response_model or model_name
+            attrs.update(google_usage_attrs(state.google_usage))
+            if thinking:
+                attrs["gen_ai.response.thinking"] = thinking
+            if state.finish_reasons:
+                attrs["gen_ai.response.finish_reasons"] = list(state.finish_reasons)
+            if ttft_ms is not None:
+                attrs["gen_ai.server.time_to_first_token_ms"] = ttft_ms
+            if safety_ratings:
+                import json
+                attrs["gen_ai.response.safety_ratings"] = json.dumps(safety_ratings)
+            if response_body:
+                attrs["gen_ai.response.body"] = response_body
+            events: List[SpanEvent] = from_stream_tool_calls(state.tool_calls, ts)
+            client.enqueue(TraceEnvelope(
+                trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
+                span_type="llm_call",
+                status="ERROR" if error is not None else "OK",
+                status_message=str(error) if error is not None else None,
+                operation="generate_content",
+                service_name=client._opts.service_name, provider="google-ai", model=model_name,
+                prompt=prompt_text, completion=completion,
+                tokens_in=state.tokens_in, tokens_out=state.tokens_out,
+                cache_read_tokens=state.cache_read_tokens or None,
+                latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
+                attributes=attrs, events=events or None,
+                environment=client._opts.environment, app_version=client._opts.app_version,
+                sdk_version=SDK_VERSION,
+            ))
+
         span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
         token = _current_span.set(span_ctx)
         try:
@@ -52,8 +109,7 @@ def patch_google_ai(client: EvalKitClient, model: Any) -> None:
                 service_name=client._opts.service_name, provider="google-ai", model=model_name,
                 prompt=prompt_text, latency_ms=latency, start_time=ts, end_time=end_ts,
                 created_at=ts,
-                attributes={**client._meta_attrs(), "gen_ai.request.model": model_name,
-                            **({"gen_ai.request.body": request_body} if request_body else {})},
+                attributes=base_attrs(),
                 environment=client._opts.environment, app_version=client._opts.app_version,
                 sdk_version=SDK_VERSION,
             ))
@@ -61,68 +117,66 @@ def patch_google_ai(client: EvalKitClient, model: Any) -> None:
         finally:
             _current_span.reset(token)
 
-        end_ts = _now_iso()
-        latency = int(time.time() * 1000 - start_ms)
+        if streaming:
+            state = _StreamState(start_ms)
 
-        completion = ""
+            def on_stream_done(
+                completion: str, tokens_in: int, tokens_out: int, thinking: str,
+                reasoning_tokens: int, has_redacted_thinking: bool, ttft_ms: Optional[int],
+                cache_read_tokens: int, cache_creation_tokens: int,
+                error: Optional[BaseException],
+            ) -> None:
+                emit(
+                    state, completion=completion, thinking=thinking, response_body="",
+                    safety_ratings=[], ttft_ms=ttft_ms, error=error,
+                )
+
+            return _SyncStreamTracer(
+                result, on_stream_done, start_ms=start_ms,
+                process=_StreamState.process_google_legacy_chunk, state=state,
+            )
+
+        state = _StreamState()
         try:
-            completion = result.text or ""
+            state.process_google_legacy_chunk(result)
         except Exception:
             pass
-
-        usage_metadata = getattr(result, "usage_metadata", None)
-        tokens_in = getattr(usage_metadata, "prompt_token_count", 0) or 0
-        tokens_out = getattr(usage_metadata, "candidates_token_count", 0) or 0
-        cached_tokens = getattr(usage_metadata, "cached_content_token_count", 0) or 0
-
-        safety_ratings = []
-        try:
-            for candidate in (result.candidates or []):
-                for sr in (getattr(candidate, "safety_ratings", []) or []):
-                    safety_ratings.append({
-                        "category": str(getattr(sr, "category", "")),
-                        "probability": str(getattr(sr, "probability", "")),
-                    })
-        except Exception:
-            pass
-
-        attrs: Dict[str, Any] = {
-            **client._meta_attrs(),
-            "gen_ai.request.model": model_name,
-            "gen_ai.response.model": model_name,
-            "gen_ai.usage.total_tokens": tokens_in + tokens_out,
-        }
-        if cached_tokens:
-            attrs["gen_ai.usage.cached_tokens"] = cached_tokens
-        if temperature is not None:
-            attrs["gen_ai.request.temperature"] = temperature
-        if max_tokens is not None:
-            attrs["gen_ai.request.max_tokens"] = max_tokens
-        if safety_ratings:
-            import json
-            attrs["gen_ai.response.safety_ratings"] = json.dumps(safety_ratings)
-        if request_body:
-            attrs["gen_ai.request.body"] = request_body
-        response_body = _safe_body(_dump(result))
-        if response_body:
-            attrs["gen_ai.response.body"] = response_body
-
-        client.enqueue(TraceEnvelope(
-            trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-            span_type="llm_call", status="OK",
-            operation="generate_content",
-            service_name=client._opts.service_name, provider="google-ai", model=model_name,
-            prompt=prompt_text, completion=completion,
-            tokens_in=tokens_in, tokens_out=tokens_out, cache_read_tokens=cached_tokens or None,
-            latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
-            attributes=attrs,
-            environment=client._opts.environment, app_version=client._opts.app_version,
-            sdk_version=SDK_VERSION,
-        ))
+        emit(
+            state,
+            completion="".join(state.chunks) or _fallback_text(state, result),
+            thinking="".join(state.thinking_chunks),
+            response_body=_safe_body(_dump(result)),
+            safety_ratings=_safety_ratings(result),
+            ttft_ms=None,
+            error=None,
+        )
         return result
 
     traced_generate_content._evalkit = True
     model.generate_content = traced_generate_content
+
+
+def _fallback_text(state: _StreamState, result: Any) -> str:
+    if state.thinking_chunks or state.tool_calls:
+        return ""
+    try:
+        return result.text or ""
+    except Exception:
+        return ""
+
+
+def _safety_ratings(result: Any) -> List[Dict[str, str]]:
+    ratings: List[Dict[str, str]] = []
+    try:
+        for candidate in (result.candidates or []):
+            for sr in (getattr(candidate, "safety_ratings", []) or []):
+                ratings.append({
+                    "category": str(getattr(sr, "category", "")),
+                    "probability": str(getattr(sr, "probability", "")),
+                })
+    except Exception:
+        pass
+    return ratings
 
 
 def _contents_to_text(contents: Any) -> str:

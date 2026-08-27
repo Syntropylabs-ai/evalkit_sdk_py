@@ -148,10 +148,20 @@ def init(
     device_id: Optional[str] = None,
     function_tracing: bool = True,
     trace_packages: Optional[List[str]] = None,
+    capture_content: Optional[bool] = None,
+    capture_sensitive_headers: Optional[bool] = None,
+    capture_stream_bodies: Optional[bool] = None,
+    mask: Optional[Callable[[TraceEnvelope], Optional[TraceEnvelope]]] = None,
 ) -> EvalKitClient:
     global _instance
     if _instance is not None:
         return _instance
+    from .core.redact import (
+        resolve_capture_content,
+        resolve_capture_sensitive_headers,
+        resolve_capture_stream_bodies,
+    )
+    from .utils.headers import set_capture_sensitive_headers
     opts = EvalKitOptions(
         subscription_key=subscription_key,
         base_url=base_url,
@@ -165,7 +175,12 @@ def init(
         environment=environment,
         app_version=app_version,
         device_id=device_id,
+        capture_content=resolve_capture_content(capture_content),
+        capture_sensitive_headers=resolve_capture_sensitive_headers(capture_sensitive_headers),
+        capture_stream_bodies=resolve_capture_stream_bodies(capture_stream_bodies),
+        mask=mask,
     )
+    set_capture_sensitive_headers(opts.capture_sensitive_headers)
     _instance = EvalKitClient(opts)
 
     try:

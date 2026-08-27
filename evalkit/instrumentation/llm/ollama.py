@@ -133,7 +133,7 @@ def _patch_sync(ek: "EvalKitClient", Client: Any) -> None:
                     attrs = {**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True}
                     if thinking_parts:
                         attrs["gen_ai.response.thinking"] = "".join(thinking_parts)
-                    if ttft_ms is not None:
+                    if ttft_ms is not None and status == "OK":
                         attrs["gen_ai.server.time_to_first_token_ms"] = ttft_ms
                     if req_body:
                         attrs["gen_ai.request.body"] = req_body
@@ -262,7 +262,7 @@ def _patch_async(ek: "EvalKitClient", AsyncClient: Any) -> None:
                     attrs = {**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True}
                     if thinking_parts:
                         attrs["gen_ai.response.thinking"] = "".join(thinking_parts)
-                    if ttft_ms is not None:
+                    if ttft_ms is not None and status == "OK":
                         attrs["gen_ai.server.time_to_first_token_ms"] = ttft_ms
                     if req_body:
                         attrs["gen_ai.request.body"] = req_body

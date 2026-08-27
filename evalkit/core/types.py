@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional
 
 
 @dataclass
@@ -140,3 +140,7 @@ class EvalKitOptions:
     environment: Optional[str] = None
     app_version: Optional[str] = None
     device_id: Optional[str] = None
+    capture_content: bool = True
+    capture_sensitive_headers: bool = True
+    capture_stream_bodies: bool = True
+    mask: Optional[Callable[["TraceEnvelope"], Optional["TraceEnvelope"]]] = None

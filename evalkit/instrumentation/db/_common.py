@@ -12,6 +12,20 @@ from ...core.types import TraceEnvelope
 _STMT_MAX = 2048
 
 
+def set_stmt_max(limit: Any) -> None:
+    global _STMT_MAX
+    try:
+        value = int(limit)
+    except (TypeError, ValueError):
+        return
+    if value > 0:
+        _STMT_MAX = value
+
+
+def stmt_max() -> int:
+    return _STMT_MAX
+
+
 def op_and_table(statement: Optional[str]):
     op = "QUERY"
     table = ""

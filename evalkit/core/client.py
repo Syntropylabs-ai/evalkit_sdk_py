@@ -148,10 +148,21 @@ class EvalKitClient:
                 created_at=envelope.created_at,
                 environment=envelope.environment,
                 app_version=envelope.app_version,
+                user_id=envelope.user_id,
                 session_id=envelope.session_id,
                 device_id=envelope.device_id,
                 sdk_version=envelope.sdk_version,
             ))
+
+    def _redact(self, envelope: TraceEnvelope) -> Optional[TraceEnvelope]:
+        from .redact import apply_mask, strip_content
+
+        if not self._opts.capture_content:
+            envelope = strip_content(envelope)
+        mask = self._opts.mask
+        if mask is None:
+            return envelope
+        return apply_mask(mask, envelope)
 
     def enqueue(self, envelope: TraceEnvelope) -> None:
         try:
@@ -160,6 +171,10 @@ class EvalKitClient:
                 self._maybe_emit_tool_spans(envelope)
             except Exception:
                 pass
+            redacted = self._redact(envelope)
+            if redacted is None:
+                return
+            envelope = redacted
             full = False
             with self._lock:
                 if len(self._queue) >= self._opts.max_queue_size:
@@ -189,12 +204,33 @@ class EvalKitClient:
             self._queue.clear()
         return self._exporter.export(batch)
 
+    def _flush_bridge(self) -> None:
+        try:
+            from .otel_provider import flush_otel
+        except Exception:
+            return
+        flush_otel()
+
+    def _flush_stream_bodies(self) -> None:
+        try:
+            from ..instrumentation.http._stream_body import flush_pending
+        except Exception:
+            return
+        try:
+            flush_pending()
+        except Exception:
+            pass
+
     def flush(self) -> bool:
+        self._flush_stream_bodies()
+        self._flush_bridge()
         return self._drain()
 
     def destroy(self) -> None:
         self._stop_event.set()
         self._flush_now.set()
+        self._flush_stream_bodies()
+        self._flush_bridge()
         self._drain()
 
     def start_trace(

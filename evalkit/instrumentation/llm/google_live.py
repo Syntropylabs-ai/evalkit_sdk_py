@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 from ..._version import SDK_VERSION
 from ...core.client import _new_span_id, _now_iso
 from ...core.types import SpanEvent, TraceEnvelope
+from .._google_usage import extract_google_usage, google_usage_attrs
 from ._bodies import _dump, _safe_body
 from .google_genai import _extract_prompt
 
@@ -227,18 +228,12 @@ class _ObservedSession:
             if thinking:
                 attrs["gen_ai.response.thinking"] = thinking[:_MAX_TEXT]
 
-            tokens_in = getattr(usage, "prompt_token_count", 0) or 0 if usage else 0
-            tokens_out = getattr(usage, "response_token_count", 0) or 0 if usage else 0
-            cached_tokens = 0
+            counts = extract_google_usage(usage)
+            tokens_in = counts.tokens_in
+            tokens_out = counts.tokens_out
+            cached_tokens = counts.cached_tokens
             if usage is not None:
-                total = getattr(usage, "total_token_count", 0) or 0
-                attrs["gen_ai.usage.total_tokens"] = total or (tokens_in + tokens_out)
-                thoughts_tokens = getattr(usage, "thoughts_token_count", 0) or 0
-                if thoughts_tokens:
-                    attrs["gen_ai.usage.reasoning_tokens"] = thoughts_tokens
-                cached_tokens = getattr(usage, "cached_content_token_count", 0) or 0
-                if cached_tokens:
-                    attrs["gen_ai.usage.cached_tokens"] = cached_tokens
+                attrs.update(google_usage_attrs(counts))
                 audio_tokens_in = _modality_tokens(getattr(usage, "prompt_tokens_details", None), "AUDIO")
                 audio_tokens_out = _modality_tokens(getattr(usage, "response_tokens_details", None), "AUDIO")
                 if audio_tokens_in:

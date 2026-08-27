@@ -48,6 +48,23 @@ def tool_event(
         return None
 
 
+def from_stream_tool_calls(tool_calls: Any, ts: str) -> List[SpanEvent]:
+    events: List[SpanEvent] = []
+    try:
+        for call in (tool_calls or []):
+            ev = tool_event(
+                name=call.get("name"),
+                arguments=call.get("arguments", ""),
+                call_id=call.get("id", ""),
+                ts=ts,
+            )
+            if ev is not None:
+                events.append(ev)
+    except Exception:
+        pass
+    return events
+
+
 def from_openai_chat(result: Any, ts: str) -> List[SpanEvent]:
     events: List[SpanEvent] = []
     try:
@@ -82,7 +99,7 @@ def from_anthropic_blocks(blocks: Any, ts: str) -> List[SpanEvent]:
                 name = getattr(block, "name", None)
                 bid = getattr(block, "id", "")
                 binput = getattr(block, "input", {})
-            if btype != "tool_use":
+            if btype not in ("tool_use", "server_tool_use"):
                 continue
             ev = tool_event(name=name, arguments=binput, call_id=bid, ts=ts)
             if ev is not None:

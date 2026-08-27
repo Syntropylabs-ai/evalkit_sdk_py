@@ -9,7 +9,7 @@ import threading
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
-from ..core.context import SimulationContext, _current_simulation
+from ..core.context import SimulationContext, _current_simulation, _current_span
 from ..evaluate import evaluate
 from .types import AgentTurnResult, SimContext, resolve_persona
 
@@ -28,20 +28,12 @@ def with_simulation(sim: SimulationContext):
 
 
 @contextmanager
-def _scenario_trace(name: str):
-    span_cm = None
+def _bind_scenario_root(root: Any):
+    token = _current_span.set(root)
     try:
-        from ..core.otel_provider import otel_active
-        if otel_active():
-            from opentelemetry import trace as _ot
-            span_cm = _ot.get_tracer("evalkit").start_as_current_span(f"scenario:{name}")
-    except Exception:
-        span_cm = None
-    if span_cm is None:
         yield
-        return
-    with span_cm:
-        yield
+    finally:
+        _current_span.reset(token)
 
 
 def _run_coro_blocking(coro: Any) -> Any:
@@ -147,8 +139,8 @@ def _begin_scenario(client: Any, scenario: Dict[str, Any], cfg: Dict[str, Any]):
         tags=cfg["tags"],
     )
     turn_messages = _user_turns(scenario)[: cfg["max_turns"]]
-    trace_id, end_trace, _root = client.start_trace(f"scenario:{name}", session_id=ctx.session_id)
-    return name, scenario_id, ctx, sim, turn_messages, end_trace
+    _trace_id, end_trace, root = client.start_trace(f"scenario:{name}", session_id=ctx.session_id)
+    return name, scenario_id, ctx, sim, turn_messages, end_trace, root
 
 
 def _finish_scenario(
@@ -179,9 +171,8 @@ def _result(scenario_id: str, name: str, status: str, turns: int, scores: Dict[s
 
 
 def _run_scenario(client: Any, entrypoint: Entrypoint, scenario: Dict[str, Any], **cfg: Any) -> Dict[str, Any]:
-    with _scenario_trace(scenario.get("name", "scenario")):
-        name, scenario_id, ctx, sim, turn_messages, end_trace = _begin_scenario(client, scenario, cfg)
-
+    name, scenario_id, ctx, sim, turn_messages, end_trace, root = _begin_scenario(client, scenario, cfg)
+    with _bind_scenario_root(root):
         status, error, turns = "OK", None, 0
         texts: List[str] = []
         explicit_tools: List[Dict[str, Any]] = []
@@ -212,9 +203,8 @@ def _run_scenario(client: Any, entrypoint: Entrypoint, scenario: Dict[str, Any],
 
 
 async def _run_scenario_async(client: Any, entrypoint: Entrypoint, scenario: Dict[str, Any], **cfg: Any) -> Dict[str, Any]:
-    with _scenario_trace(scenario.get("name", "scenario")):
-        name, scenario_id, ctx, sim, turn_messages, end_trace = _begin_scenario(client, scenario, cfg)
-
+    name, scenario_id, ctx, sim, turn_messages, end_trace, root = _begin_scenario(client, scenario, cfg)
+    with _bind_scenario_root(root):
         status, error, turns = "OK", None, 0
         texts: List[str] = []
         explicit_tools: List[Dict[str, Any]] = []

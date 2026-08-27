@@ -9,9 +9,11 @@ from ...core.client import EvalKitClient, _new_span_id, _now_iso
 from ...core.context import _current_span, current_span_ctx, _in_http_span, get_or_create_ambient_trace_id
 from ...core.types import TraceEnvelope
 from ...utils.headers import make_traceparent, path_from_url, sanitize_headers
+from ._stream_body import attach_httpx_async, attach_httpx_sync, new_capture
 
 _SKIP = {"/v1/ingest", "/health", "/healthz"}
 _BODY_MAX = 10 * 1024 * 1024
+_STREAM_BODIES = True
 
 
 def _should_skip(url: str) -> bool:
@@ -28,10 +30,16 @@ def _req_body(request: Any) -> Optional[str]:
     return None
 
 
+def _is_streaming(resp: Any) -> bool:
+    try:
+        return not hasattr(resp, "_content")
+    except Exception:
+        return False
+
+
 def _resp_body(resp: Any) -> Optional[str]:
     try:
-        is_streaming = getattr(resp, "is_stream_consumed", None) is False
-        if is_streaming:
+        if _is_streaming(resp):
             return None
         raw = resp.content
         if raw:
@@ -41,9 +49,31 @@ def _resp_body(resp: Any) -> Optional[str]:
     return None
 
 
+def _emit_streamed_span(
+    client: EvalKitClient, resp: Any, is_async: bool, start_ms: float, **span: Any
+) -> bool:
+    if not _STREAM_BODIES or _BODY_MAX <= 0:
+        return False
+
+    def emit(capture: Any, error: Optional[BaseException]) -> None:
+        _emit_http_span(
+            client, latency=int(time.time() * 1000 - start_ms), end_ts=_now_iso(),
+            error_msg=str(error) if error is not None else None,
+            stream_attrs=capture.attrs(), **span,
+        )
+
+    capture = new_capture(_BODY_MAX, start_ms, emit)
+    attach = attach_httpx_async if is_async else attach_httpx_sync
+    if attach(resp, capture):
+        return True
+    capture.finish()
+    return True
+
+
 def patch_httpx(client: EvalKitClient) -> None:
-    global _BODY_MAX
+    global _BODY_MAX, _STREAM_BODIES
     _BODY_MAX = client._opts.max_body_bytes
+    _STREAM_BODIES = client._opts.capture_stream_bodies
     try:
         import httpx
     except ImportError:
@@ -89,12 +119,21 @@ def patch_httpx(client: EvalKitClient) -> None:
             _in_http_span.reset(_http_token)
 
             end_ts = _now_iso()
+            latency = int(time.time() * 1000 - start_ms)
             resp_headers = sanitize_headers(dict(resp.headers))
-            _emit_http_span(
-                client, trace_id, parent_span_id, span_id, method, url, resp.status_code, None,
-                ts, end_ts, int(time.time() * 1000 - start_ms),
+            span = dict(
+                trace_id=trace_id, parent_span_id=parent_span_id, span_id=span_id,
+                method=method, url=url, status_code=resp.status_code, start_ts=ts,
                 req_headers=req_headers, resp_headers=resp_headers,
-                req_body=_req_body(request), resp_body=_resp_body(resp),
+                req_body=_req_body(request),
+            )
+            if _is_streaming(resp) and _emit_streamed_span(
+                client, resp, False, start_ms, time_to_headers_ms=latency, **span
+            ):
+                return resp
+            _emit_http_span(
+                client, error_msg=None, end_ts=end_ts, latency=latency,
+                resp_body=_resp_body(resp), **span,
             )
             return resp
 
@@ -141,12 +180,21 @@ def patch_httpx(client: EvalKitClient) -> None:
             _in_http_span.reset(_http_token)
 
             end_ts = _now_iso()
+            latency = int(time.time() * 1000 - start_ms)
             resp_headers = sanitize_headers(dict(resp.headers))
-            _emit_http_span(
-                client, trace_id, parent_span_id, span_id, method, url, resp.status_code, None,
-                ts, end_ts, int(time.time() * 1000 - start_ms),
+            span = dict(
+                trace_id=trace_id, parent_span_id=parent_span_id, span_id=span_id,
+                method=method, url=url, status_code=resp.status_code, start_ts=ts,
                 req_headers=req_headers, resp_headers=resp_headers,
-                req_body=_req_body(request), resp_body=_resp_body(resp),
+                req_body=_req_body(request),
+            )
+            if _is_streaming(resp) and _emit_streamed_span(
+                client, resp, True, start_ms, time_to_headers_ms=latency, **span
+            ):
+                return resp
+            _emit_http_span(
+                client, error_msg=None, end_ts=end_ts, latency=latency,
+                resp_body=_resp_body(resp), **span,
             )
             return resp
 
@@ -170,6 +218,8 @@ def _emit_http_span(
     resp_headers: Optional[Dict[str, str]] = None,
     req_body: Optional[str] = None,
     resp_body: Optional[str] = None,
+    stream_attrs: Optional[Dict[str, Any]] = None,
+    time_to_headers_ms: Optional[int] = None,
 ) -> None:
     attrs: Dict[str, Any] = {"http.method": method, "http.url": url, **client._meta_attrs()}
     status = "OK"
@@ -184,13 +234,17 @@ def _emit_http_span(
         attrs["http.response.headers"] = json.dumps(resp_headers)
     if resp_body:
         attrs["http.response.body"] = resp_body
+    if time_to_headers_ms is not None:
+        attrs["http.server.time_to_headers_ms"] = time_to_headers_ms
+    if stream_attrs:
+        attrs.update(stream_attrs)
     if error_msg:
         attrs["error.message"] = error_msg
         status = "ERROR"
 
     client.enqueue(TraceEnvelope(
         trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-        span_type="http_call", status=status,
+        span_type="http_call", status=status, status_message=error_msg or None,
         operation=f"{method} {path_from_url(url)}",
         service_name=client._opts.service_name,
         attributes=attrs, latency_ms=latency, start_time=start_ts, end_time=end_ts,

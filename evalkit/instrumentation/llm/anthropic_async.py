@@ -4,11 +4,12 @@ import time
 from typing import Any, Dict, List, Optional
 
 from ..._version import SDK_VERSION
-from ...core.client import EvalKitClient, _new_span_id, _new_trace_id, _now_iso
+from ...core.client import EvalKitClient, _new_span_id, _now_iso
 from ...core.context import SpanContext, _current_span, current_span_ctx, get_or_create_ambient_trace_id
 from ...core.types import SpanEvent, TraceEnvelope
-from .._streaming import _AsyncStreamTracer
+from .._streaming import _AsyncStreamTracer, _StreamState, stream_response_attrs, stream_tool_events
 from .._toolcalls import from_anthropic_blocks
+from ._anthropic_stream import patch_messages_stream
 from ._bodies import _dump, _safe_body
 from .anthropic import _build_prompt, _extract_thinking
 
@@ -22,6 +23,7 @@ def patch_async_anthropic(
     parent_ctx: Optional[SpanContext] = None,
 ) -> None:
     messages_api = anthropic_client.messages
+    patch_messages_stream(client, messages_api, "anthropic", parent_ctx)
     if getattr(messages_api.create, "_evalkit", False):
         return
 
@@ -44,11 +46,14 @@ def patch_async_anthropic(
         request_body = _safe_body(_dump(kwargs))
 
         if kwargs.get("stream"):
+            state = _StreamState(start_ms)
+
             def on_stream_done(
                 completion: str, tokens_in: int, tokens_out: int,
                 thinking: str, reasoning_tokens: int, has_redacted_thinking: bool,
                 ttft_ms: Optional[int],
                 cache_read_tokens: int = 0, cache_creation_tokens: int = 0,
+                error: Optional[BaseException] = None,
             ) -> None:
                 end_ts = _now_iso()
                 latency = int(time.time() * 1000 - start_ms)
@@ -61,21 +66,31 @@ def patch_async_anthropic(
                     stream_attrs["gen_ai.response.has_redacted_thinking"] = True
                 if ttft_ms is not None:
                     stream_attrs["gen_ai.server.time_to_first_token_ms"] = ttft_ms
+                if temperature is not None:
+                    stream_attrs["gen_ai.request.temperature"] = temperature
+                if max_tokens is not None:
+                    stream_attrs["gen_ai.request.max_tokens"] = max_tokens
+                stream_attrs.update(stream_response_attrs(state))
                 client.enqueue(TraceEnvelope(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                    span_type="llm_call", status="OK",
+                    span_type="llm_call",
+                    status="ERROR" if error is not None else "OK",
+                    status_message=str(error) if error is not None else None,
                     operation="messages.create",
                     service_name=client._opts.service_name, provider="anthropic", model=model,
                     prompt=prompt_text, completion=completion[:_COMPLETION_MAX],
                     tokens_in=tokens_in, tokens_out=tokens_out,
                     cache_read_tokens=cache_read_tokens or None, cache_creation_tokens=cache_creation_tokens or None,
                     latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
+                    events=stream_tool_events(state, end_ts) or None,
                     attributes=stream_attrs,
                     environment=client._opts.environment, app_version=client._opts.app_version,
                     sdk_version=SDK_VERSION,
                 ))
             raw = await original_create(*args, **kwargs)
-            return _AsyncStreamTracer(raw, on_stream_done, is_anthropic=True, start_ms=start_ms)
+            return _AsyncStreamTracer(
+                raw, on_stream_done, is_anthropic=True, start_ms=start_ms, state=state,
+            )
 
         span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
         token = _current_span.set(span_ctx)

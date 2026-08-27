@@ -9,9 +9,11 @@ from ...core.client import EvalKitClient, _new_span_id, _now_iso
 from ...core.context import _current_span, current_span_ctx, _in_http_span, get_or_create_ambient_trace_id
 from ...core.types import TraceEnvelope
 from ...utils.headers import make_traceparent, path_from_url, sanitize_headers
+from ._stream_body import attach_aiohttp, new_capture
 
 _BODY_MAX = 10 * 1024 * 1024
 _SKIP = {"/v1/ingest", "/health", "/healthz"}
+_STREAM_BODIES = True
 
 
 def _should_skip(url: str) -> bool:
@@ -19,8 +21,9 @@ def _should_skip(url: str) -> bool:
 
 
 def patch_aiohttp(client: EvalKitClient) -> None:
-    global _BODY_MAX
+    global _BODY_MAX, _STREAM_BODIES
     _BODY_MAX = client._opts.max_body_bytes
+    _STREAM_BODIES = client._opts.capture_stream_bodies
     try:
         import aiohttp
     except ImportError:
@@ -118,6 +121,36 @@ def patch_aiohttp(client: EvalKitClient) -> None:
                 attrs["http.response.headers"] = json.dumps(resp_headers)
         except Exception:
             pass
+
+        if _STREAM_BODIES and _BODY_MAX > 0:
+            attrs["http.server.time_to_headers_ms"] = latency
+
+            def emit(capture: Any, error: Optional[BaseException]) -> None:
+                stream_attrs = dict(attrs)
+                stream_attrs.update(capture.attrs())
+                status = "ERROR" if status_code >= 400 else "OK"
+                message = None
+                if error is not None:
+                    status = "ERROR"
+                    message = str(error)
+                    stream_attrs["error.message"] = message
+                client.enqueue(TraceEnvelope(
+                    trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
+                    span_type="http_call", status=status, status_message=message,
+                    operation=f"{method.upper()} {path_from_url(url)}",
+                    service_name=client._opts.service_name,
+                    attributes=stream_attrs,
+                    latency_ms=int(time.time() * 1000 - start_ms),
+                    start_time=ts, end_time=_now_iso(),
+                    created_at=ts, environment=client._opts.environment,
+                    app_version=client._opts.app_version, sdk_version=SDK_VERSION,
+                ))
+
+            capture = new_capture(_BODY_MAX, start_ms, emit)
+            if attach_aiohttp(resp, capture):
+                return resp
+            capture.finish()
+            return resp
 
         client.enqueue(TraceEnvelope(
             trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,

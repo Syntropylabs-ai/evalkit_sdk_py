@@ -12,7 +12,13 @@ from ...core.context import (
     get_or_create_ambient_trace_id,
 )
 from ...core.types import TraceEnvelope
-from .._streaming import _AsyncStreamTracer, _SyncStreamTracer
+from .._streaming import (
+    _AsyncStreamTracer,
+    _StreamState,
+    _SyncStreamTracer,
+    stream_response_attrs,
+    stream_tool_events,
+)
 from .._toolcalls import from_openai_chat
 from ._bodies import _dump, _safe_body
 
@@ -103,11 +109,14 @@ def _patch_sync(ek: "EvalKitClient", litellm: Any) -> None:
         request_body = _safe_body(_dump(kwargs))
 
         if kwargs.get("stream"):
+            state = _StreamState(start_ms)
+
             def on_done(
                 completion: str, tin: int, tout: int,
                 thinking: str, reasoning_tokens: int, has_redacted_thinking: bool,
                 ttft_ms: Optional[int],
                 cache_read_tokens: int = 0, cache_creation_tokens: int = 0,
+                error: Optional[BaseException] = None,
             ) -> None:
                 stream_attrs = {**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True}
                 if request_body:
@@ -116,17 +125,24 @@ def _patch_sync(ek: "EvalKitClient", litellm: Any) -> None:
                     stream_attrs["gen_ai.usage.reasoning_tokens"] = reasoning_tokens
                 if ttft_ms is not None:
                     stream_attrs["gen_ai.server.time_to_first_token_ms"] = ttft_ms
+                if tin or tout:
+                    stream_attrs["gen_ai.usage.total_tokens"] = tin + tout
+                stream_attrs.update(stream_response_attrs(state))
+                end_ts = _now_iso()
                 ek.enqueue(TraceEnvelope(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                    span_type="llm_call", status="OK", operation="litellm.completion",
+                    span_type="llm_call", operation="litellm.completion",
+                    status="ERROR" if error is not None else "OK",
+                    status_message=str(error) if error is not None else None,
                     service_name=ek._opts.service_name, provider="litellm", model=model,
                     prompt=prompt, completion=completion, tokens_in=tin, tokens_out=tout,
                     cache_read_tokens=cache_read_tokens or None, cache_creation_tokens=cache_creation_tokens or None,
-                    latency_ms=int(time.time() * 1000 - start_ms), start_time=ts, end_time=_now_iso(),
-                    created_at=ts, attributes=stream_attrs,
+                    latency_ms=int(time.time() * 1000 - start_ms), start_time=ts, end_time=end_ts,
+                    created_at=ts, events=stream_tool_events(state, end_ts) or None,
+                    attributes=stream_attrs,
                     environment=ek._opts.environment, app_version=ek._opts.app_version, sdk_version=SDK_VERSION,
                 ))
-            return _SyncStreamTracer(original(*args, **kwargs), on_done, start_ms=start_ms)
+            return _SyncStreamTracer(original(*args, **kwargs), on_done, start_ms=start_ms, state=state)
 
         span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
         token = _current_span.set(span_ctx)
@@ -198,11 +214,14 @@ def _patch_async(ek: "EvalKitClient", litellm: Any) -> None:
         request_body = _safe_body(_dump(kwargs))
 
         if kwargs.get("stream"):
+            state = _StreamState(start_ms)
+
             def on_done(
                 completion: str, tin: int, tout: int,
                 thinking: str, reasoning_tokens: int, has_redacted_thinking: bool,
                 ttft_ms: Optional[int],
                 cache_read_tokens: int = 0, cache_creation_tokens: int = 0,
+                error: Optional[BaseException] = None,
             ) -> None:
                 stream_attrs = {**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True}
                 if request_body:
@@ -211,18 +230,25 @@ def _patch_async(ek: "EvalKitClient", litellm: Any) -> None:
                     stream_attrs["gen_ai.usage.reasoning_tokens"] = reasoning_tokens
                 if ttft_ms is not None:
                     stream_attrs["gen_ai.server.time_to_first_token_ms"] = ttft_ms
+                if tin or tout:
+                    stream_attrs["gen_ai.usage.total_tokens"] = tin + tout
+                stream_attrs.update(stream_response_attrs(state))
+                end_ts = _now_iso()
                 ek.enqueue(TraceEnvelope(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                    span_type="llm_call", status="OK", operation="litellm.acompletion",
+                    span_type="llm_call", operation="litellm.acompletion",
+                    status="ERROR" if error is not None else "OK",
+                    status_message=str(error) if error is not None else None,
                     service_name=ek._opts.service_name, provider="litellm", model=model,
                     prompt=prompt, completion=completion, tokens_in=tin, tokens_out=tout,
                     cache_read_tokens=cache_read_tokens or None, cache_creation_tokens=cache_creation_tokens or None,
-                    latency_ms=int(time.time() * 1000 - start_ms), start_time=ts, end_time=_now_iso(),
-                    created_at=ts, attributes=stream_attrs,
+                    latency_ms=int(time.time() * 1000 - start_ms), start_time=ts, end_time=end_ts,
+                    created_at=ts, events=stream_tool_events(state, end_ts) or None,
+                    attributes=stream_attrs,
                     environment=ek._opts.environment, app_version=ek._opts.app_version, sdk_version=SDK_VERSION,
                 ))
             raw = await original(*args, **kwargs)
-            return _AsyncStreamTracer(raw, on_done, start_ms=start_ms)
+            return _AsyncStreamTracer(raw, on_done, start_ms=start_ms, state=state)
 
         span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
         token = _current_span.set(span_ctx)

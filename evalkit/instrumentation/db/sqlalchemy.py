@@ -10,11 +10,29 @@ from ...core.context import _current_span, current_span_ctx
 from ...core.types import TraceEnvelope
 
 _BODY_MAX = 2048
+_PARAMS_MAX = 1024
 
 _SKIP_TABLES = {"sessions", "app_states", "user_states"}
 
 
+def _set_caps(client: EvalKitClient) -> None:
+    global _BODY_MAX, _PARAMS_MAX
+    try:
+        limit = int(client._opts.max_body_bytes)
+    except (AttributeError, TypeError, ValueError):
+        return
+    if limit > 0:
+        _BODY_MAX = limit
+        _PARAMS_MAX = limit
+    try:
+        from ._common import set_stmt_max
+        set_stmt_max(limit)
+    except Exception:
+        pass
+
+
 def patch_sqlalchemy(client: EvalKitClient, engine: Any) -> None:
+    _set_caps(client)
     try:
         from sqlalchemy import event
     except ImportError:
@@ -78,9 +96,9 @@ def patch_sqlalchemy(client: EvalKitClient, engine: Any) -> None:
                 import json
                 params_str = json.dumps(
                     parameters if not isinstance(parameters, tuple) else list(parameters)
-                )[:1024]
+                )[:_PARAMS_MAX]
             except Exception:
-                params_str = str(parameters)[:1024]
+                params_str = str(parameters)[:_PARAMS_MAX]
 
         attrs: dict = {
             "db.system": dialect,
@@ -134,10 +152,7 @@ def patch_sqlalchemy(client: EvalKitClient, engine: Any) -> None:
 
 
 def patch_sqlalchemy_async(client: EvalKitClient, async_engine: Any) -> None:
-    if getattr(async_engine, "_evalkit_instrumented", False):
-        return
     sync_engine = getattr(async_engine, "sync_engine", None)
     if sync_engine is None:
         return
     patch_sqlalchemy(client, sync_engine)
-    async_engine._evalkit_instrumented = True

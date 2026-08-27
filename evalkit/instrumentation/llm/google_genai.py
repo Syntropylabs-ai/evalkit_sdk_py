@@ -13,6 +13,13 @@ from ...core.context import (
     get_or_create_ambient_trace_id,
 )
 from ...core.types import SpanEvent, TraceEnvelope
+from .._google_usage import (
+    EMPTY_GOOGLE_USAGE,
+    GoogleUsage,
+    extract_google_usage,
+    google_usage_attrs,
+    merge_google_usage,
+)
 from .._toolcalls import from_google_parts
 
 if TYPE_CHECKING:
@@ -74,6 +81,7 @@ def _extract_prompt(contents: Any, config: Any = None) -> str:
 def _extract_completion(response: Any) -> str:
     text_parts: List[str] = []
     fn_parts: List[str] = []
+    saw_thought = False
     try:
         for candidate in (getattr(response, "candidates", None) or []):
             content = getattr(candidate, "content", None)
@@ -81,6 +89,7 @@ def _extract_completion(response: Any) -> str:
                 continue
             for part in getattr(content, "parts", []) or []:
                 if getattr(part, "thought", False):
+                    saw_thought = True
                     continue
                 t = getattr(part, "text", None)
                 if t:
@@ -101,6 +110,8 @@ def _extract_completion(response: Any) -> str:
         return "".join(text_parts)
     if fn_parts:
         return "\n".join(fn_parts)
+    if saw_thought:
+        return ""
     try:
         text = getattr(response, "text", None)
         if text:
@@ -131,15 +142,8 @@ def _extract_tool_events(response: Any, ts: str) -> List[SpanEvent]:
     return from_google_parts(response, ts)
 
 
-def _usage_tokens(response: Any):
-    meta = getattr(response, "usage_metadata", None)
-    if meta is None:
-        return 0, 0, 0, 0
-    tokens_in = getattr(meta, "prompt_token_count", 0) or 0
-    tokens_out = getattr(meta, "candidates_token_count", 0) or 0
-    reasoning_tokens = getattr(meta, "thoughts_token_count", 0) or 0
-    cached_tokens = getattr(meta, "cached_content_token_count", 0) or 0
-    return tokens_in, tokens_out, reasoning_tokens, cached_tokens
+def _usage_tokens(response: Any) -> GoogleUsage:
+    return extract_google_usage(getattr(response, "usage_metadata", None))
 
 
 def _resolve_trace(ek: EvalKitClient):
@@ -296,19 +300,16 @@ def _patch_sync_models(ek: EvalKitClient, gm: Any) -> None:
             completion = _extract_completion(result)
             thinking = _extract_thinking(result)
             events = _extract_tool_events(result, end_ts)
-            tokens_in, tokens_out, reasoning_tokens, cached_tokens = _usage_tokens(result)
-            extra_attrs: Dict[str, Any] = {}
+            usage = _usage_tokens(result)
+            extra_attrs: Dict[str, Any] = dict(google_usage_attrs(usage))
             if thinking:
                 extra_attrs["gen_ai.response.thinking"] = thinking
-            if reasoning_tokens:
-                extra_attrs["gen_ai.usage.reasoning_tokens"] = reasoning_tokens
-            if cached_tokens:
-                extra_attrs["gen_ai.usage.cached_tokens"] = cached_tokens
 
             ek.enqueue(_build_envelope(
                 ek, trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                 model=model, prompt=prompt, completion=completion,
-                tokens_in=tokens_in, tokens_out=tokens_out, cache_read_tokens=cached_tokens,
+                tokens_in=usage.tokens_in, tokens_out=usage.tokens_out,
+                cache_read_tokens=usage.cached_tokens,
                 latency=latency, ts=ts, end_ts=end_ts, events=events,
                 session_id=session_id, device_id=device_id,
                 request_body=_request_body(contents, config),
@@ -347,8 +348,9 @@ def _patch_sync_models(ek: EvalKitClient, gm: Any) -> None:
                     parts: List[str] = []
                     thinking_parts: List[str] = []
                     chunk_dumps: List[Any] = []
-                    tin = tout = treason = tcached = 0
+                    usage: GoogleUsage = EMPTY_GOOGLE_USAGE
                     events: List[SpanEvent] = []
+                    ttft_ms: Optional[int] = None
                     status = "OK"
                     smsg: Optional[str] = None
                     try:
@@ -356,19 +358,15 @@ def _patch_sync_models(ek: EvalKitClient, gm: Any) -> None:
                             try:
                                 t = _extract_completion(chunk)
                                 if t:
+                                    if ttft_ms is None:
+                                        ttft_ms = int(time.time() * 1000 - start_ms)
                                     parts.append(t)
                                 th = _extract_thinking(chunk)
                                 if th:
+                                    if ttft_ms is None:
+                                        ttft_ms = int(time.time() * 1000 - start_ms)
                                     thinking_parts.append(th)
-                                ci, co, cr, cc = _usage_tokens(chunk)
-                                if ci:
-                                    tin = ci
-                                if co:
-                                    tout = co
-                                if cr:
-                                    treason = cr
-                                if cc:
-                                    tcached = cc
+                                usage = merge_google_usage(usage, _usage_tokens(chunk))
                                 evs = _extract_tool_events(chunk, _now_iso())
                                 if evs:
                                     events.extend(evs)
@@ -382,17 +380,16 @@ def _patch_sync_models(ek: EvalKitClient, gm: Any) -> None:
                     finally:
                         end_ts = _now_iso()
                         try:
-                            extra_attrs: Dict[str, Any] = {"gen_ai.streaming": True}
+                            extra_attrs: Dict[str, Any] = {"gen_ai.streaming": True, **google_usage_attrs(usage)}
+                            if ttft_ms is not None and status == "OK":
+                                extra_attrs["gen_ai.server.time_to_first_token_ms"] = ttft_ms
                             if thinking_parts:
                                 extra_attrs["gen_ai.response.thinking"] = "".join(thinking_parts)
-                            if treason:
-                                extra_attrs["gen_ai.usage.reasoning_tokens"] = treason
-                            if tcached:
-                                extra_attrs["gen_ai.usage.cached_tokens"] = tcached
                             ek.enqueue(_build_envelope(
                                 ek, trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                                 model=model, prompt=prompt, completion="".join(parts),
-                                tokens_in=tin, tokens_out=tout, cache_read_tokens=tcached,
+                                tokens_in=usage.tokens_in, tokens_out=usage.tokens_out,
+                                cache_read_tokens=usage.cached_tokens,
                                 latency=int(time.time() * 1000 - start_ms), ts=ts, end_ts=end_ts,
                                 events=events or None, session_id=session_id, device_id=device_id,
                                 status=status, status_message=smsg, attrs=extra_attrs,
@@ -446,19 +443,16 @@ def _patch_async_models(ek: EvalKitClient, gm: Any) -> None:
             completion = _extract_completion(result)
             thinking = _extract_thinking(result)
             events = _extract_tool_events(result, end_ts)
-            tokens_in, tokens_out, reasoning_tokens, cached_tokens = _usage_tokens(result)
-            extra_attrs: Dict[str, Any] = {}
+            usage = _usage_tokens(result)
+            extra_attrs: Dict[str, Any] = dict(google_usage_attrs(usage))
             if thinking:
                 extra_attrs["gen_ai.response.thinking"] = thinking
-            if reasoning_tokens:
-                extra_attrs["gen_ai.usage.reasoning_tokens"] = reasoning_tokens
-            if cached_tokens:
-                extra_attrs["gen_ai.usage.cached_tokens"] = cached_tokens
 
             ek.enqueue(_build_envelope(
                 ek, trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                 model=model, prompt=prompt, completion=completion,
-                tokens_in=tokens_in, tokens_out=tokens_out, cache_read_tokens=cached_tokens,
+                tokens_in=usage.tokens_in, tokens_out=usage.tokens_out,
+                cache_read_tokens=usage.cached_tokens,
                 latency=latency, ts=ts, end_ts=end_ts, events=events,
                 session_id=session_id, device_id=device_id,
                 request_body=_request_body(contents, config),
@@ -497,8 +491,9 @@ def _patch_async_models(ek: EvalKitClient, gm: Any) -> None:
                     parts: List[str] = []
                     thinking_parts: List[str] = []
                     chunk_dumps: List[Any] = []
-                    tin = tout = treason = tcached = 0
+                    usage: GoogleUsage = EMPTY_GOOGLE_USAGE
                     events: List[SpanEvent] = []
+                    ttft_ms: Optional[int] = None
                     status = "OK"
                     smsg: Optional[str] = None
                     try:
@@ -506,19 +501,15 @@ def _patch_async_models(ek: EvalKitClient, gm: Any) -> None:
                             try:
                                 t = _extract_completion(chunk)
                                 if t:
+                                    if ttft_ms is None:
+                                        ttft_ms = int(time.time() * 1000 - start_ms)
                                     parts.append(t)
                                 th = _extract_thinking(chunk)
                                 if th:
+                                    if ttft_ms is None:
+                                        ttft_ms = int(time.time() * 1000 - start_ms)
                                     thinking_parts.append(th)
-                                ci, co, cr, cc = _usage_tokens(chunk)
-                                if ci:
-                                    tin = ci
-                                if co:
-                                    tout = co
-                                if cr:
-                                    treason = cr
-                                if cc:
-                                    tcached = cc
+                                usage = merge_google_usage(usage, _usage_tokens(chunk))
                                 evs = _extract_tool_events(chunk, _now_iso())
                                 if evs:
                                     events.extend(evs)
@@ -532,17 +523,16 @@ def _patch_async_models(ek: EvalKitClient, gm: Any) -> None:
                     finally:
                         end_ts = _now_iso()
                         try:
-                            extra_attrs: Dict[str, Any] = {"gen_ai.streaming": True}
+                            extra_attrs: Dict[str, Any] = {"gen_ai.streaming": True, **google_usage_attrs(usage)}
+                            if ttft_ms is not None and status == "OK":
+                                extra_attrs["gen_ai.server.time_to_first_token_ms"] = ttft_ms
                             if thinking_parts:
                                 extra_attrs["gen_ai.response.thinking"] = "".join(thinking_parts)
-                            if treason:
-                                extra_attrs["gen_ai.usage.reasoning_tokens"] = treason
-                            if tcached:
-                                extra_attrs["gen_ai.usage.cached_tokens"] = tcached
                             ek.enqueue(_build_envelope(
                                 ek, trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                                 model=model, prompt=prompt, completion="".join(parts),
-                                tokens_in=tin, tokens_out=tout, cache_read_tokens=tcached,
+                                tokens_in=usage.tokens_in, tokens_out=usage.tokens_out,
+                                cache_read_tokens=usage.cached_tokens,
                                 latency=int(time.time() * 1000 - start_ms), ts=ts, end_ts=end_ts,
                                 events=events or None, session_id=session_id, device_id=device_id,
                                 status=status, status_message=smsg, attrs=extra_attrs,

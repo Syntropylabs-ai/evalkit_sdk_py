@@ -5,7 +5,7 @@ import unittest
 from tests.helpers import fresh, reset_context
 
 
-def _make_fake_botocore(*, fail=False, content=None):
+def _make_fake_botocore(*, fail=False, content=None, invoke_body=None):
     botocore_mod = types.ModuleType("botocore")
     client_mod = types.ModuleType("botocore.client")
 
@@ -26,6 +26,8 @@ def _make_fake_botocore(*, fail=False, content=None):
                     "output": {"message": {"content": content or [{"text": "Bedrock says hello"}]}},
                     "usage": {"inputTokens": 8, "outputTokens": 15},
                 }
+            if operation_name == "InvokeModel" and invoke_body is not None:
+                return {"body": invoke_body}
             return {}
 
     client_mod.BaseClient = FakeBaseClient
@@ -44,8 +46,9 @@ class TestBedrock(unittest.TestCase):
         for n in self._injected:
             sys.modules.pop(n, None)
 
-    def _install(self, *, fail=False, content=None):
-        botocore_mod, client_mod, FakeBC = _make_fake_botocore(fail=fail, content=content)
+    def _install(self, *, fail=False, content=None, invoke_body=None):
+        botocore_mod, client_mod, FakeBC = _make_fake_botocore(
+            fail=fail, content=content, invoke_body=invoke_body)
         sys.modules["botocore"] = botocore_mod
         sys.modules["botocore.client"] = client_mod
         self._injected += ["botocore", "botocore.client"]
@@ -95,6 +98,29 @@ class TestBedrock(unittest.TestCase):
         llm = [e for e in self.captured if e.span_type == "llm_call"]
         self.assertTrue(llm[0].attributes.get("gen_ai.response.has_redacted_thinking"))
         self.assertNotIn("gen_ai.response.thinking", llm[0].attributes)
+
+    def test_invoke_model_keeps_the_bedrock_model_id_as_the_priced_model(self):
+        FakeBC = self._install(invoke_body=(
+            '{"id":"msg_1","model":"claude-3-5-sonnet-20241022",'
+            '"content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn",'
+            '"usage":{"input_tokens":8,"output_tokens":15}}'
+        ))
+        FakeBC()._make_api_call("InvokeModel", {
+            "modelId": "anthropic.claude-3-5-sonnet-20241022-v2:0",
+            "body": '{"messages":[{"role":"user","content":"hello"}]}',
+        })
+        self.client.flush()
+        llm = [e for e in self.captured if e.span_type == "llm_call"]
+        self.assertEqual(len(llm), 1)
+        self.assertEqual(
+            llm[0].model, "anthropic.claude-3-5-sonnet-20241022-v2:0",
+            "the envelope model is the only field the platform prices from, and Bedrock rates are keyed "
+            "on the Bedrock model id; the Anthropic body reports a bare name that matches no Bedrock "
+            "price row, so letting it win would silently report every InvokeModel call as free",
+        )
+        self.assertEqual(llm[0].provider, "bedrock")
+        self.assertEqual(llm[0].tokens_in, 8)
+        self.assertEqual(llm[0].tokens_out, 15)
 
     def test_non_converse_no_span(self):
         FakeBC = self._install()

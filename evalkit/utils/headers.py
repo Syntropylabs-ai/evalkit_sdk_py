@@ -10,14 +10,26 @@ SENSITIVE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_capture_sensitive = True
+
+
+def set_capture_sensitive_headers(enabled: bool) -> None:
+    global _capture_sensitive
+    _capture_sensitive = bool(enabled)
+
+
+def capture_sensitive_headers() -> bool:
+    return _capture_sensitive
+
 
 def sanitize_headers(headers: Any) -> Dict[str, str]:
     out: Dict[str, str] = {}
     if not headers:
         return out
+    keep_sensitive = _capture_sensitive
     items = headers.items() if hasattr(headers, "items") else headers
     for k, v in items:
-        if not SENSITIVE_RE.match(str(k)):
+        if keep_sensitive or not SENSITIVE_RE.match(str(k)):
             out[str(k)] = str(v)
     return out
 

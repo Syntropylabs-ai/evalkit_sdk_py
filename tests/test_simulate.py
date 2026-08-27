@@ -33,6 +33,24 @@ class TestSimulateUser(unittest.TestCase):
         self.assertTrue(all(e.simulation_id == report["simulation_id"] for e in sim_spans))
         scenario_roots = [e for e in self.captured if (e.operation or "").startswith("scenario:")]
         self.assertEqual(len({e.trace_id for e in scenario_roots}), 1)
+        self.assertEqual(
+            sorted(e.operation for e in scenario_roots),
+            ["scenario:s1", "scenario:s2"],
+            "each scenario must produce exactly one root span; opening an OpenTelemetry span alongside "
+            "client.start_trace() emits the root twice, and ingest is append-only so both rows stay",
+        )
+        self.assertTrue(
+            all(e.parent_span_id is None for e in scenario_roots),
+            "a scenario root whose parent_span_id points at a span that was never exported leaves the "
+            "waterfall dangling",
+        )
+        roots_by_id = {e.span_id for e in scenario_roots}
+        children = [e for e in self.captured if e.parent_span_id is not None]
+        self.assertTrue(children)
+        self.assertTrue(
+            all(e.parent_span_id in roots_by_id for e in children),
+            "spans emitted inside a scenario must be parented to that scenario's root",
+        )
 
     def test_async_entrypoint(self):
         m = install_fake_genai(self.client, response=GenAIResp(text="ok"))
