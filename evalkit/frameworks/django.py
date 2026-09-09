@@ -4,8 +4,9 @@ import json
 from typing import Any, Callable
 
 from ..core.client import EvalKitClient
-from ..core.context import _current_span
+from ..core.context import _current_span, reset_identity, set_identity
 from ..utils.headers import parse_traceparent
+from ._identity import user_id_of
 
 _BODY_MAX = 10 * 1024 * 1024
 
@@ -56,6 +57,7 @@ class EvalKitDjangoMiddleware:
 
     def __call__(self, request: Any) -> Any:
         global _BODY_MAX
+        identity_token = None
         try:
             client = self._get_client()
             _BODY_MAX = client._opts.max_body_bytes
@@ -82,6 +84,10 @@ class EvalKitDjangoMiddleware:
                     except Exception:
                         pass
 
+            request_user_id = user_id_of(getattr(request, "user", None))
+            if request_user_id:
+                identity_token = set_identity(user_id=request_user_id)
+
             trace_id, end, ctx = client.start_http_trace(
                 f"{method} {path}",
                 method=method,
@@ -94,6 +100,8 @@ class EvalKitDjangoMiddleware:
             token = _current_span.set(ctx)
             request._evalkit_trace_id = trace_id
         except Exception:
+            if identity_token is not None:
+                reset_identity(identity_token)
             return self.get_response(request)
 
         try:
@@ -134,6 +142,8 @@ class EvalKitDjangoMiddleware:
                 _current_span.reset(token)
             except Exception:
                 pass
+            if identity_token is not None:
+                reset_identity(identity_token)
 
     def process_exception(self, request: Any, exception: Exception) -> None:
         pass

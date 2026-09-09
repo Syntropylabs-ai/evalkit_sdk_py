@@ -13,7 +13,14 @@ from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, TypeVa
 F = TypeVar("F", bound=Callable[..., Any])
 
 from .._version import SDK_VERSION
-from .context import SpanContext, _ambient_trace_id, _current_span, current_span_ctx, get_or_create_ambient_trace_id
+from .context import (
+    SpanContext,
+    _ambient_trace_id,
+    _current_span,
+    current_identity,
+    current_span_ctx,
+    get_or_create_ambient_trace_id,
+)
 from .exporter import _Exporter
 from .types import EvalKitOptions, TraceEnvelope
 
@@ -89,6 +96,18 @@ class EvalKitClient:
             attrs["evalkit.device_id"] = self._opts.device_id
         return attrs
 
+    def _apply_identity(self, envelope: TraceEnvelope) -> None:
+        ctx = current_span_ctx()
+        identity = current_identity()
+        if envelope.user_id is None:
+            envelope.user_id = (ctx.user_id if ctx else None) or identity.user_id
+        if envelope.session_id is None:
+            envelope.session_id = (ctx.session_id if ctx else None) or identity.session_id
+        if envelope.device_id is None:
+            envelope.device_id = (
+                (ctx.device_id if ctx else None) or identity.device_id or self._opts.device_id
+            )
+
     def _apply_simulation(self, envelope: TraceEnvelope) -> None:
         from .context import _current_simulation
         sim = _current_simulation.get()
@@ -112,6 +131,18 @@ class EvalKitClient:
         envelope.attributes = attrs
         if envelope.span_type in ("tool_call", "llm_call"):
             sim.collector.append(envelope)
+
+    def _apply_prompt(self, envelope: TraceEnvelope) -> None:
+        if envelope.span_type != "llm_call":
+            return
+        from .context import _current_prompt
+        ref = _current_prompt.get()
+        if ref is None:
+            return
+        attrs = envelope.attributes or {}
+        for key, value in ref.attributes().items():
+            attrs.setdefault(key, value)
+        envelope.attributes = attrs
 
     def _maybe_emit_tool_spans(self, envelope: TraceEnvelope) -> None:
         if envelope.span_type != "llm_call" or not envelope.events:
@@ -166,7 +197,9 @@ class EvalKitClient:
 
     def enqueue(self, envelope: TraceEnvelope) -> None:
         try:
+            self._apply_identity(envelope)
             self._apply_simulation(envelope)
+            self._apply_prompt(envelope)
             try:
                 self._maybe_emit_tool_spans(envelope)
             except Exception:
@@ -239,13 +272,23 @@ class EvalKitClient:
         attributes: Optional[Dict[str, str]] = None,
         session_id: Optional[str] = None,
         device_id: Optional[str] = None,
+        user_id: Optional[str] = None,
     ) -> Tuple[str, Callable[[str], None], SpanContext]:
         parent = current_span_ctx()
+        identity = current_identity()
         trace_id = parent.trace_id if parent else get_or_create_ambient_trace_id()
         _ambient_trace_id.set(trace_id)
         parent_span_id = parent.span_id if parent else None
-        resolved_session_id = (parent.session_id if parent else None) or session_id
-        resolved_device_id = device_id or (parent.device_id if parent else None) or self._opts.device_id
+        resolved_session_id = (
+            session_id or (parent.session_id if parent else None) or identity.session_id
+        )
+        resolved_device_id = (
+            device_id
+            or (parent.device_id if parent else None)
+            or identity.device_id
+            or self._opts.device_id
+        )
+        resolved_user_id = user_id or (parent.user_id if parent else None) or identity.user_id
         span_id = _new_span_id()
         start_ms = time.time() * 1000
         start_iso = _now_iso()
@@ -254,6 +297,7 @@ class EvalKitClient:
             span_id=span_id,
             session_id=resolved_session_id,
             device_id=resolved_device_id,
+            user_id=resolved_user_id,
         )
         token = _current_span.set(ctx)
 
@@ -278,6 +322,7 @@ class EvalKitClient:
                 created_at=start_iso,
                 environment=self._opts.environment,
                 app_version=self._opts.app_version,
+                user_id=resolved_user_id,
                 session_id=resolved_session_id,
                 device_id=resolved_device_id,
                 sdk_version=SDK_VERSION,
@@ -307,9 +352,16 @@ class EvalKitClient:
         trace_id = upstream_trace_id or _new_trace_id()
         span_id = _new_span_id()
         _ambient_trace_id.set(trace_id)
+        identity = current_identity()
         start_ms = time.time() * 1000
         start_iso = _now_iso()
-        ctx = SpanContext(trace_id=trace_id, span_id=span_id)
+        ctx = SpanContext(
+            trace_id=trace_id,
+            span_id=span_id,
+            session_id=identity.session_id,
+            device_id=identity.device_id or self._opts.device_id,
+            user_id=identity.user_id,
+        )
 
         def end(
             status: str = "OK",
@@ -366,13 +418,23 @@ class EvalKitClient:
     ) -> Tuple[Callable[[str], None], SpanContext]:
         parent = parent_ctx or current_span_ctx()
         trace_id = parent.trace_id if parent else get_or_create_ambient_trace_id()
+        identity = current_identity()
         span_id = _new_span_id()
         parent_span_id = parent.span_id if parent else None
-        session_id = parent.session_id if parent else None
-        device_id = (parent.device_id if parent else None) or self._opts.device_id
+        session_id = (parent.session_id if parent else None) or identity.session_id
+        device_id = (
+            (parent.device_id if parent else None) or identity.device_id or self._opts.device_id
+        )
+        user_id = (parent.user_id if parent else None) or identity.user_id
         start_ms = time.time() * 1000
         start_iso = _now_iso()
-        ctx = SpanContext(trace_id=trace_id, span_id=span_id, session_id=session_id, device_id=device_id)
+        ctx = SpanContext(
+            trace_id=trace_id,
+            span_id=span_id,
+            session_id=session_id,
+            device_id=device_id,
+            user_id=user_id,
+        )
 
         def end(status: str = "OK") -> None:
             end_iso = _now_iso()
@@ -396,6 +458,7 @@ class EvalKitClient:
                 created_at=start_iso,
                 environment=self._opts.environment,
                 app_version=self._opts.app_version,
+                user_id=user_id,
                 session_id=session_id,
                 device_id=device_id,
                 sdk_version=SDK_VERSION,

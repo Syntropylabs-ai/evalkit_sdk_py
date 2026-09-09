@@ -6,9 +6,21 @@ from typing import Any, Callable, Dict, Generator, List, Optional, Tuple
 
 from ._version import SDK_VERSION
 from .core.client import EvalKitClient
-from .core.context import SpanContext, _current_span, get_or_create_ambient_trace_id
+from .core.context import (
+    Identity,
+    SpanContext,
+    _current_span,
+    current_identity,
+    get_or_create_ambient_trace_id,
+    reset_identity,
+    set_identity,
+)
 from .core.types import EvalKitOptions, SpanEvent, TraceEnvelope
 from .evaluate import evaluate
+from .eval import Eval, EvalResult
+from .feedback import feedback, reward
+from . import prompts
+from .prompts import Prompt
 from .simulation import AgentTurnResult, SimContext, evaluate_simulation, generate_scenarios, simulate_user, with_simulation
 
 from .instrumentation.llm.openai import patch_openai
@@ -63,7 +75,17 @@ __all__ = [
     "auto_instrument",
     "flush",
     "current_trace_id",
+    "set_user",
+    "clear_user",
+    "current_user",
+    "Identity",
     "evaluate",
+    "Eval",
+    "EvalResult",
+    "feedback",
+    "reward",
+    "prompts",
+    "Prompt",
     "generate_scenarios",
     "simulate_user",
     "evaluate_simulation",
@@ -239,6 +261,25 @@ def current_trace_id() -> str:
     return ctx.trace_id if ctx else get_or_create_ambient_trace_id()
 
 
+def set_user(
+    user_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    device_id: Optional[str] = None,
+) -> Any:
+    return set_identity(user_id=user_id, session_id=session_id, device_id=device_id)
+
+
+def clear_user(token: Optional[Any] = None) -> None:
+    if token is None:
+        set_identity()
+        return
+    reset_identity(token)
+
+
+def current_user() -> Identity:
+    return current_identity()
+
+
 def instrument_flask(app: Any) -> None:
     _instrument_flask(app, _get_instance())
 
@@ -399,8 +440,15 @@ def start_trace(
     attributes: Optional[Dict[str, str]] = None,
     session_id: Optional[str] = None,
     device_id: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> Tuple[str, Callable[[str], None], SpanContext]:
-    return _get_instance().start_trace(name, attributes, session_id=session_id, device_id=device_id)
+    return _get_instance().start_trace(
+        name,
+        attributes,
+        session_id=session_id,
+        device_id=device_id,
+        user_id=user_id,
+    )
 
 
 def start_http_trace(

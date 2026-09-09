@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
@@ -11,6 +11,49 @@ class SpanContext:
     span_id: str
     session_id: Optional[str] = None
     device_id: Optional[str] = None
+    user_id: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class Identity:
+    user_id: Optional[str] = None
+    session_id: Optional[str] = None
+    device_id: Optional[str] = None
+
+
+NO_IDENTITY = Identity()
+
+_current_identity: ContextVar[Identity] = ContextVar(
+    "evalkit_identity", default=NO_IDENTITY
+)
+
+
+def current_identity() -> Identity:
+    return _current_identity.get()
+
+
+def set_identity(
+    user_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    device_id: Optional[str] = None,
+) -> Token:
+    if user_id is None and session_id is None and device_id is None:
+        return _current_identity.set(NO_IDENTITY)
+    previous = _current_identity.get()
+    return _current_identity.set(
+        Identity(
+            user_id=user_id if user_id is not None else previous.user_id,
+            session_id=session_id if session_id is not None else previous.session_id,
+            device_id=device_id if device_id is not None else previous.device_id,
+        )
+    )
+
+
+def reset_identity(token: Token) -> None:
+    try:
+        _current_identity.reset(token)
+    except Exception:
+        pass
 
 
 _current_span: ContextVar[Optional[SpanContext]] = ContextVar(
@@ -35,6 +78,22 @@ class SimulationContext:
 _current_simulation: ContextVar[Optional[SimulationContext]] = ContextVar(
     "evalkit_simulation", default=None
 )
+
+
+@dataclass(frozen=True)
+class PromptRef:
+    name: str
+    version: int
+
+    @property
+    def ref(self) -> str:
+        return f"{self.name}@{self.version}"
+
+    def attributes(self) -> dict:
+        return {"prompt.ref": self.ref, "prompt.name": self.name, "prompt.version": self.version}
+
+
+_current_prompt: ContextVar[Optional[PromptRef]] = ContextVar("evalkit_prompt", default=None)
 
 _ambient_trace_id: ContextVar[Optional[str]] = ContextVar(
     "evalkit_ambient_trace_id", default=None

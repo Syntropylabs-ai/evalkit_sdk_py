@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "syntropylabs-evalkit"
-version = "0.2.14"
+version = "0.2.15"
 description = "EvalKit Python SDK — LLM observability and tracing"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -44,6 +44,9 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+
+[project.scripts]
+evalkit = "evalkit_cli.main:main"
 
 [project.urls]
 Homepage = "https://syntropylabs.ai"
@@ -92,11 +95,11 @@ all = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["evalkit"]
-exclude = ["evalkit/**/*.py"]
+packages = ["evalkit", "evalkit_cli"]
+exclude = ["evalkit/**/*.py", "evalkit_cli/**/*.py"]
 
 [tool.hatch.build.targets.sdist]
-only-include = ["evalkit"]
+only-include = ["evalkit", "evalkit_cli"]
 include = ["/README.md", "/LICENSE"]
 exclude = ["tests", "examples", ".claude", ".gitignore"]
 

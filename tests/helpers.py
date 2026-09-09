@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
+import threading
 import types
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import evalkit
-from evalkit.core.context import _ambient_trace_id, _current_span
+from evalkit.core.context import _ambient_trace_id, _current_span, set_identity
+from evalkit.eval import _rows_endpoint_support
 
 _CLIENT = None
 
@@ -30,6 +34,209 @@ def fresh(capture: list):
 def reset_context():
     _ambient_trace_id.set(None)
     _current_span.set(None)
+    set_identity()
+    _rows_endpoint_support.clear()
+    os.environ.pop("EVALKIT_QUIET", None)
+
+
+DATASET_HASH = "sha256:" + "ab" * 32
+
+_COUNTS_OK = {"ok": 1, "unparseable": 0, "judgeError": 0, "skipped": 0, "unsupported": 0}
+
+
+def _judged_row(row):
+    return {
+        "rowIndex": row["rowIndex"],
+        "input": row["input"],
+        "output": row["output"],
+        "metrics": [
+            {
+                "ruleId": "665f0c1234567890abcdef12",
+                "metricName": "Relevance",
+                "score": 0.9,
+                "passed": True,
+                "status": "ok",
+                "reason": "r",
+                "source": "judge",
+            }
+        ],
+        "localScores": row.get("localScores") or [],
+        "overallScore": 0.9,
+        "passed": True,
+        "status": "ok",
+        "counts": dict(_COUNTS_OK),
+    }
+
+
+def _legacy_all_pass(body, n):
+    rows = body["rows"]
+    payload = {
+        "jobId": f"job_{n}",
+        "name": body.get("name"),
+        "datasetHash": DATASET_HASH,
+        "totalRows": len(rows),
+        "averageScore": 0.9,
+        "passRate": 1.0,
+        "counts": {"ok": len(rows), "unparseable": 0, "judgeError": 0, "skipped": 0, "unsupported": 0},
+        "indeterminateRows": 0,
+        "erroredRows": 0,
+        "scoringVersion": 2,
+        "overallScores": {"Relevance": 0.9},
+        "gateResult": None,
+        "hyperparameters": body.get("hyperparameters"),
+        "results": [
+            _judged_row({"rowIndex": i, "input": r["input"], "output": r["output"]})
+            for i, r in enumerate(rows)
+        ],
+    }
+    if "gate" in body:
+        payload["gateResult"] = {
+            "passed": True,
+            "checks": [
+                {"name": "minPassRate", "threshold": body["gate"].get("minPassRate"), "actual": 1.0, "passed": True}
+            ],
+            "evaluatedAt": "2026-09-01T00:00:00.000Z",
+        }
+    if "baselineJobId" in body:
+        payload["comparison"] = {
+            "comparable": True,
+            "candidateJobId": f"job_{n}",
+            "baselineJobId": body["baselineJobId"],
+            "rows": {"compared": len(rows), "improved": 0, "regressed": 0, "unchanged": len(rows), "indeterminate": 0},
+        }
+    return 200, payload
+
+
+class RunServer:
+
+    def __init__(self, mode="append", fail_rows_times=0, legacy_respond=_legacy_all_pass):
+        self.mode = mode
+        self.fail_rows_times = fail_rows_times
+        self.legacy_respond = legacy_respond
+        self.requests = []
+        self.runs = []
+        self.rows = {}
+        self.names = {}
+        self.completes = []
+        self._rows_failures = 0
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), _run_handler(self))
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+
+    @property
+    def url(self):
+        return f"http://127.0.0.1:{self._server.server_address[1]}"
+
+    def shutdown(self):
+        self._server.shutdown()
+        self._server.server_close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.shutdown()
+        return False
+
+    def paths(self):
+        return [r["path"] for r in self.requests]
+
+    def bodies(self, path_suffix):
+        return [r["body"] for r in self.requests if r["path"].endswith(path_suffix)]
+
+    def stored_rows(self, run_id=None):
+        target = run_id or (self.runs[-1] if self.runs else None)
+        rows = self.rows.get(target, {})
+        return [rows[index] for index in sorted(rows)]
+
+    def route(self, path, body):
+        if path == "/evaluation-runs":
+            if "rows" in body:
+                return self.legacy_respond(body, len([b for b in self.bodies("/evaluation-runs") if "rows" in b]))
+            if self.mode == "legacy":
+                return 400, {"statusCode": 400, "message": "rows should not be empty"}
+            run_id = f"run_{len(self.runs) + 1}"
+            self.runs.append(run_id)
+            self.rows[run_id] = {}
+            self.names[run_id] = body.get("name")
+            return 201, {"runId": run_id, "url": f"https://app.test/o/o1/p/p1/evaluations/{run_id}"}
+        parts = path.split("/")
+        if len(parts) == 4 and parts[1] == "evaluation-runs" and parts[3] == "rows":
+            if self.mode == "no-rows-endpoint":
+                return 404, {"statusCode": 404, "message": f"Cannot POST {path}"}
+            if self._rows_failures < self.fail_rows_times:
+                self._rows_failures += 1
+                return 500, {"statusCode": 500, "message": "flaky"}
+            batch = body.get("rows") or []
+            stored = self.rows.setdefault(parts[2], {})
+            for row in batch:
+                stored[row["rowIndex"]] = row
+            return 202, {"accepted": len(batch), "rows": len(stored)}
+        if len(parts) == 4 and parts[1] == "evaluation-runs" and parts[3] == "complete":
+            self.completes.append(body)
+            return 200, self.complete_payload(parts[2], body)
+        return 404, {"statusCode": 404, "message": f"Cannot POST {path}"}
+
+    def complete_payload(self, run_id, body):
+        rows = self.stored_rows(run_id)
+        payload = {
+            "jobId": f"job_{run_id}",
+            "runId": run_id,
+            "name": self.names.get(run_id),
+            "datasetHash": DATASET_HASH,
+            "totalRows": len(rows),
+            "averageScore": 0.9,
+            "passRate": 1.0,
+            "counts": {"ok": len(rows), "unparseable": 0, "judgeError": 0, "skipped": 0, "unsupported": 0},
+            "indeterminateRows": 0,
+            "erroredRows": 0,
+            "scoringVersion": 2,
+            "overallScores": {"Relevance": 0.9},
+            "gateResult": None,
+            "comparison": {"comparable": True, "candidateJobId": f"job_{run_id}", "baselineJobId": None},
+            "results": [_judged_row(row) for row in rows],
+        }
+        if body.get("gate"):
+            payload["gateResult"] = {
+                "passed": True,
+                "checks": [
+                    {
+                        "name": "minPassRate",
+                        "threshold": body["gate"].get("minPassRate"),
+                        "actual": 1.0,
+                        "passed": True,
+                    }
+                ],
+                "evaluatedAt": "2026-09-01T00:00:00.000Z",
+            }
+        return payload
+
+
+def _run_handler(server):
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length)
+            body = json.loads(raw or b"{}")
+            server.requests.append(
+                {
+                    "path": self.path,
+                    "body": body,
+                    "key": self.headers.get("X-Subscription-Key"),
+                    "raw": raw.decode("utf-8"),
+                }
+            )
+            status, payload = server.route(self.path, body)
+            data = json.dumps(payload).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *a):
+            pass
+
+    return Handler
 
 
 class _FC:

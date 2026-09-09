@@ -4,8 +4,9 @@ import json
 from typing import Any, Callable
 
 from ..core.client import EvalKitClient
-from ..core.context import SpanContext, _current_span
+from ..core.context import SpanContext, _current_span, reset_identity, set_identity
 from ..utils.headers import parse_traceparent, sanitize_headers
+from ._identity import user_id_of
 
 _BODY_MAX = 10 * 1024 * 1024
 
@@ -82,6 +83,11 @@ class EvalKitMiddleware:
             except Exception:
                 body_json = total_body[:_BODY_MAX].decode("utf-8", errors="replace") or None
 
+        identity_token = None
+        request_user_id = user_id_of(scope.get("user"))
+        if request_user_id:
+            identity_token = set_identity(user_id=request_user_id)
+
         try:
             trace_id, end, ctx = client.start_http_trace(
                 f"{method} {path}",
@@ -94,6 +100,8 @@ class EvalKitMiddleware:
             )
             token = _current_span.set(ctx)
         except Exception:
+            if identity_token is not None:
+                reset_identity(identity_token)
             await self._app(scope, receive_replay, send)
             return
 
@@ -155,3 +163,5 @@ class EvalKitMiddleware:
                 _current_span.reset(token)
             except Exception:
                 pass
+            if identity_token is not None:
+                reset_identity(identity_token)

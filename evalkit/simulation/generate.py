@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import json
 import os
-import urllib.error
-import urllib.request
 from typing import Any, Dict, List, Optional
+
+from ..core.api import post_json
 
 
 def _jsonable_tool(t: Any) -> Any:
@@ -69,58 +68,12 @@ def generate_scenarios(
     if max_tokens is not None:
         body["maxTokens"] = max_tokens
 
-    url = base + "/scenarios/generate"
-    payload = json.dumps(body, default=str)
-    req = urllib.request.Request(
-        url,
-        data=payload.encode(),
-        headers={
-            "Content-Type": "application/json",
-            "X-Subscription-Key": client._opts.subscription_key,
-        },
-        method="POST",
+    data = post_json(
+        client,
+        base + "/scenarios/generate",
+        body,
+        timeout=120,
+        span_name="POST /scenarios/generate",
+        redact=("apiKey",),
     )
-
-    import evalkit as _ek
-
-    attrs: Dict[str, Any] = {
-        "evalkit.span_type": "http_call",
-        "http.method": "POST",
-        "http.url": url,
-        "http.request.body": payload[:8192],
-    }
-    try:
-        end_span, ctx = client.start_span("POST /scenarios/generate", attrs)
-    except Exception:
-        end_span, ctx = None, None
-
-    try:
-        if ctx is not None:
-            token = _ek._current_span.set(ctx)
-        try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                raw = resp.read()
-                attrs["http.status_code"] = resp.getcode()
-                attrs["http.response.body"] = raw[:8192].decode("utf-8", errors="replace")
-        finally:
-            if ctx is not None:
-                _ek._current_span.reset(token)
-    except urllib.error.HTTPError as exc:
-        attrs["http.status_code"] = exc.code
-        try:
-            attrs["http.response.body"] = exc.read()[:8192].decode("utf-8", errors="replace")
-        except Exception:
-            pass
-        if end_span:
-            end_span("ERROR")
-        raise
-    except Exception as exc:
-        attrs["error.message"] = str(exc)
-        if end_span:
-            end_span("ERROR")
-        raise
-
-    if end_span:
-        end_span("OK")
-    data = json.loads(raw)
     return data.get("scenarios", [])
