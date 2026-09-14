@@ -6,6 +6,7 @@ import unittest
 
 from evalkit.core.redact import (
     resolve_capture_content,
+    resolve_capture_secrets,
     resolve_capture_sensitive_headers,
     resolve_capture_stream_bodies,
     strip_content,
@@ -35,31 +36,40 @@ class TestSensitiveHeaderCapture(unittest.TestCase):
     def tearDown(self):
         set_capture_sensitive_headers(self.saved)
 
-    def test_sensitive_headers_are_kept_by_default(self):
+    def test_sensitive_header_values_are_masked_by_default(self):
+        set_capture_sensitive_headers(False)
+        out = sanitize_headers(SENSITIVE)
+        self.assertEqual(
+            out.get("Authorization"), "***",
+            "a bearer token in a span attribute is a credential leaving the process, so masked is the only defensible "
+            "default; the previous default shipped it to the backend in clear text",
+        )
+        self.assertEqual(out.get("x-subscription-key"), "***")
+        self.assertEqual(out.get("Cookie"), "***")
+        self.assertEqual(out.get("X-Api-Key"), "***")
+        self.assertEqual(out.get("Proxy-Authorization"), "***")
+        self.assertEqual(
+            set(out), set(SENSITIVE),
+            "masking replaces the value and keeps the key, so the recorded request still shows which headers were "
+            "sent; dropping them outright is what made 401s impossible to diagnose",
+        )
+        self.assertEqual(
+            out.get("Content-Type"), "application/json",
+            "only credential headers are masked - the rest of the request is what makes the span debuggable",
+        )
+        self.assertEqual(
+            out.get("traceparent"), SENSITIVE["traceparent"],
+            "traceparent especially has to survive, since losing it breaks parent linkage in the very mode a "
+            "security-conscious user picks",
+        )
+
+    def test_the_opt_in_keeps_every_sensitive_header_verbatim(self):
         set_capture_sensitive_headers(True)
         out = sanitize_headers(SENSITIVE)
         self.assertEqual(
-            out.get("Authorization"), "Bearer sk-proj-secret",
-            "the SDK is meant to capture everything by default so an auth failure is debuggable from the trace alone; "
-            "stripping the header silently is what made 401s impossible to diagnose",
-        )
-        self.assertEqual(
-            set(out), set(SENSITIVE),
-            "no header is dropped when capture is on, otherwise the recorded request is not the request that was sent",
-        )
-
-    def test_the_opt_out_strips_every_sensitive_header(self):
-        set_capture_sensitive_headers(False)
-        out = sanitize_headers(SENSITIVE)
-        self.assertNotIn("Authorization", out)
-        self.assertNotIn("Cookie", out)
-        self.assertNotIn("X-Api-Key", out)
-        self.assertNotIn("x-subscription-key", out)
-        self.assertNotIn("Proxy-Authorization", out)
-        self.assertEqual(
-            out, {"Content-Type": "application/json", "traceparent": SENSITIVE["traceparent"]},
-            "opting out has to leave the harmless headers behind - traceparent especially, since dropping it would "
-            "break parent linkage in the very mode a security-conscious user picks",
+            out, dict(SENSITIVE),
+            "EVALKIT_CAPTURE_SECRETS=1 exists to debug an auth failure from the trace alone, which only works if the "
+            "header is recorded exactly as it was sent",
         )
 
     def test_matching_is_case_insensitive_and_anchored(self):
@@ -70,19 +80,19 @@ class TestSensitiveHeaderCapture(unittest.TestCase):
             "x-authorization-scheme": "not-a-secret",
             "authorization-type": "also-not",
         })
-        self.assertNotIn("AUTHORIZATION", out)
-        self.assertNotIn("authorization", out)
+        self.assertEqual(out["AUTHORIZATION"], "***")
+        self.assertEqual(out["authorization"], "***")
         self.assertEqual(
-            set(out), {"x-authorization-scheme", "authorization-type"},
-            "the pattern is anchored on purpose: an unanchored match would eat descriptive headers that merely "
-            "mention authorization and quietly shrink the captured request",
+            {out["x-authorization-scheme"], out["authorization-type"]}, {"not-a-secret", "also-not"},
+            "the pattern is anchored on purpose: an unanchored match would blank out descriptive headers that merely "
+            "mention authorization and were never secret",
         )
 
     def test_non_dict_header_pairs_still_work(self):
         set_capture_sensitive_headers(False)
         out = sanitize_headers([("Authorization", "x"), ("Accept", "*/*")])
         self.assertEqual(
-            out, {"Accept": "*/*"},
+            out, {"Authorization": "***", "Accept": "*/*"},
             "httpx and aiohttp hand over multidicts and plain pair sequences, so the sanitizer cannot assume .items()",
         )
 
@@ -104,8 +114,8 @@ class TestSensitiveHeaderCapture(unittest.TestCase):
         strip_content(env)
         self.assertNotIn(
             "http.request.headers", env.attributes,
-            "turning header capture on by default is only defensible because capture_content=False is still a total "
-            "kill switch; if headers survived it, there would be no way to keep secrets out of the backend",
+            "capture_content=False is the total kill switch that has to hold even for a user who opted back in to "
+            "capturing credentials; if headers survived it there would be no way to keep secrets out of the backend",
         )
         self.assertNotIn("http.response.headers", env.attributes)
         self.assertIn(
@@ -119,6 +129,7 @@ class TestFlagResolution(unittest.TestCase):
         self.saved = {
             k: os.environ.get(k) for k in (
                 "EVALKIT_CAPTURE_CONTENT",
+                "EVALKIT_CAPTURE_SECRETS",
                 "EVALKIT_CAPTURE_SENSITIVE_HEADERS",
                 "EVALKIT_CAPTURE_STREAM_BODIES",
                 "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT",
@@ -134,14 +145,37 @@ class TestFlagResolution(unittest.TestCase):
             else:
                 os.environ[k] = v
 
-    def test_all_three_flags_default_to_capturing(self):
+    def test_content_and_stream_bodies_default_to_capturing_but_secrets_do_not(self):
         self.assertTrue(resolve_capture_content(None))
-        self.assertTrue(
-            resolve_capture_sensitive_headers(None),
-            "capture-everything-by-default is the product decision; a default of False would mean the common case is "
-            "the degraded one",
-        )
         self.assertTrue(resolve_capture_stream_bodies(None))
+        self.assertFalse(
+            resolve_capture_secrets(None),
+            "capture-everything-by-default is the product decision for content, but a credential is never the "
+            "customer's data to lose, so secrets are masked unless someone opts in",
+        )
+        self.assertFalse(
+            resolve_capture_sensitive_headers(None),
+            "the old header flag is an alias of the same switch, so its default has to move with it",
+        )
+
+    def test_either_env_var_opts_back_in(self):
+        os.environ["EVALKIT_CAPTURE_SECRETS"] = "1"
+        self.assertTrue(resolve_capture_secrets(None))
+        del os.environ["EVALKIT_CAPTURE_SECRETS"]
+        os.environ["EVALKIT_CAPTURE_SENSITIVE_HEADERS"] = "1"
+        self.assertTrue(
+            resolve_capture_secrets(None),
+            "operators already set EVALKIT_CAPTURE_SENSITIVE_HEADERS, so it stays as an alias rather than silently "
+            "doing nothing after the rename",
+        )
+
+    def test_the_specific_variable_wins_when_both_are_set(self):
+        os.environ["EVALKIT_CAPTURE_SECRETS"] = "0"
+        os.environ["EVALKIT_CAPTURE_SENSITIVE_HEADERS"] = "1"
+        self.assertFalse(
+            resolve_capture_secrets(None),
+            "EVALKIT_CAPTURE_SECRETS is the current name and the broader switch, so it has to beat the alias",
+        )
 
     def test_an_explicit_argument_beats_the_environment(self):
         os.environ["EVALKIT_CAPTURE_SENSITIVE_HEADERS"] = "1"
@@ -189,13 +223,18 @@ class TestFlagResolution(unittest.TestCase):
 
 
 class TestOptionsPlumbing(unittest.TestCase):
-    def test_the_options_dataclass_defaults_to_capturing(self):
+    def test_the_options_dataclass_defaults_to_capturing_content_but_masking_secrets(self):
         from evalkit.core.types import EvalKitOptions
 
         opts = EvalKitOptions(subscription_key="tk", base_url="http://x")
         self.assertTrue(opts.capture_content)
-        self.assertTrue(opts.capture_sensitive_headers)
         self.assertTrue(opts.capture_stream_bodies)
+        self.assertFalse(opts.capture_secrets)
+        self.assertFalse(
+            opts.capture_sensitive_headers,
+            "capture_sensitive_headers is now a read-only view of capture_secrets, so the two can never disagree and "
+            "leave the header global out of step with the scrubber",
+        )
 
     def test_init_accepts_and_forwards_both_new_flags(self):
         import inspect
@@ -203,7 +242,7 @@ class TestOptionsPlumbing(unittest.TestCase):
         import evalkit
 
         params = inspect.signature(evalkit.init).parameters
-        for name in ("capture_sensitive_headers", "capture_stream_bodies"):
+        for name in ("capture_secrets", "capture_sensitive_headers", "capture_stream_bodies"):
             self.assertIn(
                 name, params,
                 f"{name} is the documented opt-out, so it has to be a real init() keyword and not only an env var",
@@ -226,7 +265,7 @@ evalkit.init(subscription_key="tk_test", base_url="http://127.0.0.1:1", service_
              function_tracing=False, {kwargs})
 print(repr([
     capture_sensitive_headers(),
-    "Authorization" in sanitize_headers({{"Authorization": "Bearer x"}}),
+    sanitize_headers({{"Authorization": "Bearer x"}}).get("Authorization"),
     rq._STREAM_BODIES,
     hx._STREAM_BODIES,
     ah._STREAM_BODIES,
@@ -236,6 +275,7 @@ print(repr([
 
 def _probe(kwargs="", env=None):
     environ = dict(os.environ)
+    environ.pop("EVALKIT_CAPTURE_SECRETS", None)
     environ.pop("EVALKIT_CAPTURE_SENSITIVE_HEADERS", None)
     environ.pop("EVALKIT_CAPTURE_STREAM_BODIES", None)
     environ.update(env or {})
@@ -249,29 +289,37 @@ def _probe(kwargs="", env=None):
 
 
 class TestInitWiring(unittest.TestCase):
-    def test_a_default_init_turns_both_captures_on(self):
-        keep, kept_header, rq, hx, ah = _probe()
-        self.assertTrue(keep)
-        self.assertTrue(
-            kept_header,
+    def test_a_default_init_masks_credentials_and_keeps_stream_bodies(self):
+        keep, header_value, rq, hx, ah = _probe()
+        self.assertFalse(keep)
+        self.assertEqual(
+            header_value, "***",
             "the module global in headers.py is the only thing sanitize_headers reads, so init has to write it; "
-            "leaving the write out would make the option silently do nothing",
+            "leaving the write out would ship bearer tokens from a default install",
         )
         self.assertTrue(rq and hx and ah)
 
-    def test_the_env_var_reaches_the_header_global_through_init(self):
-        keep, kept_header, _, _, _ = _probe(env={"EVALKIT_CAPTURE_SENSITIVE_HEADERS": "0"})
-        self.assertFalse(keep)
-        self.assertFalse(
-            kept_header,
+    def test_the_secrets_env_var_reaches_the_header_global_through_init(self):
+        keep, header_value, _, _, _ = _probe(env={"EVALKIT_CAPTURE_SECRETS": "1"})
+        self.assertTrue(keep)
+        self.assertEqual(
+            header_value, "Bearer x",
             "env var to resolver to options to set_capture_sensitive_headers is a four-link chain; any broken link "
-            "leaves an operator unable to keep bearer tokens out of the backend",
+            "leaves an operator unable to get the header back when a 401 needs diagnosing",
         )
 
+    def test_the_legacy_env_var_still_reaches_the_header_global(self):
+        keep, header_value, _, _, _ = _probe(env={"EVALKIT_CAPTURE_SENSITIVE_HEADERS": "1"})
+        self.assertTrue(keep)
+        self.assertEqual(header_value, "Bearer x")
+
     def test_an_explicit_init_argument_reaches_the_header_global(self):
-        keep, kept_header, _, _, _ = _probe(kwargs="capture_sensitive_headers=False")
-        self.assertFalse(keep)
-        self.assertFalse(kept_header)
+        keep, header_value, _, _, _ = _probe(kwargs="capture_secrets=True")
+        self.assertTrue(keep)
+        self.assertEqual(header_value, "Bearer x")
+        keep, header_value, _, _, _ = _probe(kwargs="capture_sensitive_headers=True")
+        self.assertTrue(keep, "the old keyword is an alias, so it must still reach the global")
+        self.assertEqual(header_value, "Bearer x")
 
     def test_the_env_var_reaches_all_three_http_modules(self):
         _, _, rq, hx, ah = _probe(env={"EVALKIT_CAPTURE_STREAM_BODIES": "0"})

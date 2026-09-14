@@ -187,9 +187,12 @@ class EvalKitClient:
 
     def _redact(self, envelope: TraceEnvelope) -> Optional[TraceEnvelope]:
         from .redact import apply_mask, strip_content
+        from .secrets import scrub_secrets
 
         if not self._opts.capture_content:
             envelope = strip_content(envelope)
+        if not self._opts.capture_secrets:
+            envelope = scrub_secrets(envelope)
         mask = self._opts.mask
         if mask is None:
             return envelope

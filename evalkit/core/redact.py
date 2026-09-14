@@ -18,7 +18,9 @@ CAPTURE_CONTENT_ENV_VARS = (
     "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT",
 )
 
-CAPTURE_SENSITIVE_HEADERS_ENV_VARS = ("EVALKIT_CAPTURE_SENSITIVE_HEADERS",)
+CAPTURE_SECRETS_ENV_VARS = ("EVALKIT_CAPTURE_SECRETS", "EVALKIT_CAPTURE_SENSITIVE_HEADERS")
+
+CAPTURE_SENSITIVE_HEADERS_ENV_VARS = CAPTURE_SECRETS_ENV_VARS
 
 CAPTURE_STREAM_BODIES_ENV_VARS = ("EVALKIT_CAPTURE_STREAM_BODIES",)
 
@@ -78,8 +80,11 @@ def resolve_capture_content(explicit: Optional[bool]) -> bool:
     return _resolve_flag(explicit, CAPTURE_CONTENT_ENV_VARS, True)
 
 
-def resolve_capture_sensitive_headers(explicit: Optional[bool]) -> bool:
-    return _resolve_flag(explicit, CAPTURE_SENSITIVE_HEADERS_ENV_VARS, True)
+def resolve_capture_secrets(explicit: Optional[bool]) -> bool:
+    return _resolve_flag(explicit, CAPTURE_SECRETS_ENV_VARS, False)
+
+
+resolve_capture_sensitive_headers = resolve_capture_secrets
 
 
 def resolve_capture_stream_bodies(explicit: Optional[bool]) -> bool:

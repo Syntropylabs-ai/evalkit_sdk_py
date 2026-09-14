@@ -3,14 +3,16 @@ from __future__ import annotations
 import re
 from typing import Any, Dict
 
+MASK = "***"
+
 SENSITIVE_RE = re.compile(
     r"^(authorization|cookie|set-cookie|x-api-key|api-key|"
     r"x-auth-token|proxy-authorization|x-secret|x-access-token|"
-    r"x-subscription-key|token|password)$",
+    r"x-subscription-key|subscription-key|token|password)$",
     re.IGNORECASE,
 )
 
-_capture_sensitive = True
+_capture_sensitive = False
 
 
 def set_capture_sensitive_headers(enabled: bool) -> None:
@@ -31,6 +33,8 @@ def sanitize_headers(headers: Any) -> Dict[str, str]:
     for k, v in items:
         if keep_sensitive or not SENSITIVE_RE.match(str(k)):
             out[str(k)] = str(v)
+        else:
+            out[str(k)] = MASK
     return out
 
 

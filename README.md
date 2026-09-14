@@ -169,19 +169,21 @@ export EVALKIT_CAPTURE_STREAM_BODIES=false
 
 ## Request and response headers
 
-HTTP and web-framework spans carry both request and response headers, including `Authorization`,
-`Cookie` and `x-api-key`. They are captured because an auth failure is close to undebuggable without
-them, and stripping them silently was worse than the alternative.
+HTTP and web-framework spans carry both request and response headers under
+`http.request.headers` / `http.response.headers`. Credential headers — `Authorization`, `Cookie`,
+`x-api-key`, `x-subscription-key` and the rest of the list in
+[Privacy](#privacy-content-capture-and-masking) — keep their names but their values are recorded as
+`***`, so you can see what was sent without the key leaving your process. Everything else,
+`traceparent` included, is recorded verbatim.
 
-They are content, so `capture_content=False` removes them along with every other payload, and a
-`mask` callback sees them under `http.request.headers` / `http.response.headers` if you want to
-rewrite rather than drop. To strip just the credential headers and keep the rest — `traceparent`
-included, so parent linkage survives:
+They are also content, so `capture_content=False` removes them along with every other payload, and a
+`mask` callback sees them if you want to rewrite rather than drop. To record credential headers in
+full instead — the usual reason is debugging a 401 from the trace alone:
 
 ```python
-evalkit.init(subscription_key="tk_live_...", capture_sensitive_headers=False)
+evalkit.init(subscription_key="tk_live_...", capture_secrets=True)
 # or
-export EVALKIT_CAPTURE_SENSITIVE_HEADERS=false
+export EVALKIT_CAPTURE_SECRETS=1
 ```
 
 ## Web frameworks
@@ -604,6 +606,62 @@ tracing degrades instead of your app.
 When both controls are set, `capture_content` is applied first, so `mask` sees the already-stripped
 envelope.
 
+### Secrets are masked before export
+
+Every envelope goes through a secret scrubber before your `mask` hook runs and before anything
+leaves the process. It runs whether or not content capture is on: turning capture off removes
+strictly more, never less.
+
+**By key.** Any object key matching one of these, case-insensitively, as the whole key or as a
+dot/underscore/dash-delimited segment, has its value replaced by `"***"` — recursively through
+objects and arrays, and through attribute values that are JSON strings, which are parsed, scrubbed
+and re-serialized:
+
+`api_key` / `api-key` / `apikey`, `secret`, `token`, `password`, `passwd`, `authorization`,
+`credential`, `credentials`, `subscription_key` / `subscription-key`, `x-subscription-key`,
+`cookie`, `set-cookie`, `private_key`, `access_key`, `client_secret`.
+
+So `subscriptionKey`, `X-Subscription-Key`, `http.request.api_key` and `credentials.password` are
+all masked. `token` is the one word matched only as the whole key or the *final* segment, because it
+is also telemetry vocabulary: `prompt_token_count`, `gen_ai.server.time_to_first_token_ms`,
+`input_tokens` and `tokenizer` are metrics, not credentials, and masking them would blank out a
+dashboard column to protect nothing.
+Booleans and numbers under a matching key become `"***"` as well, so the value's shape never hints
+at what was there. `http.request.headers` and `http.response.headers` additionally go through the
+sensitive-header list (`authorization`, `cookie`, `set-cookie`, `x-api-key`, `api-key`,
+`x-auth-token`, `proxy-authorization`, `x-secret`, `x-access-token`, `x-subscription-key`,
+`subscription-key`, `token`, `password`).
+
+**By pattern.** Inside any string — attributes, event attributes, prompt, completion, status
+message — these are replaced by their own prefix followed by `***`:
+
+| Pattern | Becomes |
+| ---------------------------------- | ------------- |
+| `tk_live_[0-9a-f]{8,}`             | `tk_live_***` |
+| `tk_test_[0-9a-f]{8,}`             | `tk_test_***` |
+| `sk-[A-Za-z0-9_-]{16,}`            | `sk-***`      |
+| `Bearer\s+[A-Za-z0-9._~+/=-]{8,}`  | `Bearer ***`  |
+| `AKIA[0-9A-Z]{16}`                 | `AKIA***`     |
+| `ghp_[A-Za-z0-9]{20,}`             | `ghp_***`     |
+
+Strings that contain no secret are left byte for byte, JSON strings included — nothing is
+reformatted on the way through.
+
+Identity is deliberately **not** masked. Email addresses, user IDs, session IDs and device IDs pass
+through untouched: they are what the Users view, per-user cost and session replay are built on. A
+credential is never yours to lose; an identity is the product.
+
+To turn the scrubber off — debugging your own auth failure is the usual reason:
+
+```python
+evalkit.init(subscription_key="tk_live_...", capture_secrets=True)
+# or
+export EVALKIT_CAPTURE_SECRETS=1
+```
+
+`capture_sensitive_headers=` and `EVALKIT_CAPTURE_SENSITIVE_HEADERS` are aliases of the same switch,
+and their default moved with it: credential headers are masked unless you opt back in.
+
 ## Configuration
 
 ```python
@@ -617,7 +675,8 @@ evalkit.init(
     function_tracing=True,                    # auto-trace your functions (default)
     trace_packages=None,                      # extra sibling packages to trace
     capture_content=None,                     # None = env var, else True/False
-    capture_sensitive_headers=None,           # None = env var, else True/False
+    capture_secrets=None,                     # None = env var, else True/False
+    capture_sensitive_headers=None,           # alias of capture_secrets
     capture_stream_bodies=None,               # None = env var, else True/False
     mask=None,                                # callable(envelope) -> envelope | None
 )
@@ -631,7 +690,8 @@ evalkit.flush()
 
 Environment variables: `EVALKIT_API_URL` overrides the control-plane base for
 `Eval()`, feedback and prompts; `EVALKIT_QUIET=1` silences the evaluation-run link;
-`EVALKIT_FUNCTION_TRACE=false` turns off function tracing.
+`EVALKIT_FUNCTION_TRACE=false` turns off function tracing;
+`EVALKIT_CAPTURE_SECRETS=1` turns off secret masking.
 
 ## Links
 

@@ -141,6 +141,10 @@ class EvalKitOptions:
     app_version: Optional[str] = None
     device_id: Optional[str] = None
     capture_content: bool = True
-    capture_sensitive_headers: bool = True
+    capture_secrets: bool = False
     capture_stream_bodies: bool = True
     mask: Optional[Callable[["TraceEnvelope"], Optional["TraceEnvelope"]]] = None
+
+    @property
+    def capture_sensitive_headers(self) -> bool:
+        return self.capture_secrets
