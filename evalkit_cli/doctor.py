@@ -91,7 +91,9 @@ def _read(cfg: SharedConfig, tenant: str, trace: str) -> Tuple[bool, str]:
             time.sleep(READ_DELAY_S)
         code, body, error = get_json(url, cfg.key)
         if code == 403:
-            return False, f"read back forbidden for tenant {tenant!r}; pass --tenant <your tenant id>"
+            if tenant == DEFAULT_TENANT:
+                return False, f"read back forbidden at {url}: this receiver predates the '{DEFAULT_TENANT}' alias; pass --tenant <your tenant id> or update the receiver"
+            return False, f"read back forbidden at {url}: the key belongs to a different tenant than {tenant!r}"
         if code is None or not 200 <= code < 300:
             detail = f"HTTP {code}" if code is not None else (error or "no response")
             continue
@@ -100,7 +102,7 @@ def _read(cfg: SharedConfig, tenant: str, trace: str) -> Tuple[bool, str]:
         if len(rows) >= EXPECTED_SPANS and prompt:
             return True, f"{len(rows)} spans merged, prompt present"
         detail = f"{len(rows)} spans, prompt {'present' if prompt else 'missing'}"
-    return False, detail
+    return False, f"{detail} at {url}"
 
 
 def run(cfg: SharedConfig, tenant: Optional[str]) -> Tuple[bool, str]:

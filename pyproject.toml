@@ -11,7 +11,7 @@ requires-python = ">=3.9"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "Syntropy Labs" }]
-keywords = ["llm", "observability", "tracing", "evaluation", "openai", "anthropic", "ai", "agents"]
+keywords = ["llm", "observability", "tracing", "evaluation", "opentelemetry", "llm-as-judge", "agents", "claude-code", "openai", "anthropic", "ai"]
 dependencies = [
     "opentelemetry-sdk>=1.20.0",
     "opentelemetry-instrumentation>=0.41b0",
@@ -51,6 +51,7 @@ evalkit = "evalkit_cli.main:main"
 [project.urls]
 Homepage = "https://syntropylabs.ai"
 Documentation = "https://syntropylabs.ai/docs"
+Integrations = "https://syntropylabs.ai/integrations"
 
 [project.optional-dependencies]
 openai = ["openai>=1.0.0"]

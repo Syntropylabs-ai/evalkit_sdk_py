@@ -171,7 +171,7 @@ def cmd_doctor(args: argparse.Namespace, store: ConfigStore, out) -> int:
         return 2
     saved = store.load_state()
     ok, detail = doctor_run.run(cfg, args.tenant or cfg.tenant or None)
-    print(f"round trip: {'ok' if ok else 'failed'} ({detail}) → {cfg.endpoint}/v1/traces", file=out)
+    print(f"round trip: {'ok' if ok else 'failed'} ({detail}) → exporter {cfg.endpoint}", file=out)
     saved.doctor = {"at": _timestamp(), "ok": ok, "detail": detail}
     store.save_state(saved)
     vendors = [args.vendor] if args.vendor else [v for v in VENDORS if v in saved.vendors]
