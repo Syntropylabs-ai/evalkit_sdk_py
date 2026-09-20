@@ -173,21 +173,21 @@ class _JsonKeysInstaller:
         return _status_of(state)
 
 
-class ClaudeCodeInstaller(_JsonKeysInstaller):
-    name = "claude-code"
-    tool_dir = ".claude"
-    hook_events = ("PostToolUse", "SubagentStop")
+class _GroupHooks:
+    name = ""
+    hook_events: tuple[str, ...] = ()
     hook_timeout_s = 5
-
-    def prefix(self) -> List[str]:
-        return ["env"]
+    hook_timeouts: Dict[str, int] = {}
 
     def marker(self) -> str:
         return f"coding hook --vendor {self.name}"
 
+    def hook_timeout(self, event: str) -> int:
+        return self.hook_timeouts.get(event, self.hook_timeout_s)
+
     def hook_group(self, event: str) -> Dict[str, Any]:
         command = f"{hook_binary()} coding hook --vendor {self.name} --event {event}"
-        return {"hooks": [{"type": "command", "command": command, "timeout": self.hook_timeout_s}]}
+        return {"hooks": [{"type": "command", "command": command, "timeout": self.hook_timeout(event)}]}
 
     def _without_ours(self, groups: Any, marker: str) -> tuple[List[Any], int]:
         kept: List[Any] = []
@@ -222,10 +222,7 @@ class ClaudeCodeInstaller(_JsonKeysInstaller):
             del data["hooks"]
         return removed
 
-    def merge_extra(self, data: Dict[str, Any], opts: InstallOptions, info: Dict[str, Any]) -> List[str]:
-        if not opts.subagents:
-            removed = self._strip_hooks(data, self.marker())
-            return [f"removed {removed} agent hooks"] if removed else []
+    def _merge_hooks(self, data: Dict[str, Any], info: Dict[str, Any], where: str) -> None:
         self._strip_hooks(data, self.marker())
         hooks = data.get("hooks")
         if not isinstance(hooks, dict):
@@ -234,10 +231,25 @@ class ClaudeCodeInstaller(_JsonKeysInstaller):
         for event in self.hook_events:
             current = hooks.get(event)
             if current is not None and not isinstance(current, list):
-                raise RuntimeError(f"hooks.{event} in the settings file must be a list of hook groups; fix it before installing")
+                raise RuntimeError(f"hooks.{event} in {where} must be a list of hook groups; fix it before installing")
             hooks[event] = [*(current or []), self.hook_group(event)]
         info["hookEvents"] = list(self.hook_events)
         info["marker"] = self.marker()
+
+
+class ClaudeCodeInstaller(_GroupHooks, _JsonKeysInstaller):
+    name = "claude-code"
+    tool_dir = ".claude"
+    hook_events = ("PostToolUse", "SubagentStop")
+
+    def prefix(self) -> List[str]:
+        return ["env"]
+
+    def merge_extra(self, data: Dict[str, Any], opts: InstallOptions, info: Dict[str, Any]) -> List[str]:
+        if not opts.subagents:
+            removed = self._strip_hooks(data, self.marker())
+            return [f"removed {removed} agent hooks"] if removed else []
+        self._merge_hooks(data, info, "the settings file")
         return [f"merged {len(self.hook_events)} agent hooks"]
 
     def restore_extra(self, data: Dict[str, Any], info: Dict[str, Any]) -> List[str]:
@@ -323,8 +335,11 @@ class GeminiCliInstaller(_JsonKeysInstaller):
         return changes + super().uninstall(keyed, dry_run)
 
 
-class CodexInstaller:
+class CodexInstaller(_GroupHooks):
     name = "codex"
+    hooks_file = "hooks.json"
+    hook_events = ("Stop", "SessionEnd")
+    hook_timeouts = {"SessionEnd": 3}
 
     def __init__(self, home: Path) -> None:
         self.home = home
@@ -332,6 +347,9 @@ class CodexInstaller:
     def target(self, opts: InstallOptions) -> Path:
         base = opts.cwd if opts.scope == "project" else self.home
         return base / ".codex" / "config.toml"
+
+    def hooks_target(self, opts: InstallOptions) -> Path:
+        return self.target(opts).with_name(self.hooks_file)
 
     def block(self, cfg: SharedConfig, opts: InstallOptions) -> str:
         endpoint = cfg.endpoint.rstrip("/")
@@ -359,8 +377,29 @@ class CodexInstaller:
             raise RuntimeError(f"{path} already has an [otel] table outside the evalkit markers; remove or move it first")
         if not opts.dry_run:
             write_atomic(path, replace_marker_block(text, TOML_BEGIN, TOML_END, self.block(cfg, opts)), mode=0o600)
-        state = _state(opts, _carry_files(existing, {_pathkey(path): {"block": [TOML_BEGIN, TOML_END]}}))
-        return state, [Change(path, "wrote [otel] block between evalkit markers")]
+        files = {_pathkey(path): {"block": [TOML_BEGIN, TOML_END]}}
+        changes = [Change(path, "wrote [otel] block between evalkit markers")]
+        hooks = self._hooks(opts)
+        if hooks is not None:
+            hooks_path, data, info, summary = hooks
+            if not opts.dry_run:
+                write_json(hooks_path, data)
+            files[_pathkey(hooks_path)] = info
+            changes.append(Change(hooks_path, summary))
+        return _state(opts, _carry_files(existing, files)), changes
+
+    def _hooks(self, opts: InstallOptions) -> Optional[tuple[Path, Dict[str, Any], Dict[str, Any], str]]:
+        path = self.hooks_target(opts)
+        present = path.exists()
+        data = read_json(path)
+        info: Dict[str, Any] = {}
+        if opts.capture == "full":
+            self._merge_hooks(data, info, str(path))
+            events = ", ".join(self.hook_events)
+            return path, data, info, f"merged {len(self.hook_events)} turn hooks ({events}); codex asks you to review new hooks before it runs them"
+        if present and self._strip_hooks(data, self.marker()):
+            return path, data, info, "removed evalkit turn hooks (capture is minimal)"
+        return None
 
     def uninstall(self, state: VendorState, dry_run: bool) -> List[Change]:
         changes: List[Change] = []
@@ -368,10 +407,19 @@ class CodexInstaller:
             path = Path(raw)
             if not path.exists():
                 continue
-            begin, end = info["block"]
+            if "block" in info:
+                begin, end = info["block"]
+                if not dry_run:
+                    write_atomic(path, replace_marker_block(path.read_text(), begin, end, None))
+                changes.append(Change(path, "removed [otel] block"))
+                continue
+            if "hookEvents" not in info:
+                continue
+            data = read_json(path)
+            removed = self._strip_hooks(data, info.get("marker") or self.marker())
             if not dry_run:
-                write_atomic(path, replace_marker_block(path.read_text(), begin, end, None))
-            changes.append(Change(path, "removed [otel] block"))
+                write_json(path, data)
+            changes.append(Change(path, f"removed {removed} turn hooks"))
         return changes
 
     def status(self, state: Optional[VendorState]) -> Dict[str, Any]:

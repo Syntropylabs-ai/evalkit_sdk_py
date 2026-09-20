@@ -6,7 +6,7 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import turns
+from . import codex_capture, turns
 from .config import ConfigStore
 from .otlp import attr, log_record, send_logs, send_traces
 from .turns import LOGS, TRACES, Record
@@ -15,6 +15,7 @@ _STDIN_CAP = 1024 * 1024
 _HARD_TIMEOUT = 5.0
 
 CLAUDE_CODE = "claude-code"
+CODEX = "codex"
 CLAUDE_EVENT_PREFIX = "claude_code"
 CLAUDE_EVENTS = {
     "PostToolUse": "tool_output",
@@ -76,13 +77,18 @@ def build_records(vendor: str, event: str, payload: Dict[str, Any], capture_cont
 def run_hook(vendor: str, event: str) -> int:
     def work() -> None:
         try:
-            cfg = ConfigStore().load()
+            store = ConfigStore()
+            cfg = store.load()
             if not cfg.key:
                 return
+            payload = _read_payload()
+            if vendor == CODEX:
+                codex_capture.hook_emit(store, cfg, payload)
+                return
             timeout = min(4.0, _HARD_TIMEOUT - 1)
-            for signal, payload in build_records(vendor, event, _read_payload(), cfg.capture == "full"):
+            for signal, body in build_records(vendor, event, payload, cfg.capture == "full"):
                 sender = send_traces if signal == TRACES else send_logs
-                sender(cfg.endpoint, cfg.key, payload, timeout=timeout)
+                sender(cfg.endpoint, cfg.key, body, timeout=timeout)
         except Exception:
             return
 

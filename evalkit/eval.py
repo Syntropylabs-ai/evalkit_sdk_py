@@ -416,24 +416,13 @@ def _announce(url: str) -> None:
     print(f"[evalkit] evaluation run: {url}")
 
 
-def _create_run(api: _RunApi, spec: _RunSpec) -> Optional[Dict[str, Any]]:
-    try:
-        created = api.create(spec)
-    except urllib.error.HTTPError as exc:
-        if exc.code == 404 or (exc.code == 400 and _rejects_missing_rows(exc)):
-            return None
-        raise
-    return created if created.get("runId") else None
-
-
-def _rejects_missing_rows(exc: urllib.error.HTTPError) -> bool:
-    text = getattr(exc, "response_text", None)
-    if text is None:
-        try:
-            text = exc.read().decode("utf-8", "replace")
-        except Exception:
-            text = ""
-    return "rows" in text.lower()
+def _create_run(api: _RunApi, spec: _RunSpec) -> Tuple[str, Optional[str]]:
+    created = api.create(spec)
+    run_id = created.get("runId")
+    if not run_id:
+        raise RuntimeError("[evalkit] POST /evaluation-runs answered without a runId")
+    url = created.get("url")
+    return str(run_id), (str(url) if url else None)
 
 
 def _summary_result(
@@ -470,13 +459,7 @@ def _summary_result(
 def _run_appended(
     api: _RunApi, client: Any, spec: _RunSpec, rows: _RunRows
 ) -> Optional[EvalResult]:
-    created = _create_run(api, spec)
-    if created is None:
-        _rows_endpoint_support[client] = False
-        return None
-    run_id = str(created["runId"])
-    url = created.get("url")
-    url = str(url) if url else None
+    run_id, url = _create_run(api, spec)
     if url:
         _announce(url)
     for start, stop in rows.batches():

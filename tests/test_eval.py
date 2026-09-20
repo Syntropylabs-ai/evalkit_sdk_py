@@ -374,18 +374,45 @@ class TestEval(unittest.TestCase):
         self.assertEqual(server.paths(), ["/evaluation-runs"])
         self.assertIn("rows", server.requests[0]["body"])
 
-    def test_rowless_create_rejected_falls_back_to_single_call(self):
+    def test_create_400_mentioning_rows_surfaces_and_is_not_sticky(self):
         with RunServer(mode="legacy") as server:
-            result = self._run(
-                server, name="old", data=[{"input": "q1", "output": "a1"}], evaluators=[RULE_A]
-            )
-        self.assertEqual(server.paths(), ["/evaluation-runs", "/evaluation-runs"])
-        self.assertEqual(result.job_id, "job_1")
-        self.assertIsNone(result.url)
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                self._run(server, name="old", data=[{"input": "q1", "output": "a1"}], evaluators=[RULE_A])
+        self.assertEqual(cm.exception.code, 400)
+        self.assertEqual(server.paths(), ["/evaluation-runs"])
+        self.assertIsNone(_rows_endpoint_support.get(self.client))
+
+        with RunServer() as server:
+            result = self._run(server, name="next", data=[{"input": "q2", "output": "a2"}], evaluators=[RULE_A])
+        self.assertEqual(
+            server.paths(), ["/evaluation-runs", "/evaluation-runs/run_1/rows", "/evaluation-runs/run_1/complete"]
+        )
+        self.assertEqual(result.run_id, "run_1")
+
+    def test_create_404_is_an_error_not_a_legacy_server(self):
+        with RunServer(mode="create-404") as server:
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                self._run(server, name="missing-rule", data=[{"input": "q1", "output": "a1"}], evaluators=[RULE_A])
+        self.assertEqual(cm.exception.code, 404)
+        self.assertIn("Evaluation rule(s) not found", cm.exception.response_text)
+        self.assertEqual(server.paths(), ["/evaluation-runs"])
+        self.assertIsNone(_rows_endpoint_support.get(self.client))
+
+    def test_create_without_run_id_raises(self):
+        class NoRunId(RunServer):
+            def route(self, path, body):
+                if path == "/evaluation-runs" and "rows" not in body:
+                    return 201, {"url": "https://app.test/x"}
+                return super().route(path, body)
+
+        with NoRunId() as server:
+            with self.assertRaises(RuntimeError):
+                self._run(server, name="odd", data=[{"input": "q1", "output": "a1"}], evaluators=[RULE_A])
+        self.assertEqual(server.paths(), ["/evaluation-runs"])
 
     def test_legacy_multi_batch_rolls_up_client_side_without_gate(self):
         rows = [{"input": f"q{g}", "output": f"a{g}"} for g in range(450)]
-        with RunServer(mode="legacy", legacy_respond=_patterned) as server:
+        with RunServer(mode="no-rows-endpoint", legacy_respond=_patterned) as server:
             result = self._run(
                 server,
                 name="big",
@@ -447,15 +474,16 @@ class TestEval(unittest.TestCase):
             self.assertIn(attrs.get("http.status_code"), (200, 201, 202))
 
     def test_http_error_propagates(self):
-        with RunServer(mode="legacy", legacy_respond=_bad_request) as server:
+        with RunServer(mode="no-rows-endpoint", legacy_respond=_bad_request) as server:
             with self.assertRaises(urllib.error.HTTPError) as cm:
                 self._run(server, name="bad", data=[{"input": "q1", "output": "a1"}], evaluators=[RULE_A])
         self.assertEqual(cm.exception.code, 400)
         self.assertIs(_rows_endpoint_support.get(self.client), False)
+        self.assertEqual(server.paths(), ["/evaluation-runs", "/evaluation-runs/run_1/rows", "/evaluation-runs"])
         self.client.flush()
         spans = [e for e in self.captured if (e.operation or "").startswith("POST /evaluation-runs")]
         self.assertTrue(spans)
-        self.assertEqual((getattr(spans[0], "attributes", {}) or {}).get("http.status_code"), 400)
+        self.assertEqual((getattr(spans[-1], "attributes", {}) or {}).get("http.status_code"), 400)
 
 
 if __name__ == "__main__":

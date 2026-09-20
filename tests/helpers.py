@@ -154,6 +154,8 @@ class RunServer:
                 return self.legacy_respond(body, len([b for b in self.bodies("/evaluation-runs") if "rows" in b]))
             if self.mode == "legacy":
                 return 400, {"statusCode": 400, "message": "rows should not be empty"}
+            if self.mode == "create-404":
+                return 404, {"statusCode": 404, "message": "Evaluation rule(s) not found: 665f0c1234567890abcdef12"}
             run_id = f"run_{len(self.runs) + 1}"
             self.runs.append(run_id)
             self.rows[run_id] = {}
@@ -175,6 +177,9 @@ class RunServer:
             self.completes.append(body)
             return 200, self.complete_payload(parts[2], body)
         return 404, {"statusCode": 404, "message": f"Cannot POST {path}"}
+
+    def route_get(self, path):
+        return 404, {"statusCode": 404, "message": f"Cannot GET {path}"}
 
     def complete_payload(self, run_id, body):
         rows = self.stored_rows(run_id)
@@ -226,6 +231,16 @@ def _run_handler(server):
                 }
             )
             status, payload = server.route(self.path, body)
+            data = json.dumps(payload).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            server.requests.append({"path": self.path, "body": None, "key": self.headers.get("X-Subscription-Key"), "raw": ""})
+            status, payload = server.route_get(self.path)
             data = json.dumps(payload).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")

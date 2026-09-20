@@ -31,7 +31,7 @@ class TestEvalExtras(unittest.TestCase):
         self.assertEqual(result.total_rows, 250)
 
     def test_legacy_fallback_keeps_single_batch_only_fields(self):
-        with RunServer(mode="legacy") as server:
+        with RunServer(mode="no-rows-endpoint") as server:
             evalkit.Eval(
                 "hp",
                 [{"input": str(i), "output": "b"} for i in range(3)],

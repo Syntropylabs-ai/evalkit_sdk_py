@@ -1,7 +1,7 @@
 import json
 import unittest
 
-from evalkit.core.secrets import is_secret_key, scrub_secrets, scrub_string, scrub_value
+from evalkit.core.secrets import is_secret_key, scrub_secrets, scrub_string, scrub_url, scrub_value
 from evalkit.core.types import SpanEvent, TraceEnvelope
 from tests.helpers import fresh, reset_context
 
@@ -100,6 +100,141 @@ UNTOUCHED_STRINGS = (
     "https://api.example.com/charge?id=7",
 )
 
+URL_CASES = (
+    (
+        "api_key in the query of http.url is masked and page is kept",
+        "http.url",
+        "https://api.example.com/v1/x?api_key=AKIAIOSFODNN7EXAMPLE&page=2",
+        "https://api.example.com/v1/x?api_key=***&page=2",
+    ),
+    (
+        "userinfo is masked",
+        "url.full",
+        "https://user:pass@api.example.com/v1/x",
+        "https://***@api.example.com/v1/x",
+    ),
+    (
+        "a key used as the username",
+        "url.full",
+        f"https://{LIVE_KEY}@api.example.com/v1/x",
+        "https://***@api.example.com/v1/x",
+    ),
+    (
+        "an unrelated query is untouched",
+        "http.url",
+        "https://api.example.com/search?q=hello&page=2",
+        "https://api.example.com/search?q=hello&page=2",
+    ),
+    (
+        "http.target is path and query without a scheme",
+        "http.target",
+        "/v1/x?access_token=abc&limit=5",
+        "/v1/x?access_token=***&limit=5",
+    ),
+    (
+        "url.query is a bare query string",
+        "url.query",
+        "sig=abc&se=2026-01-01",
+        "sig=***&se=2026-01-01",
+    ),
+    (
+        "server.address is a plain host",
+        "server.address",
+        "api.example.com",
+        "api.example.com",
+    ),
+    (
+        "a scheme-prefixed string under any key is a url",
+        "tool.args",
+        "wss://h/socket?token=abc",
+        "wss://h/socket?token=***",
+    ),
+    (
+        "query keys match case-insensitively and after url-decoding",
+        "http.url",
+        "https://h/p?api%5Fkey=a&API_KEY=b&Signature=c&sig=d&stream_key=e&key_id=keep&keyword=keep",
+        "https://h/p?api%5Fkey=***&API_KEY=***&Signature=***&sig=***&stream_key=***&key_id=keep&keyword=keep",
+    ),
+    (
+        "fragment parameters are masked like query parameters",
+        "http.url",
+        "https://app.example.com/cb#access_token=abc&token_type=bearer",
+        "https://app.example.com/cb#access_token=***&token_type=bearer",
+    ),
+    (
+        "flags, empty params and repeated equals are kept as they were",
+        "http.url",
+        "https://h/p?flag&token=abc&&x=1=2",
+        "https://h/p?flag&token=***&&x=1=2",
+    ),
+    (
+        "a url inside prose is free text, not a url",
+        "log.message",
+        "See https://example.com/x?token=abc for details",
+        "See https://example.com/x?token=abc for details",
+    ),
+    (
+        "prose around a url still gets pattern scrubbing",
+        "log.message",
+        f"See https://example.com/x?key={LIVE_KEY} for details",
+        "See https://example.com/x?key=tk_live_*** for details",
+    ),
+)
+
+NESTED_URL_CASES = (
+    (
+        "a url inside a json request body",
+        '{"url": "https://h/p?token=abc"}',
+        {"url": "https://h/p?token=***"},
+    ),
+    (
+        "a url inside a json array of objects",
+        '[{"endpoint": "https://h/p?api_key=abc"}, {"endpoint": "https://h/q?page=2"}]',
+        [{"endpoint": "https://h/p?api_key=***"}, {"endpoint": "https://h/q?page=2"}],
+    ),
+)
+
+OPERATION_CASES = (
+    (
+        "a subscription key in the operation query is pattern scrubbed",
+        f"GET /v1/traces?key={LIVE_KEY}",
+        "GET /v1/traces?key=tk_live_***",
+    ),
+    (
+        "the operation is free text, so a plain query value is left alone",
+        "GET /v1/traces?key=abc123",
+        "GET /v1/traces?key=abc123",
+    ),
+    (
+        "an ordinary operation name is untouched",
+        "TracingService.findById",
+        "TracingService.findById",
+    ),
+)
+
+PROSE_URL = "See https://example.com/x?token=abc for details"
+
+
+def _nested_url_json(levels):
+    leaf = {"url": "https://h/p?token=abc"}
+    for _ in range(levels):
+        leaf = {"a": leaf}
+    return json.dumps(leaf)
+
+
+def _envelope(**fields):
+    return TraceEnvelope(
+        trace_id="0" * 32,
+        span_id="1" * 16,
+        created_at="2026-09-09T00:00:00Z",
+        span_type="function_call",
+        **fields,
+    )
+
+
+def _scrub_attr(key, value):
+    return scrub_secrets(_envelope(attributes={key: value})).attributes[key]
+
 
 def _leaky_envelope():
     return TraceEnvelope(
@@ -107,7 +242,7 @@ def _leaky_envelope():
         span_id="1" * 16,
         created_at="2026-09-09T00:00:00Z",
         span_type="function_call",
-        operation="TracingService.findById",
+        operation=f"GET /v1/traces?key={LIVE_KEY}",
         status="ERROR",
         status_message=f"401 rejected for {LIVE_KEY}",
         prompt=f"the environment key is {LIVE_KEY}",
@@ -131,6 +266,7 @@ def _leaky_envelope():
             "http.response.headers": json.dumps({"set-cookie": "session=abc123"}),
             "gen_ai.usage.input_tokens": 11,
             "url.full": "https://api.example.com/charge",
+            "http.url": f"https://api.example.com/v1/x?api_key={LIVE_KEY}&page=2",
         },
         events=[SpanEvent(
             name="log",
@@ -139,6 +275,7 @@ def _leaky_envelope():
                 "log.message": f"calling with key {LIVE_KEY}",
                 "subscriptionKey": LIVE_KEY,
                 "user.email": "ada@example.com",
+                "http.url": f"https://api.example.com/v1/x?api_key={LIVE_KEY}",
             },
         )],
     )
@@ -188,7 +325,54 @@ class PatternTest(unittest.TestCase):
                 )
 
 
+class UrlScrubTest(unittest.TestCase):
+    def test_url_attributes_mask_credentials_and_keep_the_rest(self):
+        for name, key, raw, expected in URL_CASES:
+            with self.subTest(name):
+                self.assertEqual(_scrub_attr(key, raw), expected)
+
+    def test_scrub_url_is_idempotent_and_keeps_innocent_urls_byte_for_byte(self):
+        for name, key, raw, expected in URL_CASES:
+            if key in ("log.message",):
+                continue
+            with self.subTest(name):
+                self.assertEqual(_scrub_attr(key, expected), expected)
+
+    def test_scrub_url_handles_a_url_without_a_query_or_userinfo(self):
+        self.assertEqual(scrub_url("https://api.example.com/charge"), "https://api.example.com/charge")
+        self.assertEqual(scrub_url("https://@h/p"), "https://@h/p")
+
+    def test_urls_nested_in_json_attributes_are_masked(self):
+        for name, raw, expected in NESTED_URL_CASES:
+            with self.subTest(name):
+                self.assertEqual(json.loads(_scrub_attr("request.body", raw)), expected)
+
+    def test_the_depth_limit_still_applies_to_nested_urls(self):
+        shallow = _nested_url_json(3)
+        self.assertIn("token=***", _scrub_attr("request.body", shallow))
+        self.assertNotIn("token=abc", _scrub_attr("request.body", shallow))
+        deep = _nested_url_json(20)
+        self.assertEqual(_scrub_attr("request.body", deep), deep)
+
+    def test_a_url_in_event_attributes_is_masked(self):
+        event = scrub_secrets(_leaky_envelope()).events[0]
+        self.assertEqual(event.attributes["http.url"], "https://api.example.com/v1/x?api_key=***")
+
+
 class EnvelopeScrubTest(unittest.TestCase):
+    def test_the_operation_is_pattern_scrubbed_only(self):
+        for name, raw, expected in OPERATION_CASES:
+            with self.subTest(name):
+                self.assertEqual(scrub_secrets(_envelope(operation=raw)).operation, expected)
+
+    def test_a_url_inside_prompt_or_completion_prose_is_left_as_free_text(self):
+        env = scrub_secrets(_envelope(
+            prompt=PROSE_URL,
+            completion=f"See https://example.com/x?key={LIVE_KEY} for details",
+        ))
+        self.assertEqual(env.prompt, PROSE_URL)
+        self.assertEqual(env.completion, "See https://example.com/x?key=tk_live_*** for details")
+
     def test_json_string_attributes_are_parsed_scrubbed_and_reserialized(self):
         env = scrub_secrets(_leaky_envelope())
         result = json.loads(env.attributes["function.result"])
@@ -225,6 +409,8 @@ class EnvelopeScrubTest(unittest.TestCase):
         env = scrub_secrets(_leaky_envelope())
         self.assertEqual(env.attributes["gen_ai.usage.input_tokens"], 11)
         self.assertEqual(env.attributes["url.full"], "https://api.example.com/charge")
+        self.assertEqual(env.attributes["http.url"], "https://api.example.com/v1/x?api_key=***&page=2")
+        self.assertEqual(env.operation, "GET /v1/traces?key=tk_live_***")
 
     def test_no_live_key_survives_anywhere_in_the_payload(self):
         payload = json.dumps(scrub_secrets(_leaky_envelope()).to_dict())

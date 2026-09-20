@@ -344,6 +344,8 @@ result = evalkit.Eval(
 )
 print(result.url)                                 # printed once as the run starts, too
 print(result.job_id, result.average_score, result.pass_rate, result.passed)
+if result.passed is not True:                     # None = undecided: fail closed
+    sys.exit(1 if result.passed is False else 2)
 print(result.local_scores["exact_match"])         # one entry per row, None preserved
 for row in result.results:
     print(row["rowIndex"], row["overallScore"], row["passed"], row["status"])
@@ -387,13 +389,82 @@ server rule id.
 - `average_score` is the mean over rows that produced a finite score; `pass_rate` is
   `passed / (passed + failed)`. Both are `None` when undefined — never 0.
 - `result.passed` is `gate_result["passed"]` (`True` / `False` / `None` when a check
-  could not be decided), or `None` when no gate was given.
+  could not be decided — no comparable baseline, a `perMetricMinScore` metric the run
+  never scored, every row errored), or `None` when no gate was given. Gate on
+  `passed is not True`, never on `passed is False`: the latter lets an undecided run
+  through.
 - The client timeout is 600 s per request (`timeout=`); a 4xx/5xx raises
   `urllib.error.HTTPError`.
-- Against a deployment older than the append endpoints the SDK falls back to the
-  previous single-call behaviour: one job per batch (`result.job_ids`), aggregates
-  recomputed client-side, and `gate_result` / `comparison` `None` above one batch.
-  The fallback is detected once per client, not once per batch.
+- Against a deployment older than the append endpoints — `POST
+  /evaluation-runs/{runId}/rows` answers 404 — the SDK falls back to the previous
+  single-call behaviour: one job per batch (`result.job_ids`), aggregates recomputed
+  client-side, and `gate_result` / `comparison` `None` above one batch. The fallback is
+  detected once per client, not once per batch. A 400 or 404 from `POST
+  /evaluation-runs` itself (a validation error, an evaluator id that does not exist)
+  raises `urllib.error.HTTPError` — read `exc.response_text` for the server's message —
+  and is never mistaken for an old server.
+
+### CI: `evalkit eval`
+
+The same run from the command line, with the verdict as the exit code — so a pipeline
+step fails when the gate fails **and** when it cannot be decided.
+
+```bash
+evalkit eval run eval.json                          # a JSON config
+evalkit eval run evals/checkout.py                  # a module: its `eval` attribute
+evalkit eval run evals/checkout.py:smoke --json     # another attribute of it
+evalkit eval run evals.checkout:smoke               # an importable module works too
+evalkit eval gate <runId>                           # re-read the gate of a run made elsewhere
+```
+
+| Exit | Meaning |
+|---|---|
+| `0` | `gate_result["passed"]` is `True` |
+| `1` | it is `False` |
+| `2` | undecided: it is `None`, or the run had no gate. Pass `--allow-undecided` to exit `0` instead. |
+| `3` | the run could not be made or read (bad config, HTTP error, no key) |
+
+`eval.json` carries the `Eval()` arguments in camelCase — the same file works for the
+TypeScript CLI — (`name`, `evaluators`, `gate`, `judgeModel`, `baselineJobId`,
+`autoBaseline`, `hyperparameters`, `batchSize`, `timeoutMs`) plus either inline `data`
+or `dataFile` — a `.json` array or a `.jsonl` file of rows, resolved relative to the
+config — with the outputs already present:
+
+```json
+{
+  "name": "checkout · ${GITHUB_SHA}",
+  "dataFile": "rows.jsonl",
+  "evaluators": ["665f0c1234567890abcdef12"],
+  "judgeModel": "gpt-5-mini",
+  "autoBaseline": true,
+  "gate": { "minPassRate": 0.9, "maxRegressionsVsBaseline": 0 }
+}
+```
+
+A module target is `path/to/file.py[:attr]` or `package.module[:attr]` (`attr` defaults
+to `eval`). The attribute is a dict of `Eval()` keyword arguments (snake_case or
+camelCase), a zero-argument callable returning one — this is where a `task` and local
+scorers live — or an `EvalResult` when the callable runs `evalkit.Eval()` itself. The
+key comes from `--key`, `EVALKIT_API_KEY` or the config `evalkit coding install`
+stored; the API base from `--api-url`, `EVALKIT_API_URL` or
+`https://api.syntropylabs.ai`.
+
+The command prints the run link, the pass rate and average score, the per-metric
+averages, one table row per gate check (name · threshold · actual · passed/failed/
+undecided) and the verdict with the exit code it maps to. `--json` prints one object
+instead — `{"runId", "jobId", "url", "name", "totalRows", "erroredRows",
+"indeterminateRows", "passRate", "averageScore", "overallScores", "gate": {"passed",
+"checks", "evaluatedAt"}, "verdict"}` — to paste into a job summary or parse with `jq`.
+
+```yaml
+- run: evalkit eval run eval.json --json > eval-result.json
+  env:
+    EVALKIT_API_KEY: ${{ secrets.EVALKIT_API_KEY }}
+```
+
+`eval gate <runId>` reads `GET /evaluation-runs/{runId}` with the same key and applies
+the same exit codes, for pipelines that run the evaluation in one job and decide in
+another.
 
 ## Feedback and rewards
 
@@ -504,7 +575,7 @@ call `evalkit.patch_claude_agent_sdk()` explicitly if you install it later.
 
 ## Coding agents (Claude Code · Codex · Gemini CLI · Cursor · Windsurf · OpenCode)
 
-Installing the SDK also installs the `evalkit` command. It points a coding agent's own telemetry at your EvalKit environment so its sessions appear as one trace per turn — the main agent, every subagent and everything they did:
+Installing the SDK also installs the `evalkit` command (`evalkit eval` is described above). `evalkit coding` points a coding agent's own telemetry at your EvalKit environment so its sessions appear as one trace per turn — the main agent, every subagent and everything they did:
 
 ```bash
 evalkit coding install --vendor claude-code --key tk_live_...
@@ -514,10 +585,13 @@ evalkit coding install --vendor cursor --key tk_live_... --scope project
 evalkit coding install --vendor opencode --key tk_live_...
 evalkit coding status
 evalkit coding doctor
+evalkit coding backfill --vendor codex --last 5
 evalkit coding uninstall --vendor codex
 ```
 
 Flags: `--endpoint` (default `https://api.syntropylabs.ai/v1/otlp`), `--tenant` (optional: the tenant id `doctor` reads traces back with; without it doctor reads `/v1/traces/me/…`, which a receiver from 2026-09-15 on resolves from the key, so pass it only against an older receiver), `--scope user|project` (project writes into the current directory), `--capture minimal|full` (whether prompt, reply and tool text leave your machine; default minimal), `--no-traces` (keep log events only — spans are on by default wherever the vendor has them), `--no-subagents` (Claude Code: write no hooks at all), `--dry-run`, `--managed` (Claude Code: print a managed-settings snippet instead of writing).
+
+`evalkit coding backfill --vendor codex` reads Codex's own rollout files (`~/.codex/sessions/**/rollout-*.jsonl`) and emits the assistant replies its telemetry never exports, one `codex.assistant_message` log record per message (plus `codex.assistant_reasoning` when the rollout carries reasoning text), stamped with the turn's own OTEL trace id when the rollout recorded one: `--session <thread id>`, `--last N`, `--since <ISO>`, `--all`, `--dry-run`, `--force`, one summary line per session. A byte offset per file is kept in `~/.config/evalkit/codex-offsets.json`, so re-running never emits the same message twice; nothing textual is sent unless the stored capture mode is `full`.
 
 The key and endpoint are stored once in `~/.config/evalkit/config.env` (mode 0600); `~/.config/evalkit/state.json` records exactly what was written so `uninstall` removes only that and restores any value it replaced. The key is never printed.
 
@@ -526,7 +600,7 @@ The key and endpoint are stored once in `~/.config/evalkit/config.env` (mode 060
 | Vendor | One tree per turn | Tool calls | Tool output | Prompt & reply | Subagents | Tokens & cost |
 |---|---|---|---|---|---|---|
 | `claude-code` | yes — the agent's own spans (`--no-traces` falls back to flat log events) | yes | `--capture full` | `--capture full` | yes, nested under the `Agent` tool call | yes (tokens on the span, cost from the `api_request` event) |
-| `codex` | yes — the turn span; Codex's ~150 internal plumbing spans are dropped by the receiver | when Codex emits them | `--capture full` | prompt with `--capture full` | no | yes (`sse_event` tokens, `turn_cost`) |
+| `codex` | yes — the turn span; Codex's ~150 internal plumbing spans are dropped by the receiver | when Codex emits them | `--capture full` | prompt from Codex, reply from the rollout file (the `Stop` hook, or `backfill`) — both `--capture full` | no | yes (`sse_event` tokens, `turn_cost`) |
 | `gemini-cli` | yes — `agent_call` / `llm_call` / `tool_call` spans | yes | no | `--capture full` | `agent_call` spans | tokens yes, cost no |
 | `cursor` | yes — built by the hooks with deterministic span ids | yes | `--capture full` | `--capture full` | yes (`subagentStart` / `subagentStop`) | no — Cursor's hooks carry neither |
 | `windsurf` | yes — same construction | yes | `--capture full` | `--capture full` | no (Cascade has no subagent events) | no |
@@ -537,7 +611,7 @@ The key and endpoint are stored once in `~/.config/evalkit/config.env` (mode 060
 | Vendor | What `install` writes | How data flows | Remove |
 |---|---|---|---|
 | `claude-code` | `env` keys in `~/.claude/settings.json` (or `.claude/settings.json`): `CLAUDE_CODE_ENABLE_TELEMETRY`, `OTEL_*_EXPORTER=otlp`, `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`, endpoint, `Authorization=Bearer` header, resource attribute `evalkit.vendor=claude-code`; span mode is on by default (`CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1`, `OTEL_TRACES_EXPORTER=otlp`, `OTEL_TRACES_EXPORT_INTERVAL=1000`) and `--no-traces` removes those three; `--capture full` adds `OTEL_LOG_USER_PROMPTS`, `OTEL_LOG_ASSISTANT_RESPONSES`, `OTEL_LOG_TOOL_DETAILS`, `OTEL_LOG_TOOL_CONTENT` and `OTEL_LOG_RAW_API_BODIES` plus `CLAUDE_CODE_OTEL_CONTENT_MAX_LENGTH=524288` — Claude Code cuts each body at 60 KB by default, which is smaller than its own system prompt, so the cap is raised to 512 K characters. The same file drives the VS Code and JetBrains flavours | In span mode Claude Code opens one trace per turn: a `claude_code.interaction` root with `llm_request` and `tool` children, and a subagent's work nested under the `Agent` tool's execution span. Content and cost still arrive as log events (`api_request`, `api_request_body` / `api_response_body`, `assistant_response`, `user_prompt`, `tool_result`, `subagent_completed`) which the receiver merges onto the matching span by trace and span id. Unless `--no-subagents`, `PostToolUse` and `SubagentStop` hooks (5 s timeout, always exit 0) post `claude_code.tool_output` and `claude_code.subagent_stop` so non-Bash tool output and the subagent's last message are covered too | `uninstall` deletes those keys, restores previous values — including a key you had already set to the same value we write — and removes only the hooks whose command contains `coding hook --vendor claude-code`. Files written under the other `--scope` are remembered too |
-| `codex` | an `[otel]` table between `# evalkit-managed-begin/end` markers in `~/.codex/config.toml` (or `.codex/config.toml`) with log, **trace** and metrics exporters pointing at `<endpoint>/v1/{logs,traces,metrics}`; `--no-traces` writes `trace_exporter = "none"`; refuses to run if an `[otel]` table already exists outside the markers | Codex's native export: the turn span plus `codex.api_request`, `sse_event` token counts, `turn_cost`, `tool_result`, `user_prompt` (event names live in the `event.name` attribute) | `uninstall` removes the block |
+| `codex` | an `[otel]` table between `# evalkit-managed-begin/end` markers in `~/.codex/config.toml` (or `.codex/config.toml`) with log, **trace** and metrics exporters pointing at `<endpoint>/v1/{logs,traces,metrics}`; `--no-traces` writes `trace_exporter = "none"`; refuses to run if an `[otel]` table already exists outside the markers. With `--capture full` it also merges `Stop` (5 s) and `SessionEnd` (3 s — Codex clamps that event to 3) hook entries into `~/.codex/hooks.json`, leaving any other hook alone | Codex's native export: the turn span plus `codex.api_request`, `sse_event` token counts, `turn_cost`, `tool_result`, `user_prompt` (event names live in the `event.name` attribute). Codex never exports the assistant's reply, so the hook reads it out of the rollout file the CLI writes anyway and posts `codex.assistant_message` / `codex.assistant_reasoning` with `conversation.id`, `turn.id`, `item.id` and `completion`, on the trace id Codex itself used for that turn (`event_msg/task_started.trace_id`, absent in pre-2026-09 sessions — then the receiver joins by `turn.id` as before); Codex marks a newly written hook **untrusted** and asks you to review it before it runs, and `backfill` covers whatever the hook missed | `uninstall` removes the block and only the hook entries whose command contains `coding hook --vendor codex` |
 | `gemini-cli` | `telemetry` block in `~/.gemini/settings.json` (`otlpProtocol: http`, `traces: true` unless `--no-traces`, `logPrompts` false unless `--capture full`) and the `OTEL_EXPORTER_OTLP_HEADERS` line between `# evalkit-begin/end` markers in `~/.gemini/.env` | Gemini CLI's native spans (`gen_ai.operation.name` = `agent_call` / `llm_call` / `tool_call`) plus `gemini_cli.*` events correlated by `prompt_id` | `uninstall` restores the previous `telemetry` values and removes the marker block |
 | `cursor` | 12 hook entries (`evalkit coding hook --vendor cursor --event …`, 5 s timeout) in `~/.cursor/hooks.json`; other hooks untouched | Cursor has no telemetry export, so the hook **builds the trace itself**: trace id = `sha256(conversation_id + generation_id)[:32]`, turn root span id = `sha256(generation_id)[:16]`, tool span id = `sha256(tool_use_id)[:16]` (start = now − `duration`), subagent span id = `sha256(subagent_id)[:16]` parented to `sha256(tool_call_id)[:16]`. `beforeSubmitPrompt` opens the turn, `afterAgentResponse` / `stop` complete it with an enrichment record, `subagentStop` completes the subagent | `uninstall` removes only entries whose command contains `coding hook --vendor cursor`; a reinstall also drops entries for events we no longer use |
 | `windsurf` | 6 hook entries in `~/.codeium/windsurf/hooks.json` (project scope: `.windsurf/hooks.json`) | same construction with `trajectory_id` as the session and `execution_id` as the turn; `post_run_command`, `post_write_code`, `post_read_code` and `post_mcp_tool_use` become tool spans, `post_cascade_response` completes the turn | same |
@@ -632,8 +706,8 @@ sensitive-header list (`authorization`, `cookie`, `set-cookie`, `x-api-key`, `ap
 `x-auth-token`, `proxy-authorization`, `x-secret`, `x-access-token`, `x-subscription-key`,
 `subscription-key`, `token`, `password`).
 
-**By pattern.** Inside any string — attributes, event attributes, prompt, completion, status
-message — these are replaced by their own prefix followed by `***`:
+**By pattern.** Inside any string — attributes, event attributes, operation, prompt, completion,
+status message — these are replaced by their own prefix followed by `***`:
 
 | Pattern | Becomes |
 | ---------------------------------- | ------------- |
@@ -646,6 +720,17 @@ message — these are replaced by their own prefix followed by `***`:
 
 Strings that contain no secret are left byte for byte, JSON strings included — nothing is
 reformatted on the way through.
+
+**By URL.** `http.url`, `url.full`, `http.target`, `url.query` and `server.address` are always read
+as URLs, and so is any other attribute value — including values nested inside JSON strings — that is
+a single `http://`, `https://`, `ws://` or `wss://` URL and nothing else. Userinfo is masked
+(`https://user:pass@host/x` becomes `https://***@host/x`), and every query or fragment parameter
+whose key is on the by-key list, on the sensitive-header list, or is `key`, `sig` or `signature` as
+the whole key or its final segment has its value replaced by `***`; keys are matched
+case-insensitively after URL-decoding. Every other parameter keeps its value and position, so
+`?api_key=AKIA…&page=2` becomes `?api_key=***&page=2` and `?q=hello` is untouched. A URL inside
+prose — a prompt, a completion, an operation name, a log line — is free text and only goes through
+the pattern list above.
 
 Identity is deliberately **not** masked. Email addresses, user IDs, session IDs and device IDs pass
 through untouched: they are what the Users view, per-user cost and session replay are built on. A

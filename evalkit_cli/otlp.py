@@ -7,13 +7,15 @@ import urllib.request
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 _MAX_ATTR = 4096
+MAX_CONTENT = 524288
+SDK_NAME = "evalkit-cli"
 
 
 def json_text(value: Any) -> str:
     return json.dumps(value, separators=(",", ":"), default=str)
 
 
-def attr(key: str, value: Any) -> Dict[str, Any]:
+def attr(key: str, value: Any, limit: int = _MAX_ATTR) -> Dict[str, Any]:
     if isinstance(value, bool):
         return {"key": key, "value": {"boolValue": value}}
     if isinstance(value, int):
@@ -21,8 +23,53 @@ def attr(key: str, value: Any) -> Dict[str, Any]:
     if isinstance(value, float):
         return {"key": key, "value": {"doubleValue": value}}
     if isinstance(value, str):
-        return {"key": key, "value": {"stringValue": value[:_MAX_ATTR]}}
-    return {"key": key, "value": {"stringValue": json_text(value)[:_MAX_ATTR]}}
+        return {"key": key, "value": {"stringValue": value[:limit]}}
+    return {"key": key, "value": {"stringValue": json_text(value)[:limit]}}
+
+
+def log_item(
+    name: str,
+    attributes: Iterable[Dict[str, Any]],
+    body: Optional[str] = None,
+    trace: Optional[str] = None,
+    span: Optional[str] = None,
+    at_ns: Optional[int] = None,
+) -> Dict[str, Any]:
+    when = str(at_ns if at_ns else time.time_ns())
+    record: Dict[str, Any] = {
+        "timeUnixNano": when,
+        "observedTimeUnixNano": str(time.time_ns()),
+        "severityText": "INFO",
+        "body": {"stringValue": body or name},
+        "attributes": [attr("event.name", name), *attributes],
+    }
+    if trace:
+        record["traceId"] = trace
+    if span:
+        record["spanId"] = span
+    return record
+
+
+def log_envelope(vendor: str, records: Iterable[Dict[str, Any]], service: Optional[str] = None) -> Dict[str, Any]:
+    return {
+        "resourceLogs": [
+            {
+                "resource": {
+                    "attributes": [
+                        attr("service.name", service or vendor),
+                        attr("agent.vendor", vendor),
+                        attr("telemetry.sdk.name", SDK_NAME),
+                    ]
+                },
+                "scopeLogs": [
+                    {
+                        "scope": {"name": SDK_NAME},
+                        "logRecords": list(records),
+                    }
+                ],
+            }
+        ]
+    }
 
 
 def log_record(
@@ -33,39 +80,10 @@ def log_record(
     prefix: Optional[str] = None,
     trace: Optional[str] = None,
     span: Optional[str] = None,
+    service: Optional[str] = None,
 ) -> Dict[str, Any]:
-    now = str(time.time_ns())
     name = f"{prefix or vendor}.{event}"
-    record: Dict[str, Any] = {
-        "timeUnixNano": now,
-        "observedTimeUnixNano": now,
-        "severityText": "INFO",
-        "body": {"stringValue": body or name},
-        "attributes": [attr("event.name", name), *attributes],
-    }
-    if trace:
-        record["traceId"] = trace
-    if span:
-        record["spanId"] = span
-    return {
-        "resourceLogs": [
-            {
-                "resource": {
-                    "attributes": [
-                        attr("service.name", vendor),
-                        attr("agent.vendor", vendor),
-                        attr("telemetry.sdk.name", "evalkit-cli"),
-                    ]
-                },
-                "scopeLogs": [
-                    {
-                        "scope": {"name": "evalkit-cli"},
-                        "logRecords": [record],
-                    }
-                ],
-            }
-        ]
-    }
+    return log_envelope(vendor, [log_item(name, attributes, body, trace, span)], service)
 
 
 def send(endpoint: str, key: str, signal: str, record: Dict[str, Any], timeout: float = 4.0) -> Tuple[Optional[int], Optional[str]]:

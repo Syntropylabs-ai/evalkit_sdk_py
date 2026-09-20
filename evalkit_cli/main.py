@@ -12,7 +12,8 @@ from .config import ConfigStore
 from .files import MalformedFile
 from .vendors import VENDORS, ClaudeCodeInstaller, InstallOptions, VendorState, installer_for
 
-HOOK_VENDORS = ("claude-code", "cursor", "windsurf")
+HOOK_VENDORS = ("claude-code", "codex", "cursor", "windsurf")
+BACKFILL_VENDORS = ("codex",)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -56,7 +57,39 @@ def _parser() -> argparse.ArgumentParser:
     hook = actions.add_parser("hook")
     hook.add_argument("--vendor", required=True, choices=HOOK_VENDORS)
     hook.add_argument("--event", required=True)
+
+    backfill = actions.add_parser("backfill", help="emit the assistant replies a coding agent wrote to disk but never exported")
+    backfill.add_argument("--vendor", required=True, choices=BACKFILL_VENDORS)
+    backfill.add_argument("--session", help="thread id to read (default: the most recent session)")
+    backfill.add_argument("--last", type=int, help="read the N most recent sessions")
+    backfill.add_argument("--since", help="skip sessions last updated before this ISO timestamp")
+    backfill.add_argument("--all", action="store_true", help="read every session on disk")
+    backfill.add_argument("--dry-run", action="store_true", help="print what would be emitted and emit nothing")
+    backfill.add_argument("--force", action="store_true", help="ignore the stored offsets and re-read each session from the start")
+
+    evaluation = sub.add_parser("eval", help="run an evaluation and gate a CI step on its verdict")
+    eval_actions = evaluation.add_subparsers(dest="action", required=True)
+    run = eval_actions.add_parser(
+        "run",
+        help="run Eval() from eval.json or module.py[:attr]; exit 0 passed, 1 failed, 2 undecided, 3 error",
+    )
+    run.add_argument("target", help="eval.json, or module.py[:attr] / package.module[:attr] (attr defaults to 'eval')")
+    _eval_flags(run)
+    gate = eval_actions.add_parser("gate", help="read an existing run's gate and exit with the same codes")
+    gate.add_argument("run_id")
+    _eval_flags(gate)
     return parser
+
+
+def _eval_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--key", help="subscription key (default: EVALKIT_API_KEY, then the stored coding config)")
+    parser.add_argument("--api-url", help="control-plane base URL (default: EVALKIT_API_URL, then https://api.syntropylabs.ai)")
+    parser.add_argument("--json", action="store_true", help="print the run summary and gate as one JSON object")
+    parser.add_argument(
+        "--allow-undecided",
+        action="store_true",
+        help="exit 0 instead of 2 when the gate could not be decided (no gate, or a check without data)",
+    )
 
 
 def cmd_install(args: argparse.Namespace, store: ConfigStore, out) -> int:
@@ -195,6 +228,10 @@ def main(argv: Optional[List[str]] = None, home: Optional[Path] = None, out=None
     out = out or sys.stdout
     args = _parser().parse_args(argv)
     store = ConfigStore(home)
+    if args.command == "eval":
+        from .evaluation import cmd_eval_gate, cmd_eval_run
+
+        return cmd_eval_run(args, store, out) if args.action == "run" else cmd_eval_gate(args, store, out)
     if args.command != "coding":
         return 2
     if args.action == "install":
@@ -209,6 +246,10 @@ def main(argv: Optional[List[str]] = None, home: Optional[Path] = None, out=None
         from .hook import run_hook
 
         return run_hook(args.vendor, args.event)
+    if args.action == "backfill":
+        from .codex_capture import cmd_backfill
+
+        return cmd_backfill(args, store, out)
     return 2
 
 
