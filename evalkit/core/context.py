@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextvars import ContextVar, Token
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, List, Mapping, Optional
 
 
@@ -157,6 +157,19 @@ def _otel_span_ctx() -> Optional[SpanContext]:
 
 def current_span_ctx() -> Optional[SpanContext]:
     return _current_span.get() or _otel_span_ctx()
+
+
+def child_span_ctx(trace_id: str, span_id: str) -> SpanContext:
+    """The context of a span started under the current one: its own ids, its parent's identity and agent.
+
+    An instrumented call is the current span while it runs, and whatever starts inside it (the
+    HTTP client, another OpenTelemetry library) reads its session, user and agent from here;
+    bare ids would drop them to the process-wide defaults.
+    """
+    parent = _current_span.get()
+    if parent is None or parent.trace_id != trace_id:
+        return SpanContext(trace_id=trace_id, span_id=span_id)
+    return replace(parent, span_id=span_id)
 
 
 def get_or_create_ambient_trace_id() -> str:

@@ -19,6 +19,52 @@ if TYPE_CHECKING:
     from ..core.client import EvalKitClient
 
 
+# The request settings, besides the model and the system prompt, that tell one agent
+# configuration from another. The trace service fingerprints agent versions from them.
+_SAMPLING_PARAMS = {
+    "temperature": "gen_ai.request.temperature",
+    "top_p": "gen_ai.request.top_p",
+    "max_tokens": "gen_ai.request.max_tokens",
+    "max_completion_tokens": "gen_ai.request.max_tokens",
+    "max_output_tokens": "gen_ai.request.max_tokens",
+}
+
+
+def _request_attrs(kwargs: dict) -> dict:
+    """The declared tool names and sampling parameters of a chat request."""
+    attrs: dict = {}
+    tools = kwargs.get("tools")
+    if isinstance(tools, (list, tuple)):
+        names = [name for name in map(_tool_name, tools) if name]
+        if names:
+            attrs["gen_ai.request.tools"] = names
+    for param, key in _SAMPLING_PARAMS.items():
+        value = kwargs.get(param)
+        # The clients' NOT_GIVEN sentinels and booleans are not settings.
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            attrs[key] = value
+    return attrs
+
+
+def _tool_name(tool) -> str | None:
+    """OpenAI chat nests the name under ``function``; Anthropic and Responses name the tool
+    at the top, and a built-in tool (web search, code interpreter) has only its type."""
+    def field(obj, key):
+        return obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
+
+    function = field(tool, "function")
+    name = (function is not None and field(function, "name")) or field(tool, "name") or field(tool, "type")
+    return name if isinstance(name, str) and name else None
+
+
+def _system_text(system) -> str:
+    """Anthropic's ``system`` as text; a list of blocks is how prompt caching passes it."""
+    if not isinstance(system, (list, tuple)):
+        return str(system)
+    texts = [block.get("text") if isinstance(block, dict) else getattr(block, "text", None) for block in system]
+    return "\n".join(t for t in texts if isinstance(t, str))
+
+
 def _try_patch_openai(ek: "EvalKitClient") -> None:
     try:
         import openai.resources.chat.completions.completions as _oc
@@ -42,7 +88,7 @@ def _patch_openai_class_sync(ek: "EvalKitClient", cls, provider: str = "openai")
         return
     import time
     from ..core.client import _new_span_id, _now_iso
-    from ..core.context import SpanContext, _current_span, current_span_ctx, get_or_create_ambient_trace_id
+    from ..core.context import _current_span, child_span_ctx, current_span_ctx, get_or_create_ambient_trace_id
     from ..core.types import SpanEvent, TraceEnvelope
     from .._version import SDK_VERSION
 
@@ -70,7 +116,7 @@ def _patch_openai_class_sync(ek: "EvalKitClient", cls, provider: str = "openai")
             ) -> None:
                 end_ts = _now_iso()
                 latency = int(time.time() * 1000 - start_ms)
-                stream_attrs = {**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True}
+                stream_attrs = {**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs), "gen_ai.streaming": True}
                 if reasoning_tokens:
                     stream_attrs["gen_ai.usage.reasoning_tokens"] = reasoning_tokens
                 if ttft_ms is not None:
@@ -99,7 +145,7 @@ def _patch_openai_class_sync(ek: "EvalKitClient", cls, provider: str = "openai")
                 original(self, *args, **kwargs), wrapped_done, start_ms=start_ms, state=state,
             )
 
-        span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
+        span_ctx = child_span_ctx(trace_id, span_id)
         token = _current_span.set(span_ctx)
         try:
             result = original(self, *args, **kwargs)
@@ -112,7 +158,7 @@ def _patch_openai_class_sync(ek: "EvalKitClient", cls, provider: str = "openai")
                 service_name=ek._opts.service_name, provider=provider, model=model,
                 prompt=prompt, latency_ms=int(time.time() * 1000 - start_ms),
                 start_time=ts, end_time=_now_iso(), created_at=ts,
-                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_exc_attrs(exc)},
+                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs), **_exc_attrs(exc)},
                 environment=ek._opts.environment, app_version=ek._opts.app_version,
                 sdk_version=SDK_VERSION,
             ))
@@ -135,7 +181,7 @@ def _patch_openai_class_sync(ek: "EvalKitClient", cls, provider: str = "openai")
             prompt_details = getattr(usage, "prompt_tokens_details", None)
             cache_read_tokens = getattr(prompt_details, "cached_tokens", 0) or 0
             events = from_openai_chat(result, end_ts)
-            attrs = {**ek._meta_attrs(), "gen_ai.request.model": model,
+            attrs = {**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs),
                      "gen_ai.response.model": getattr(result, "model", model),
                      "gen_ai.usage.total_tokens": getattr(usage, "total_tokens", 0) or 0}
             if reasoning_tokens:
@@ -167,7 +213,7 @@ def _patch_openai_class_async(ek: "EvalKitClient", cls, provider: str = "openai"
         return
     import time
     from ..core.client import _new_span_id, _now_iso
-    from ..core.context import SpanContext, _current_span, current_span_ctx, get_or_create_ambient_trace_id
+    from ..core.context import _current_span, child_span_ctx, current_span_ctx, get_or_create_ambient_trace_id
     from ..core.types import SpanEvent, TraceEnvelope
     from .._version import SDK_VERSION
 
@@ -195,7 +241,7 @@ def _patch_openai_class_async(ek: "EvalKitClient", cls, provider: str = "openai"
             ) -> None:
                 end_ts = _now_iso()
                 latency = int(time.time() * 1000 - start_ms)
-                stream_attrs = {**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True}
+                stream_attrs = {**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs), "gen_ai.streaming": True}
                 if reasoning_tokens:
                     stream_attrs["gen_ai.usage.reasoning_tokens"] = reasoning_tokens
                 if ttft_ms is not None:
@@ -223,7 +269,7 @@ def _patch_openai_class_async(ek: "EvalKitClient", cls, provider: str = "openai"
             raw = await original(self, *args, **kwargs)
             return _AsyncStreamTracer(raw, wrapped_done, start_ms=start_ms, state=state)
 
-        span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
+        span_ctx = child_span_ctx(trace_id, span_id)
         token = _current_span.set(span_ctx)
         try:
             result = await original(self, *args, **kwargs)
@@ -236,7 +282,7 @@ def _patch_openai_class_async(ek: "EvalKitClient", cls, provider: str = "openai"
                 service_name=ek._opts.service_name, provider=provider, model=model,
                 prompt=prompt, latency_ms=int(time.time() * 1000 - start_ms),
                 start_time=ts, end_time=end_ts, created_at=ts,
-                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_exc_attrs(exc)},
+                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs), **_exc_attrs(exc)},
                 environment=ek._opts.environment, app_version=ek._opts.app_version,
                 sdk_version=SDK_VERSION,
             ))
@@ -258,7 +304,7 @@ def _patch_openai_class_async(ek: "EvalKitClient", cls, provider: str = "openai"
             prompt_details = getattr(usage, "prompt_tokens_details", None)
             cache_read_tokens = getattr(prompt_details, "cached_tokens", 0) or 0
             events = from_openai_chat(result, end_ts)
-            attrs = {**ek._meta_attrs(), "gen_ai.request.model": model,
+            attrs = {**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs),
                      "gen_ai.response.model": getattr(result, "model", model),
                      "gen_ai.usage.total_tokens": getattr(usage, "total_tokens", 0) or 0}
             if reasoning_tokens:
@@ -325,7 +371,7 @@ def _patch_anthropic_class_sync(ek: "EvalKitClient", cls) -> None:
         return
     import time
     from ..core.client import _new_span_id, _now_iso
-    from ..core.context import SpanContext, _current_span, current_span_ctx, get_or_create_ambient_trace_id
+    from ..core.context import _current_span, child_span_ctx, current_span_ctx, get_or_create_ambient_trace_id
     from ..core.types import SpanEvent, TraceEnvelope
     from .._version import SDK_VERSION
 
@@ -341,7 +387,7 @@ def _patch_anthropic_class_sync(ek: "EvalKitClient", cls) -> None:
         model = kwargs.get("model", "unknown")
         system = kwargs.get("system")
         messages = kwargs.get("messages", [])
-        parts = ([f"system: {system}"] if system else []) + [
+        parts = ([f"system: {_system_text(system)}"] if system else []) + [
             f"{m.get('role','')}: {m.get('content','')}" for m in messages
         ]
         prompt = "\n".join(parts)
@@ -357,7 +403,7 @@ def _patch_anthropic_class_sync(ek: "EvalKitClient", cls) -> None:
             ) -> None:
                 end_ts = _now_iso()
                 latency = int(time.time() * 1000 - start_ms)
-                stream_attrs = {**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True}
+                stream_attrs = {**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs), "gen_ai.streaming": True}
                 if thinking:
                     stream_attrs["gen_ai.response.thinking"] = thinking[:32768]
                 if has_redacted_thinking:
@@ -386,7 +432,7 @@ def _patch_anthropic_class_sync(ek: "EvalKitClient", cls) -> None:
                 is_anthropic=True, start_ms=start_ms, state=state,
             )
 
-        span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
+        span_ctx = child_span_ctx(trace_id, span_id)
         token = _current_span.set(span_ctx)
         try:
             result = original(self, *args, **kwargs)
@@ -399,7 +445,7 @@ def _patch_anthropic_class_sync(ek: "EvalKitClient", cls) -> None:
                 service_name=ek._opts.service_name, provider="anthropic", model=model,
                 prompt=prompt, latency_ms=int(time.time() * 1000 - start_ms),
                 start_time=ts, end_time=end_ts, created_at=ts,
-                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_exc_attrs(exc)},
+                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs), **_exc_attrs(exc)},
                 environment=ek._opts.environment, app_version=ek._opts.app_version,
                 sdk_version=SDK_VERSION,
             ))
@@ -421,6 +467,7 @@ def _patch_anthropic_class_sync(ek: "EvalKitClient", cls) -> None:
         attrs = {
             **ek._meta_attrs(),
             "gen_ai.request.model": model,
+            **_request_attrs(kwargs),
             "gen_ai.response.model": getattr(result, "model", model),
             "gen_ai.response.id": getattr(result, "id", ""),
             "gen_ai.usage.total_tokens": tokens_in + tokens_out,
@@ -456,7 +503,7 @@ def _patch_anthropic_class_async(ek: "EvalKitClient", cls) -> None:
         return
     import time
     from ..core.client import _new_span_id, _now_iso
-    from ..core.context import SpanContext, _current_span, current_span_ctx, get_or_create_ambient_trace_id
+    from ..core.context import _current_span, child_span_ctx, current_span_ctx, get_or_create_ambient_trace_id
     from ..core.types import SpanEvent, TraceEnvelope
     from .._version import SDK_VERSION
 
@@ -472,7 +519,7 @@ def _patch_anthropic_class_async(ek: "EvalKitClient", cls) -> None:
         model = kwargs.get("model", "unknown")
         system = kwargs.get("system")
         messages = kwargs.get("messages", [])
-        parts = ([f"system: {system}"] if system else []) + [
+        parts = ([f"system: {_system_text(system)}"] if system else []) + [
             f"{m.get('role','')}: {m.get('content','')}" for m in messages
         ]
         prompt = "\n".join(parts)
@@ -488,7 +535,7 @@ def _patch_anthropic_class_async(ek: "EvalKitClient", cls) -> None:
             ) -> None:
                 end_ts = _now_iso()
                 latency = int(time.time() * 1000 - start_ms)
-                stream_attrs = {**ek._meta_attrs(), "gen_ai.request.model": model, "gen_ai.streaming": True}
+                stream_attrs = {**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs), "gen_ai.streaming": True}
                 if thinking:
                     stream_attrs["gen_ai.response.thinking"] = thinking[:32768]
                 if has_redacted_thinking:
@@ -517,7 +564,7 @@ def _patch_anthropic_class_async(ek: "EvalKitClient", cls) -> None:
                 raw, on_stream_done, is_anthropic=True, start_ms=start_ms, state=state,
             )
 
-        span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
+        span_ctx = child_span_ctx(trace_id, span_id)
         token = _current_span.set(span_ctx)
         try:
             result = await original(self, *args, **kwargs)
@@ -530,7 +577,7 @@ def _patch_anthropic_class_async(ek: "EvalKitClient", cls) -> None:
                 service_name=ek._opts.service_name, provider="anthropic", model=model,
                 prompt=prompt, latency_ms=int(time.time() * 1000 - start_ms),
                 start_time=ts, end_time=end_ts, created_at=ts,
-                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_exc_attrs(exc)},
+                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs), **_exc_attrs(exc)},
                 environment=ek._opts.environment, app_version=ek._opts.app_version,
                 sdk_version=SDK_VERSION,
             ))
@@ -552,6 +599,7 @@ def _patch_anthropic_class_async(ek: "EvalKitClient", cls) -> None:
         attrs = {
             **ek._meta_attrs(),
             "gen_ai.request.model": model,
+            **_request_attrs(kwargs),
             "gen_ai.response.model": getattr(result, "model", model),
             "gen_ai.response.id": getattr(result, "id", ""),
             "gen_ai.usage.total_tokens": tokens_in + tokens_out,
@@ -726,7 +774,7 @@ def _patch_openai_responses_sync(ek: "EvalKitClient", cls) -> None:
         return
     import time
     from ..core.client import _new_span_id, _now_iso
-    from ..core.context import SpanContext, _current_span, current_span_ctx, get_or_create_ambient_trace_id
+    from ..core.context import _current_span, child_span_ctx, current_span_ctx, get_or_create_ambient_trace_id
     from ..core.types import SpanEvent, TraceEnvelope
     from .._version import SDK_VERSION
 
@@ -770,7 +818,7 @@ def _patch_openai_responses_sync(ek: "EvalKitClient", cls) -> None:
             tool_events_box: list[SpanEvent] = []
             done_box = [False]
 
-            span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
+            span_ctx = child_span_ctx(trace_id, span_id)
             token = _current_span.set(span_ctx)
             try:
                 raw_stream = original(self, *args, **kwargs)
@@ -784,7 +832,7 @@ def _patch_openai_responses_sync(ek: "EvalKitClient", cls) -> None:
                     service_name=ek._opts.service_name, provider="openai", model=model,
                     prompt=prompt[:32768], latency_ms=int(time.time() * 1000 - start_ms),
                     start_time=ts, end_time=end_ts, created_at=ts,
-                    attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_exc_attrs(exc)},
+                    attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs), **_exc_attrs(exc)},
                     environment=ek._opts.environment, app_version=ek._opts.app_version,
                     sdk_version=SDK_VERSION,
                 ))
@@ -806,7 +854,7 @@ def _patch_openai_responses_sync(ek: "EvalKitClient", cls) -> None:
                     tokens_in=tokens_in_box[0], tokens_out=tokens_out_box[0],
                     latency_ms=latency2, start_time=ts, end_time=end_ts2, created_at=ts,
                     events=tool_events_box or None,
-                    attributes={**ek._meta_attrs(), "gen_ai.request.model": model,
+                    attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs),
                                 "gen_ai.streaming": True,
                                 "gen_ai.usage.total_tokens": tokens_in_box[0] + tokens_out_box[0]},
                     environment=ek._opts.environment, app_version=ek._opts.app_version,
@@ -851,7 +899,7 @@ def _patch_openai_responses_sync(ek: "EvalKitClient", cls) -> None:
 
             return _ResponsesStreamWrapper()
 
-        span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
+        span_ctx = child_span_ctx(trace_id, span_id)
         token = _current_span.set(span_ctx)
         try:
             result = original(self, *args, **kwargs)
@@ -864,7 +912,7 @@ def _patch_openai_responses_sync(ek: "EvalKitClient", cls) -> None:
                 service_name=ek._opts.service_name, provider="openai", model=model,
                 prompt=prompt[:32768], latency_ms=int(time.time() * 1000 - start_ms),
                 start_time=ts, end_time=end_ts, created_at=ts,
-                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_exc_attrs(exc)},
+                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs), **_exc_attrs(exc)},
                 environment=ek._opts.environment, app_version=ek._opts.app_version,
                 sdk_version=SDK_VERSION,
             ))
@@ -890,7 +938,7 @@ def _patch_openai_responses_sync(ek: "EvalKitClient", cls) -> None:
                 tokens_in=tokens_in, tokens_out=tokens_out,
                 latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
                 events=events or None,
-                attributes={**ek._meta_attrs(), "gen_ai.request.model": model,
+                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs),
                             "gen_ai.response.model": getattr(result, "model", model),
                             "gen_ai.response.id": getattr(result, "id", ""),
                             "gen_ai.usage.total_tokens": total_tokens},
@@ -910,7 +958,7 @@ def _patch_openai_responses_async(ek: "EvalKitClient", cls) -> None:
         return
     import time
     from ..core.client import _new_span_id, _now_iso
-    from ..core.context import SpanContext, _current_span, current_span_ctx, get_or_create_ambient_trace_id
+    from ..core.context import _current_span, child_span_ctx, current_span_ctx, get_or_create_ambient_trace_id
     from ..core.types import SpanEvent, TraceEnvelope
     from .._version import SDK_VERSION
 
@@ -947,7 +995,7 @@ def _patch_openai_responses_async(ek: "EvalKitClient", cls) -> None:
             input_text = str(raw_input)
         prompt = (f"system: {instructions}\n" if instructions else "") + input_text
 
-        span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
+        span_ctx = child_span_ctx(trace_id, span_id)
         token = _current_span.set(span_ctx)
         try:
             result = await original(self, *args, **kwargs)
@@ -960,7 +1008,7 @@ def _patch_openai_responses_async(ek: "EvalKitClient", cls) -> None:
                 service_name=ek._opts.service_name, provider="openai", model=model,
                 prompt=prompt[:32768], latency_ms=int(time.time() * 1000 - start_ms),
                 start_time=ts, end_time=end_ts, created_at=ts,
-                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_exc_attrs(exc)},
+                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs), **_exc_attrs(exc)},
                 environment=ek._opts.environment, app_version=ek._opts.app_version,
                 sdk_version=SDK_VERSION,
             ))
@@ -986,7 +1034,7 @@ def _patch_openai_responses_async(ek: "EvalKitClient", cls) -> None:
                 tokens_in=tokens_in, tokens_out=tokens_out,
                 latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
                 events=events or None,
-                attributes={**ek._meta_attrs(), "gen_ai.request.model": model,
+                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs),
                             "gen_ai.response.model": getattr(result, "model", model),
                             "gen_ai.response.id": getattr(result, "id", ""),
                             "gen_ai.usage.total_tokens": total_tokens},

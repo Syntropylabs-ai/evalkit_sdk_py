@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, List, Optional
 
 from ..._version import SDK_VERSION
 from ...core.client import _new_span_id, _now_iso
 from ...core.context import (
-    SpanContext,
     _ambient_trace_id,
-    _current_span, current_span_ctx,
+    _current_span, child_span_ctx, current_span_ctx,
     get_or_create_ambient_trace_id,
 )
 from ...core.types import SpanEvent, TraceEnvelope
@@ -155,7 +155,7 @@ def _patch_sync(ek: "EvalKitClient", Client: Any) -> None:
                         pass
             return _gen()
 
-        span_ctx = SpanContext(trace_id=trace_id, span_id=span_id, session_id=session_id, device_id=device_id)
+        span_ctx = replace(child_span_ctx(trace_id, span_id), session_id=session_id, device_id=device_id)
         token = _current_span.set(span_ctx)
         try:
             result = original(self, model=model, messages=messages, stream=False, **kwargs)
@@ -284,7 +284,7 @@ def _patch_async(ek: "EvalKitClient", AsyncClient: Any) -> None:
                         pass
             return _agen()
 
-        span_ctx = SpanContext(trace_id=trace_id, span_id=span_id, session_id=session_id, device_id=device_id)
+        span_ctx = replace(child_span_ctx(trace_id, span_id), session_id=session_id, device_id=device_id)
         token = _current_span.set(span_ctx)
         try:
             result = await original(self, model=model, messages=messages, stream=False, **kwargs)

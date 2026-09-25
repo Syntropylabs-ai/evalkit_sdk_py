@@ -303,6 +303,31 @@ def test_bridge_span_inherits_enclosing_evalkit_trace(client, bridge):
     assert envelope.agent_name == "router"
 
 
+def test_bridge_span_inside_an_instrumented_call_keeps_the_callers_scope(client, bridge):
+    """The HTTP span an OpenAI client opens runs while the llm_call span is current."""
+    from tests.helpers import OResp
+    from evalkit.instrumentation.auto import _patch_openai_class_sync
+
+    host, stub = bridge
+
+    class Completions:
+        def create(self, *a, **k):
+            host.get_tracer("httpx").start_span("POST /v1/chat/completions").end()
+            return OResp("ok")
+
+    _patch_openai_class_sync(client, Completions)
+    _, end, ctx = evalkit.start_trace("turn", session_id="s-turn", user_id="u-turn", agent="support-bot")
+    with evalkit.with_trace(ctx):
+        end_sub, sub_ctx = evalkit.start_span("refund", {"gen_ai.agent.name": "refund-specialist"})
+        with evalkit.with_trace(sub_ctx):
+            Completions().create(model="gpt-4o-mini", messages=[])
+        end_sub("OK")
+    end("OK")
+    _flush_from_another_thread(host)
+    envelope = next(e for e in stub.spans if e.operation == "POST /v1/chat/completions")
+    assert (envelope.session_id, envelope.user_id, envelope.agent_name) == ("s-turn", "u-turn", "refund-specialist")
+
+
 @pytest.mark.parametrize(
     "key", ["session.id", "conversation.id", "gen_ai.conversation.id", "session_id", "evalkit.session_id"]
 )

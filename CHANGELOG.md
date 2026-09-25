@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.1 — 2026-09-26
+
+### Fixed
+- OpenTelemetry spans that another library opens inside an instrumented model call (the HTTP
+  span httpx starts under an OpenAI, Anthropic, Gemini, Bedrock, Ollama or other provider call)
+  keep the caller's session, user and agent. They were exported with none, so a conversation's
+  HTTP spans fell out of its session and a sub-agent's out of that agent.
+- OpenAI chat, OpenAI Responses and Anthropic model-call spans record the declared tool names
+  (`gen_ai.request.tools`) and the sampling parameters (`gen_ai.request.temperature`, `top_p`,
+  `max_tokens`). The dashboard tells agent versions apart by system prompt, tools, model and
+  sampling, and without these a changed tool set never showed as a new version. The first spans
+  after upgrading start a new version entry for each agent, since the parameters are now part of it.
+- An Anthropic `system` prompt passed as a list of blocks (as prompt caching requires) is
+  recorded as its text in the span's prompt instead of the list's Python repr.
+
 ## 0.3.0 — 2026-09-26
 
 Sessions and named agents. Traces now group into conversations and agents on the dashboard

@@ -7,7 +7,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from ..._version import SDK_VERSION
 from ...core.client import EvalKitClient, _exc_attrs, _new_span_id, _now_iso
-from ...core.context import SpanContext, _current_span, current_span_ctx, get_or_create_ambient_trace_id
+from ...core.context import SpanContext, _current_span, child_span_ctx, current_span_ctx, get_or_create_ambient_trace_id
 from ...core.types import SpanEvent, TraceEnvelope
 from .._toolcalls import tool_event
 from ..db._common import start_db
@@ -257,7 +257,7 @@ class _BedrockSpan:
         self.ts = _now_iso()
 
     def ctx(self) -> SpanContext:
-        return SpanContext(trace_id=self.trace_id, span_id=self.span_id)
+        return child_span_ctx(self.trace_id, self.span_id)
 
     def emit(
         self,

@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Any, AsyncIterator, List, Optional
 
 from ..._version import SDK_VERSION
 from ...core.client import _new_span_id, _now_iso
-from ...core.context import SpanContext, _current_span, current_span_ctx, get_or_create_ambient_trace_id
+from ...core.context import _current_span, child_span_ctx, current_span_ctx, get_or_create_ambient_trace_id
 from ...core.types import SpanEvent, TraceEnvelope
 from .._toolcalls import tool_event
 from ._bodies import _dump, _safe_body
@@ -65,7 +65,7 @@ async def _traced_gen(
     start_ms = time.time() * 1000
     ts = _now_iso()
 
-    span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
+    span_ctx = child_span_ctx(trace_id, span_id)
     token = _current_span.set(span_ctx)
 
     model = model_hint

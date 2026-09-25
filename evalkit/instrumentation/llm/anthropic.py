@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 
 from ..._version import SDK_VERSION
 from ...core.client import EvalKitClient, _new_span_id, _now_iso
-from ...core.context import SpanContext, _current_span, current_span_ctx, get_or_create_ambient_trace_id
+from ...core.context import SpanContext, _current_span, child_span_ctx, current_span_ctx, get_or_create_ambient_trace_id
 from ...core.types import SpanEvent, TraceEnvelope
 from .._streaming import _StreamState, _SyncStreamTracer, stream_response_attrs, stream_tool_events
 from .._toolcalls import from_anthropic_blocks
@@ -91,7 +91,7 @@ def patch_anthropic(
                 is_anthropic=True, start_ms=start_ms, state=state,
             )
 
-        span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
+        span_ctx = child_span_ctx(trace_id, span_id)
         token = _current_span.set(span_ctx)
         try:
             result = original_create(*args, **kwargs)

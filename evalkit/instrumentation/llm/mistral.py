@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ..._version import SDK_VERSION
 from ...core.client import EvalKitClient, _new_span_id, _now_iso
-from ...core.context import SpanContext, _current_span, current_span_ctx, get_or_create_ambient_trace_id
+from ...core.context import SpanContext, _current_span, child_span_ctx, current_span_ctx, get_or_create_ambient_trace_id
 from ...core.types import SpanEvent, TraceEnvelope
 from .._streaming import _AsyncStreamTracer, _StreamState, _SyncStreamTracer
 from .._toolcalls import from_openai_chat, from_stream_tool_calls
@@ -113,7 +113,7 @@ def _patch_mistral_complete(
         prompt_text = _extract_mistral_prompt(messages)[:_PROMPT_MAX]
         request_body = _safe_body(_dump(kwargs))
 
-        span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
+        span_ctx = child_span_ctx(trace_id, span_id)
         token = _current_span.set(span_ctx)
         try:
             result = original_complete(**kwargs)
@@ -208,7 +208,7 @@ def _patch_mistral_complete_async(
         prompt_text = _extract_mistral_prompt(messages)[:_PROMPT_MAX]
         request_body = _safe_body(_dump(kwargs))
 
-        span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
+        span_ctx = child_span_ctx(trace_id, span_id)
         token = _current_span.set(span_ctx)
         try:
             result = await original_complete_async(**kwargs)
@@ -359,7 +359,7 @@ def _patch_mistral_stream(
             trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
             start_ms=start_ms, ts=_now_iso(), state=state,
         )
-        return SpanContext(trace_id=trace_id, span_id=span_id), start_ms, state, on_stream_done
+        return child_span_ctx(trace_id, span_id), start_ms, state, on_stream_done
 
     if is_async:
         async def traced_stream_async(**kwargs: Any) -> Any:

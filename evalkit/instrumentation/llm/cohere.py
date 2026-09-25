@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 
 from ..._version import SDK_VERSION
 from ...core.client import EvalKitClient, _new_span_id, _now_iso
-from ...core.context import SpanContext, _current_span, current_span_ctx, get_or_create_ambient_trace_id
+from ...core.context import _current_span, child_span_ctx, current_span_ctx, get_or_create_ambient_trace_id
 from ...core.types import SpanEvent, TraceEnvelope
 from .._streaming import _AsyncStreamTracer, _StreamState, _SyncStreamTracer
 from .._toolcalls import from_stream_tool_calls
@@ -164,7 +164,7 @@ def _cohere_span_start(kwargs: Dict[str, Any], *, operation: str, client: EvalKi
         trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
         start_ms=start_ms, ts=_now_iso(), streaming=streaming,
     )
-    return SpanContext(trace_id=trace_id, span_id=span_id), start_ms, emit
+    return child_span_ctx(trace_id, span_id), start_ms, emit
 
 
 def _emit_unary_error(emit, exc: BaseException) -> None:

@@ -6,9 +6,8 @@ from typing import TYPE_CHECKING, Any, Optional
 from ..._version import SDK_VERSION
 from ...core.client import _exc_attrs, _new_span_id, _now_iso
 from ...core.context import (
-    SpanContext,
     _ambient_trace_id,
-    _current_span, current_span_ctx,
+    _current_span, child_span_ctx, current_span_ctx,
     get_or_create_ambient_trace_id,
 )
 from ...core.types import TraceEnvelope
@@ -144,7 +143,7 @@ def _patch_sync(ek: "EvalKitClient", litellm: Any) -> None:
                 ))
             return _SyncStreamTracer(original(*args, **kwargs), on_done, start_ms=start_ms, state=state)
 
-        span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
+        span_ctx = child_span_ctx(trace_id, span_id)
         token = _current_span.set(span_ctx)
         try:
             result = original(*args, **kwargs)
@@ -250,7 +249,7 @@ def _patch_async(ek: "EvalKitClient", litellm: Any) -> None:
             raw = await original(*args, **kwargs)
             return _AsyncStreamTracer(raw, on_done, start_ms=start_ms, state=state)
 
-        span_ctx = SpanContext(trace_id=trace_id, span_id=span_id)
+        span_ctx = child_span_ctx(trace_id, span_id)
         token = _current_span.set(span_ctx)
         try:
             result = await original(*args, **kwargs)

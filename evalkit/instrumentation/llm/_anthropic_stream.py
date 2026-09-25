@@ -5,7 +5,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..._version import SDK_VERSION
 from ...core.client import EvalKitClient, _new_span_id, _now_iso
-from ...core.context import SpanContext, _current_span, current_span_ctx, get_or_create_ambient_trace_id
+from ...core.context import SpanContext, _current_span, child_span_ctx, current_span_ctx, get_or_create_ambient_trace_id
 from ...core.types import SpanEvent, TraceEnvelope
 from .._toolcalls import from_anthropic_blocks
 from ._bodies import _dump, _safe_body
@@ -169,7 +169,7 @@ def patch_messages_stream(
             except Exception:
                 pass
 
-        return SpanContext(trace_id=trace_id, span_id=span_id), safe_emit
+        return child_span_ctx(trace_id, span_id), safe_emit
 
     def wrap(invoke: Callable[[], Any], kwargs: Dict[str, Any]) -> Any:
         try:
