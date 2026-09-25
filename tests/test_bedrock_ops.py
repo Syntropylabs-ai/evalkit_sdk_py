@@ -584,6 +584,8 @@ class BedrockOpsTest(unittest.TestCase):
         self.assertEqual(spans[0].prompt, "do the thing")
         self.assertEqual(spans[0].attributes["gen_ai.operation.name"], "invoke_agent")
         self.assertEqual(spans[0].attributes["gen_ai.conversation.id"], "s1")
+        self.assertEqual(spans[0].session_id, "s1")
+        self.assertEqual(spans[0].to_dict()["sessionId"], "s1")
 
     def test_retrieve_emits_db_span(self):
         client = self._client(

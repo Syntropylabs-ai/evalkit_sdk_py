@@ -153,7 +153,9 @@ async def trace_bedrock_call_async(
 
 
 class _Plan:
-    __slots__ = ("operation", "span_type", "model", "prompt", "attrs", "family", "stream_kind", "stream_key")
+    __slots__ = (
+        "operation", "span_type", "model", "prompt", "attrs", "family", "stream_kind", "stream_key", "session_id",
+    )
 
     def __init__(self, operation: str) -> None:
         self.operation = operation
@@ -164,6 +166,7 @@ class _Plan:
         self.family: Optional[Dict[str, Any]] = None
         self.stream_kind: Optional[str] = None
         self.stream_key: Optional[str] = None
+        self.session_id: Optional[str] = None
 
 
 def _plan(operation_name: str, params: Dict[str, Any]) -> _Plan:
@@ -226,7 +229,10 @@ def _plan(operation_name: str, params: Dict[str, Any]) -> _Plan:
 
     session_id = params.get("sessionId")
     if isinstance(session_id, str) and session_id:
+        # The Bedrock session is the conversation this call belongs to, so it is the span's
+        # session even when the app never called set_user.
         plan.attrs["gen_ai.conversation.id"] = session_id
+        plan.session_id = session_id
     plan.prompt = plan.prompt[:_PROMPT_MAX]
     request_body = _safe_body(_dump(request_dump))
     if request_body:
@@ -291,7 +297,7 @@ class _BedrockSpan:
             start_time=self.ts, end_time=end_ts, created_at=self.ts,
             events=events or None, attributes=attrs,
             environment=self.ek._opts.environment, app_version=self.ek._opts.app_version,
-            sdk_version=SDK_VERSION,
+            session_id=plan.session_id, sdk_version=SDK_VERSION,
         ))
 
     def emit_acc(

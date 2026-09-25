@@ -14,11 +14,16 @@ F = TypeVar("F", bound=Callable[..., Any])
 
 from .._version import SDK_VERSION
 from .context import (
+    AGENT_NAME_KEYS,
+    SESSION_ID_KEYS,
+    USER_ID_KEYS,
     SpanContext,
     _ambient_trace_id,
     _current_span,
+    current_agent,
     current_identity,
     current_span_ctx,
+    first_attr,
     get_or_create_ambient_trace_id,
 )
 from .exporter import _Exporter
@@ -52,6 +57,20 @@ def _new_trace_id() -> str:
 
 def _new_span_id() -> str:
     return secrets.token_hex(8)
+
+
+def _first(*values: Optional[str]) -> Optional[str]:
+    for value in values:
+        if value:
+            return value
+    return None
+
+
+def _stamp_agent(attrs: Dict[str, Any], agent_name: Optional[str]) -> None:
+    # Both spellings: our receiver reads either, other OpenTelemetry backends only the gen_ai one.
+    if agent_name:
+        attrs["evalkit.agent_name"] = agent_name
+        attrs["gen_ai.agent.name"] = agent_name
 
 
 def _exc_attrs(exc: BaseException) -> Dict[str, Any]:
@@ -97,16 +116,30 @@ class EvalKitClient:
         return attrs
 
     def _apply_identity(self, envelope: TraceEnvelope) -> None:
+        # Envelope field > span attribute (any spelling) > enclosing span > ambient scope.
         ctx = current_span_ctx()
         identity = current_identity()
+        attrs = envelope.attributes
         if envelope.user_id is None:
-            envelope.user_id = (ctx.user_id if ctx else None) or identity.user_id
+            envelope.user_id = _first(
+                first_attr(attrs, USER_ID_KEYS), ctx.user_id if ctx else None, identity.user_id
+            )
         if envelope.session_id is None:
-            envelope.session_id = (ctx.session_id if ctx else None) or identity.session_id
+            envelope.session_id = _first(
+                first_attr(attrs, SESSION_ID_KEYS), ctx.session_id if ctx else None, identity.session_id
+            )
         if envelope.device_id is None:
             envelope.device_id = (
                 (ctx.device_id if ctx else None) or identity.device_id or self._opts.device_id
             )
+        if envelope.agent_name is None:
+            envelope.agent_name = _first(
+                first_attr(attrs, AGENT_NAME_KEYS), ctx.agent_name if ctx else None, current_agent()
+            )
+        if envelope.agent_name:
+            stamped = dict(attrs or {})
+            _stamp_agent(stamped, envelope.agent_name)
+            envelope.attributes = stamped
 
     def _apply_simulation(self, envelope: TraceEnvelope) -> None:
         from .context import _current_simulation
@@ -182,6 +215,7 @@ class EvalKitClient:
                 user_id=envelope.user_id,
                 session_id=envelope.session_id,
                 device_id=envelope.device_id,
+                agent_name=envelope.agent_name,
                 sdk_version=envelope.sdk_version,
             ))
 
@@ -269,6 +303,48 @@ class EvalKitClient:
         self._flush_bridge()
         self._drain()
 
+    def _resolve_scope(
+        self,
+        attributes: Optional[Dict[str, Any]],
+        parent: Optional[SpanContext],
+        *,
+        session_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        device_id: Optional[str] = None,
+        agent: Optional[str] = None,
+    ) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+        """Explicit argument > span attribute (any spelling) > parent span > ambient scope.
+
+        Resolved at span start so children opened inside this span inherit the same ids.
+        """
+        identity = current_identity()
+        resolved_session = _first(
+            session_id,
+            first_attr(attributes, SESSION_ID_KEYS),
+            parent.session_id if parent else None,
+            identity.session_id,
+        )
+        resolved_user = _first(
+            user_id,
+            first_attr(attributes, USER_ID_KEYS),
+            parent.user_id if parent else None,
+            identity.user_id,
+        )
+        resolved_device = _first(
+            device_id,
+            first_attr(attributes, ("evalkit.device_id",)),
+            parent.device_id if parent else None,
+            identity.device_id,
+            self._opts.device_id,
+        )
+        resolved_agent = _first(
+            agent,
+            first_attr(attributes, AGENT_NAME_KEYS),
+            parent.agent_name if parent else None,
+            current_agent(),
+        )
+        return resolved_session, resolved_user, resolved_device, resolved_agent
+
     def start_trace(
         self,
         name: str,
@@ -276,22 +352,22 @@ class EvalKitClient:
         session_id: Optional[str] = None,
         device_id: Optional[str] = None,
         user_id: Optional[str] = None,
+        agent: Optional[str] = None,
+        *,
+        join_trace_id: Optional[str] = None,
     ) -> Tuple[str, Callable[[str], None], SpanContext]:
         parent = current_span_ctx()
-        identity = current_identity()
-        trace_id = parent.trace_id if parent else get_or_create_ambient_trace_id()
-        _ambient_trace_id.set(trace_id)
+        # A root trace is its own unit of work: reusing the context's ambient id would fold
+        # every turn of a loop (and so every turn of a session) into one trace. The ambient
+        # id follows the trace while it is open and is restored when it ends.
+        # `join_trace_id` adds another root to a trace already open, as a simulation run does
+        # with one root per scenario.
+        trace_id = parent.trace_id if parent else (join_trace_id or _new_trace_id())
+        ambient_token = _ambient_trace_id.set(trace_id)
         parent_span_id = parent.span_id if parent else None
-        resolved_session_id = (
-            session_id or (parent.session_id if parent else None) or identity.session_id
+        resolved_session_id, resolved_user_id, resolved_device_id, resolved_agent = self._resolve_scope(
+            attributes, parent, session_id=session_id, user_id=user_id, device_id=device_id, agent=agent
         )
-        resolved_device_id = (
-            device_id
-            or (parent.device_id if parent else None)
-            or identity.device_id
-            or self._opts.device_id
-        )
-        resolved_user_id = user_id or (parent.user_id if parent else None) or identity.user_id
         span_id = _new_span_id()
         start_ms = time.time() * 1000
         start_iso = _now_iso()
@@ -301,6 +377,7 @@ class EvalKitClient:
             session_id=resolved_session_id,
             device_id=resolved_device_id,
             user_id=resolved_user_id,
+            agent_name=resolved_agent,
         )
         token = _current_span.set(ctx)
 
@@ -310,6 +387,7 @@ class EvalKitClient:
             attrs = self._meta_attrs()
             if attributes:
                 attrs.update(attributes)
+            _stamp_agent(attrs, resolved_agent)
             envelope = TraceEnvelope(
                 trace_id=trace_id,
                 span_id=span_id,
@@ -328,11 +406,16 @@ class EvalKitClient:
                 user_id=resolved_user_id,
                 session_id=resolved_session_id,
                 device_id=resolved_device_id,
+                agent_name=resolved_agent,
                 sdk_version=SDK_VERSION,
             )
             self.enqueue(envelope)
             try:
                 _current_span.reset(token)
+            except Exception:
+                pass
+            try:
+                _ambient_trace_id.reset(ambient_token)
             except Exception:
                 pass
 
@@ -364,6 +447,7 @@ class EvalKitClient:
             session_id=identity.session_id,
             device_id=identity.device_id or self._opts.device_id,
             user_id=identity.user_id,
+            agent_name=current_agent(),
         )
 
         def end(
@@ -421,14 +505,9 @@ class EvalKitClient:
     ) -> Tuple[Callable[[str], None], SpanContext]:
         parent = parent_ctx or current_span_ctx()
         trace_id = parent.trace_id if parent else get_or_create_ambient_trace_id()
-        identity = current_identity()
         span_id = _new_span_id()
         parent_span_id = parent.span_id if parent else None
-        session_id = (parent.session_id if parent else None) or identity.session_id
-        device_id = (
-            (parent.device_id if parent else None) or identity.device_id or self._opts.device_id
-        )
-        user_id = (parent.user_id if parent else None) or identity.user_id
+        session_id, user_id, device_id, agent_name = self._resolve_scope(attributes, parent)
         start_ms = time.time() * 1000
         start_iso = _now_iso()
         ctx = SpanContext(
@@ -437,6 +516,7 @@ class EvalKitClient:
             session_id=session_id,
             device_id=device_id,
             user_id=user_id,
+            agent_name=agent_name,
         )
 
         def end(status: str = "OK") -> None:
@@ -445,6 +525,7 @@ class EvalKitClient:
             attrs = self._meta_attrs()
             if attributes:
                 attrs.update(attributes)
+            _stamp_agent(attrs, agent_name)
             span_type = str(attrs.pop("evalkit.span_type", "function_call"))
             envelope = TraceEnvelope(
                 trace_id=trace_id,
@@ -464,6 +545,7 @@ class EvalKitClient:
                 user_id=user_id,
                 session_id=session_id,
                 device_id=device_id,
+                agent_name=agent_name,
                 sdk_version=SDK_VERSION,
             )
             self.enqueue(envelope)

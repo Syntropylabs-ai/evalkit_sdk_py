@@ -139,7 +139,7 @@ def _begin_scenario(client: Any, scenario: Dict[str, Any], cfg: Dict[str, Any]):
         tags=cfg["tags"],
     )
     turn_messages = _user_turns(scenario)[: cfg["max_turns"]]
-    _trace_id, end_trace, root = client.start_trace(f"scenario:{name}", session_id=ctx.session_id)
+    _trace_id, end_trace, root = client.start_trace(f"scenario:{name}", session_id=ctx.session_id, join_trace_id=cfg["trace_id"])
     return name, scenario_id, ctx, sim, turn_messages, end_trace, root
 
 
@@ -262,7 +262,8 @@ def simulate_user(
     }
     scenario_list = list(scenarios)
 
-    get_or_create_ambient_trace_id()
+    # One trace per run, one root and one session per scenario inside it.
+    cfg["trace_id"] = get_or_create_ambient_trace_id()
 
     if inspect.iscoroutinefunction(entrypoint):
         async def _run_all() -> List[Dict[str, Any]]:

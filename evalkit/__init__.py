@@ -10,11 +10,15 @@ from .core.context import (
     Identity,
     SpanContext,
     _current_span,
+    current_agent,
     current_identity,
     get_or_create_ambient_trace_id,
+    reset_agent,
     reset_identity,
+    set_agent_name,
     set_identity,
 )
+from .core.scopes import session
 from .core.types import EvalKitOptions, SpanEvent, TraceEnvelope
 from .evaluate import evaluate
 from .eval import Eval, EvalResult
@@ -78,6 +82,10 @@ __all__ = [
     "set_user",
     "clear_user",
     "current_user",
+    "session",
+    "set_agent",
+    "clear_agent",
+    "current_agent",
     "Identity",
     "evaluate",
     "Eval",
@@ -283,6 +291,22 @@ def current_user() -> Identity:
     return current_identity()
 
 
+def set_agent(name: Optional[str]) -> Any:
+    """Name the agent every span from here on belongs to (``None`` clears it).
+
+    Scoped like ``set_user``: per thread and per asyncio task. Returns a token for
+    ``clear_agent`` to restore the previous name.
+    """
+    return set_agent_name(name)
+
+
+def clear_agent(token: Optional[Any] = None) -> None:
+    if token is None:
+        set_agent_name(None)
+        return
+    reset_agent(token)
+
+
 def instrument_flask(app: Any) -> None:
     _instrument_flask(app, _get_instance())
 
@@ -444,6 +468,7 @@ def start_trace(
     session_id: Optional[str] = None,
     device_id: Optional[str] = None,
     user_id: Optional[str] = None,
+    agent: Optional[str] = None,
 ) -> Tuple[str, Callable[[str], None], SpanContext]:
     return _get_instance().start_trace(
         name,
@@ -451,6 +476,7 @@ def start_trace(
         session_id=session_id,
         device_id=device_id,
         user_id=user_id,
+        agent=agent,
     )
 
 

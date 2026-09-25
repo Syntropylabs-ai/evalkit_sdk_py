@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
-from typing import Any, List, Optional
+from typing import Any, List, Mapping, Optional
 
 
 @dataclass(frozen=True)
@@ -12,6 +12,24 @@ class SpanContext:
     session_id: Optional[str] = None
     device_id: Optional[str] = None
     user_id: Optional[str] = None
+    agent_name: Optional[str] = None
+
+
+# Spellings other instrumentations use for the same ids, in resolution order. Our own key comes
+# first so a span tagged by EvalKit is never overridden by a looser convention on the same span.
+SESSION_ID_KEYS = ("evalkit.session_id", "session.id", "conversation.id", "gen_ai.conversation.id", "session_id")
+USER_ID_KEYS = ("evalkit.user_id", "user.id", "enduser.id", "user_id")
+AGENT_NAME_KEYS = ("evalkit.agent_name", "gen_ai.agent.name", "agent.name")
+
+
+def first_attr(attributes: Optional[Mapping[str, Any]], keys: tuple) -> Optional[str]:
+    if not attributes:
+        return None
+    for key in keys:
+        value = attributes.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
 
 
 @dataclass(frozen=True)
@@ -52,6 +70,24 @@ def set_identity(
 def reset_identity(token: Token) -> None:
     try:
         _current_identity.reset(token)
+    except Exception:
+        pass
+
+
+_current_agent: ContextVar[Optional[str]] = ContextVar("evalkit_agent", default=None)
+
+
+def current_agent() -> Optional[str]:
+    return _current_agent.get()
+
+
+def set_agent_name(name: Optional[str]) -> Token:
+    return _current_agent.set(name or None)
+
+
+def reset_agent(token: Token) -> None:
+    try:
+        _current_agent.reset(token)
     except Exception:
         pass
 

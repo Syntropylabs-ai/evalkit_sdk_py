@@ -32,6 +32,22 @@ class TestManualSpans(unittest.TestCase):
         self.assertEqual(spans[0].trace_id, tid)
         self.assertEqual(spans[0].parent_span_id, ctx.span_id)
 
+    def test_consecutive_root_traces_get_their_own_ids(self):
+        # One trace per turn: a loop of turns must not fold into a single trace.
+        ids = []
+        for _ in range(3):
+            tid, end, _ctx = self.client.start_trace("turn")
+            ids.append(tid)
+            end("OK")
+        self.assertEqual(len(set(ids)), 3)
+
+    def test_bare_call_after_a_trace_does_not_join_it(self):
+        tid, end, _ctx = self.client.start_trace("turn")
+        end("OK")
+        end_bare, bare_ctx = self.client.start_span("after")
+        end_bare("OK")
+        self.assertNotEqual(bare_ctx.trace_id, tid)
+
     def test_start_trace_returns_32char_id(self):
         tid, end, ctx = self.client.start_trace("my-trace")
         self.assertIsInstance(tid, str)

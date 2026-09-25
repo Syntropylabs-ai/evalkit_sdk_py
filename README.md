@@ -282,10 +282,53 @@ evalkit.set_user()          # clears all three
   `set_user(session_id=...)` followed by `set_user(user_id=...)` leaves both set;
   calling it with no arguments clears them. It returns a token, and
   `evalkit.clear_user(token)` restores what was there before.
-- Precedence: explicit `start_trace(...)` arguments, then `set_user`, then the
-  `device_id` given to `evalkit.init()`.
+- Precedence, per field: explicit `start_trace(...)` / `start_span(...)` arguments,
+  then an id named in that span's attributes, then the parent span, then
+  `set_user` / `evalkit.session(...)`, then the `device_id` given to `evalkit.init()`.
 - Child spans inherit from the trace — LLM calls, tool calls, DB queries and HTTP
   calls under a trace all land with the same three ids.
+- Spans from other OpenTelemetry libraries keep the ids that were in effect where
+  the span started, even though they are exported from a background thread.
+- Ids can also come from attributes, in any of these spellings, on `start_trace`,
+  `start_span` or a third-party OpenTelemetry span:
+
+  | Field | Accepted attribute names |
+  |---|---|
+  | session | `evalkit.session_id`, `session.id`, `conversation.id`, `gen_ai.conversation.id`, `session_id` |
+  | user | `evalkit.user_id`, `user.id`, `enduser.id`, `user_id` |
+  | agent | `evalkit.agent_name`, `gen_ai.agent.name`, `agent.name` (first one present wins) |
+
+### Sessions
+
+Wrap one conversation, and every span opened inside it groups into that session:
+
+```python
+with evalkit.session("conv_55", user_id="u_8123"):
+    answer = agent.run(message)
+
+@evalkit.session("conv_55")        # also a decorator, sync or async
+async def handle_turn(message): ...
+```
+
+The ids in force before the block come back on exit, and concurrent requests or
+tasks never see each other's session. `user_id` is optional; without it the
+current user is kept. A span that names its own session keeps it.
+
+### Agents
+
+Name the agent in code so traces, sessions and scores can be grouped by it:
+
+```python
+evalkit.set_agent("support-bot")                       # everything that follows
+trace_id, end, ctx = evalkit.start_trace("turn", agent="planner")   # one trace
+end_step, _ = evalkit.start_span("research", {"gen_ai.agent.name": "researcher"})  # a sub-agent
+```
+
+`set_agent` is scoped like `set_user` and returns a token for
+`evalkit.clear_agent(token)`; `evalkit.current_agent()` reads it. Spans carry the name
+as both `evalkit.agent_name` and `gen_ai.agent.name`, and the envelope as `agentName`.
+Agent versions (model + prompt + tools) are still detected automatically and shown
+under the agent's name.
 - The Django middleware fills `user_id` from `request.user` and the FastAPI /
   Starlette middleware from `scope["user"]`, both only when the user is
   authenticated; anything you set yourself wins.

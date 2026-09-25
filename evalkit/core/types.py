@@ -49,6 +49,7 @@ class TraceEnvelope:
     user_id: Optional[str] = None
     session_id: Optional[str] = None
     device_id: Optional[str] = None
+    agent_name: Optional[str] = None
     trace_project_id: Optional[str] = None
     sdk_version: Optional[str] = None
     is_simulation: bool = False
@@ -111,6 +112,8 @@ class TraceEnvelope:
             d["sessionId"] = self.session_id
         if self.device_id:
             d["deviceId"] = self.device_id
+        if self.agent_name:
+            d["agentName"] = self.agent_name
         if self.trace_project_id:
             d["traceProjectId"] = self.trace_project_id
         if self.sdk_version:

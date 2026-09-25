@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import logging
+import threading
+from collections import OrderedDict
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
+from .context import AGENT_NAME_KEYS, SESSION_ID_KEYS, USER_ID_KEYS, first_attr
 from .types import SpanEvent, TraceEnvelope
 
 _log = logging.getLogger("evalkit")
@@ -168,6 +171,68 @@ def _span_events(span: Any, fallback_ts: str) -> Optional[List[SpanEvent]]:
     return out or None
 
 
+# (user_id, session_id, device_id, agent_name) as they were where the span started.
+_Scope = Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]
+
+# Spans that start but never end must not grow this without bound.
+_MAX_TRACKED_SPANS = 10000
+_started_scopes: "OrderedDict[Tuple[int, int], _Scope]" = OrderedDict()
+_scopes_lock = threading.Lock()
+# OTel trace id -> (evalkit trace id, evalkit parent span id, OTel root span id). A span from
+# another OpenTelemetry library that starts with no OTel parent while an evalkit span is current
+# belongs to that evalkit trace; without this it and its children would export as a trace of
+# their own, split off from the turn that caused them.
+_adopted_traces: "OrderedDict[int, Tuple[str, str, int]]" = OrderedDict()
+
+
+def _span_key(span: Any) -> Optional[Tuple[int, int]]:
+    try:
+        sc = span.get_span_context()
+        return (sc.trace_id, sc.span_id)
+    except Exception:
+        return None
+
+
+def capture_start_scope(span: Any) -> None:
+    """Record the ambient identity and agent on the thread that starts the span.
+
+    Export runs later on the BatchSpanProcessor worker thread, whose context holds none of the
+    caller's set_user / session / set_agent scope, so the values have to be taken here.
+    """
+    key = _span_key(span)
+    if key is None:
+        return
+    from .context import _current_span, current_agent, current_identity
+
+    ctx = _current_span.get()
+    if ctx is not None and getattr(span, "parent", None) is None:
+        with _scopes_lock:
+            _adopted_traces[key[0]] = (ctx.trace_id, ctx.span_id, key[1])
+            while len(_adopted_traces) > _MAX_TRACKED_SPANS:
+                _adopted_traces.popitem(last=False)
+    identity = current_identity()
+    scope: _Scope = (
+        (ctx.user_id if ctx else None) or identity.user_id,
+        (ctx.session_id if ctx else None) or identity.session_id,
+        (ctx.device_id if ctx else None) or identity.device_id,
+        (ctx.agent_name if ctx else None) or current_agent(),
+    )
+    if not any(scope):
+        return
+    with _scopes_lock:
+        _started_scopes[key] = scope
+        while len(_started_scopes) > _MAX_TRACKED_SPANS:
+            _started_scopes.popitem(last=False)
+
+
+def _take_start_scope(span: Any) -> _Scope:
+    key = _span_key(span)
+    if key is None:
+        return (None, None, None, None)
+    with _scopes_lock:
+        return _started_scopes.pop(key, None) or (None, None, None, None)
+
+
 def _readable_to_envelope(span: Any) -> TraceEnvelope:
     ctx = span.get_span_context()
     attrs: Dict[str, Any] = dict(span.attributes or {})
@@ -208,10 +273,19 @@ def _readable_to_envelope(span: Any) -> TraceEnvelope:
     start_iso = _ns_to_iso(getattr(span, "start_time", None))
     end_iso = _ns_to_iso(getattr(span, "end_time", None))
     created_iso = start_iso or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    started_user, started_session, started_device, started_agent = _take_start_scope(span)
+    trace_id = format(ctx.trace_id, "032x")
+    parent_span_id = format(parent.span_id, "016x") if parent else None
+    with _scopes_lock:
+        adopted = _adopted_traces.get(ctx.trace_id)
+    if adopted is not None:
+        trace_id = adopted[0]
+        if parent is None and ctx.span_id == adopted[2]:
+            parent_span_id = adopted[1]
     return TraceEnvelope(
-        trace_id=format(ctx.trace_id, "032x"),
+        trace_id=trace_id,
         span_id=format(ctx.span_id, "016x"),
-        parent_span_id=format(parent.span_id, "016x") if parent else None,
+        parent_span_id=parent_span_id,
         span_kind=_span_kind(span),
         span_type=span_type,
         status=status,
@@ -234,9 +308,10 @@ def _readable_to_envelope(span: Any) -> TraceEnvelope:
         created_at=created_iso,
         environment=_as_str(attrs.get("evalkit.environment")),
         app_version=_as_str(attrs.get("evalkit.app_version")),
-        user_id=_as_str(attrs.get("evalkit.user_id")),
-        session_id=_as_str(attrs.get("evalkit.session_id")),
-        device_id=_as_str(attrs.get("evalkit.device_id")),
+        user_id=first_attr(attrs, USER_ID_KEYS) or started_user,
+        session_id=first_attr(attrs, SESSION_ID_KEYS) or started_session,
+        device_id=_as_str(attrs.get("evalkit.device_id")) or started_device,
+        agent_name=first_attr(attrs, AGENT_NAME_KEYS) or started_agent,
         sdk_version=_as_str(attrs.get("evalkit.sdk_version")),
     )
 
@@ -279,12 +354,13 @@ def setup_otel(client: Any) -> bool:
             for sp in spans:
                 try:
                     attrs = getattr(sp, "attributes", None) or {}
-                    if attrs.get("asgi.event.type") is not None:
-                        continue
                     scope_name = getattr(getattr(sp, "instrumentation_scope", None), "name", "") or ""
-                    if scope_name == "gcp.vertex.agent":
-                        continue
-                    if _duplicates_own_span(scope_name):
+                    if (
+                        attrs.get("asgi.event.type") is not None
+                        or scope_name == "gcp.vertex.agent"
+                        or _duplicates_own_span(scope_name)
+                    ):
+                        _take_start_scope(sp)
                         continue
                     client.enqueue(_readable_to_envelope(sp))
                 except Exception as exc:
@@ -300,7 +376,15 @@ def setup_otel(client: Any) -> bool:
     try:
         opts = getattr(client, "_opts", None)
         svc = getattr(opts, "service_name", None) or "unknown"
-        processor = BatchSpanProcessor(
+        class _ScopeCapturingProcessor(BatchSpanProcessor):
+            def on_start(self, span: Any, parent_context: Any = None) -> None:
+                try:
+                    capture_start_scope(span)
+                except Exception:
+                    pass
+                super().on_start(span, parent_context=parent_context)
+
+        processor = _ScopeCapturingProcessor(
             _EnvelopeExporter(),
             max_queue_size=getattr(opts, "max_queue_size", None) or 4096,
             max_export_batch_size=getattr(opts, "max_export_batch_size", None) or 512,
