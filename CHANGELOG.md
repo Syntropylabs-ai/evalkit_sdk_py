@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.2 — 2026-10-02
 
 ### Added
 - `Eval(..., collections=[...])` runs evaluator collections from the dashboard by id, alone or
@@ -10,6 +10,20 @@
   `evaluators` is now optional when `collections` is given, and `evalkit eval run` configs
   accept `collections`. Needs a server that supports collections: an older one is detected
   when the run opens and raises `RuntimeError` before any row is sent.
+- `simulate_user(..., agent="name")` names the agent under test on every span of the run, so the
+  run's traces list under that agent.
+- The `end` that `start_trace` returns also takes `status_message`, `prompt`, `completion` and
+  `attributes` as keyword arguments, so a root span can show what was asked, what was answered
+  and why it failed. The status message is cut to 2000 characters. Attributes given to `end`
+  win over the ones given to `start_trace`.
+
+### Changed
+- A simulated scenario's session id names its simulation, run and scenario
+  (`<simulation_id>:<run_id>:<scenario_id>`), so two runs of one scenario stay apart on the
+  dashboard. It was a random `sess_` id.
+- A scenario's root span records the scenario's first message as its prompt and the agent's last
+  reply as its completion. When the scenario fails, the error is its status message and its
+  `error.type` and `error.message` attributes, so the scenario list shows why it failed.
 
 ### Fixed
 - A row's `context` given as one string is sent as one document. It was split into one

@@ -36,6 +36,20 @@ jobs:
         with:
           python-version: "3.11"
 
+      # PyPI never accepts the same version twice, so a run without a version bump would
+      # fail only at the upload, after the build. This fails first and says what to change.
+      - name: Check the version
+        run: |
+          version=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
+          if ! grep -qx "SDK_VERSION = \"$version\"" evalkit/_version.py; then
+            echo "::error file=evalkit/_version.py::SDK_VERSION in evalkit/_version.py must match pyproject.toml ($version). Spans report it as the SDK version."
+            exit 1
+          fi
+          if [ "$(curl -s -o /dev/null -w '%{http_code}' "https://pypi.org/pypi/syntropylabs-evalkit/$version/json")" = 200 ]; then
+            echo "::error file=pyproject.toml::syntropylabs-evalkit $version is already on PyPI, and PyPI never accepts a version twice. Bump version in pyproject.toml and SDK_VERSION in evalkit/_version.py, add a CHANGELOG entry, commit and run this again."
+            exit 1
+          fi
+
       - name: Install build tools
         run: pip install --upgrade build
 
