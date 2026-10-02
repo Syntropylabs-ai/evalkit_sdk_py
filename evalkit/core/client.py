@@ -32,6 +32,8 @@ from .types import EvalKitOptions, TraceEnvelope
 _log = logging.getLogger("evalkit")
 
 _IO_MAX = 4096
+# Long enough to diagnose a failure from the trace list; a stack trace belongs in exception.stacktrace.
+MAX_STATUS_MESSAGE = 2000
 
 
 def _safe_io(value: Any, limit: int = _IO_MAX) -> str:
@@ -355,7 +357,7 @@ class EvalKitClient:
         agent: Optional[str] = None,
         *,
         join_trace_id: Optional[str] = None,
-    ) -> Tuple[str, Callable[[str], None], SpanContext]:
+    ) -> Tuple[str, Callable[..., None], SpanContext]:
         parent = current_span_ctx()
         # A root trace is its own unit of work: reusing the context's ambient id would fold
         # every turn of a loop (and so every turn of a session) into one trace. The ambient
@@ -380,11 +382,23 @@ class EvalKitClient:
             agent_name=resolved_agent,
         )
         token = _current_span.set(ctx)
+        start_attributes = attributes
 
-        def end(status: str = "OK") -> None:
+        def end(
+            status: str = "OK",
+            *,
+            status_message: Optional[str] = None,
+            prompt: Optional[str] = None,
+            completion: Optional[str] = None,
+            attributes: Optional[Dict[str, Any]] = None,
+        ) -> None:
+            # A root is often the only span a trace list shows, so what it was asked,
+            # what it answered and why it failed go on it rather than only on a child.
             end_iso = _now_iso()
             latency = int(time.time() * 1000 - start_ms)
             attrs = self._meta_attrs()
+            if start_attributes:
+                attrs.update(start_attributes)
             if attributes:
                 attrs.update(attributes)
             _stamp_agent(attrs, resolved_agent)
@@ -394,7 +408,10 @@ class EvalKitClient:
                 parent_span_id=parent_span_id,
                 span_type="log",
                 status=status,
+                status_message=status_message[:MAX_STATUS_MESSAGE] if status_message else None,
                 operation=name,
+                prompt=prompt,
+                completion=completion,
                 service_name=self._opts.service_name,
                 attributes=attrs or None,
                 latency_ms=latency,

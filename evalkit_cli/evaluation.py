@@ -25,6 +25,7 @@ SPEC_KEYS = (
     "data",
     "task",
     "evaluators",
+    "collections",
     "judge_model",
     "judge_model_config_id",
     "baseline_job_id",

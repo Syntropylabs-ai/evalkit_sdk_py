@@ -9,6 +9,7 @@ import threading
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
+from ..core.client import MAX_STATUS_MESSAGE
 from ..core.context import SimulationContext, _current_simulation, _current_span
 from ..evaluate import evaluate
 from .types import AgentTurnResult, SimContext, resolve_persona
@@ -122,13 +123,21 @@ def _score(
         return {}
 
 
+def scenario_session_id(simulation_id: str, run_id: str, scenario_id: str) -> str:
+    """One session per scenario execution. A session id names its run and
+    scenario, so the platform groups a scenario's spans into one conversation
+    and can tell two runs of the same scenario apart."""
+    return f"{simulation_id}:{run_id}:{scenario_id}"
+
+
 def _begin_scenario(client: Any, scenario: Dict[str, Any], cfg: Dict[str, Any]):
     name = scenario.get("name", "scenario")
     scenario_id = scenario.get("scenario_id") or ("scn_" + secrets.token_hex(6))
     persona_id, _ = resolve_persona(scenario.get("persona"))
     state = dict((scenario.get("setup") or {}).get("state") or {})
     state["__safe_mode__"] = cfg["safe_mode"]
-    ctx = SimContext(message="", session_id="sess_" + secrets.token_hex(6), state=state)
+    session_id = scenario_session_id(cfg["simulation_id"], cfg["run_id"], scenario_id)
+    ctx = SimContext(message="", session_id=session_id, state=state)
 
     sim = SimulationContext(
         simulation_id=cfg["simulation_id"],
@@ -139,8 +148,33 @@ def _begin_scenario(client: Any, scenario: Dict[str, Any], cfg: Dict[str, Any]):
         tags=cfg["tags"],
     )
     turn_messages = _user_turns(scenario)[: cfg["max_turns"]]
-    _trace_id, end_trace, root = client.start_trace(f"scenario:{name}", session_id=ctx.session_id, join_trace_id=cfg["trace_id"])
+    _trace_id, end_trace, root = client.start_trace(
+        f"scenario:{name}", session_id=session_id, agent=cfg.get("agent"), join_trace_id=cfg["trace_id"]
+    )
     return name, scenario_id, ctx, sim, turn_messages, end_trace, root
+
+
+def _end_scenario_root(
+    end_trace: Callable[..., None],
+    status: str,
+    turn_messages: List[str],
+    texts: List[str],
+    failure: Optional[BaseException],
+) -> None:
+    """Ends the scenario's root span with what the platform lists for the
+    scenario: the opening message as its input, the agent's last reply as its
+    output, and the error that ended it, so a failed probe or scenario reads
+    as why it failed without opening its children."""
+    last_reply = texts[-1] if texts else None
+    fields: Dict[str, Any] = {
+        "prompt": turn_messages[0] if turn_messages else None,
+        "completion": last_reply if isinstance(last_reply, str) else None,
+    }
+    if failure is not None:
+        message = (str(failure) or type(failure).__name__)[:MAX_STATUS_MESSAGE]
+        fields["status_message"] = message
+        fields["attributes"] = {"error.type": type(failure).__name__, "error.message": message}
+    end_trace(status, **fields)
 
 
 def _finish_scenario(
@@ -174,6 +208,7 @@ def _run_scenario(client: Any, entrypoint: Entrypoint, scenario: Dict[str, Any],
     name, scenario_id, ctx, sim, turn_messages, end_trace, root = _begin_scenario(client, scenario, cfg)
     with _bind_scenario_root(root):
         status, error, turns = "OK", None, 0
+        failure: Optional[BaseException] = None
         texts: List[str] = []
         explicit_tools: List[Dict[str, Any]] = []
         scores: Dict[str, float] = {}
@@ -194,10 +229,10 @@ def _run_scenario(client: Any, entrypoint: Entrypoint, scenario: Dict[str, Any],
 
                 scores, _ = _finish_scenario(scenario, scenario_id, name, sim, texts, explicit_tools, cfg["metrics"])
             except Exception as exc:
-                status, error = "ERROR", str(exc)
+                status, error, failure = "ERROR", str(exc), exc
                 _log.warning("[evalkit] scenario '%s' failed: %s", name, exc)
             finally:
-                end_trace(status)
+                _end_scenario_root(end_trace, status, turn_messages, texts, failure)
 
         return _result(scenario_id, name, status, turns, scores, error)
 
@@ -206,6 +241,7 @@ async def _run_scenario_async(client: Any, entrypoint: Entrypoint, scenario: Dic
     name, scenario_id, ctx, sim, turn_messages, end_trace, root = _begin_scenario(client, scenario, cfg)
     with _bind_scenario_root(root):
         status, error, turns = "OK", None, 0
+        failure: Optional[BaseException] = None
         texts: List[str] = []
         explicit_tools: List[Dict[str, Any]] = []
         scores: Dict[str, float] = {}
@@ -228,10 +264,10 @@ async def _run_scenario_async(client: Any, entrypoint: Entrypoint, scenario: Dic
 
                 scores, _ = _finish_scenario(scenario, scenario_id, name, sim, texts, explicit_tools, cfg["metrics"])
             except Exception as exc:
-                status, error = "ERROR", str(exc)
+                status, error, failure = "ERROR", str(exc), exc
                 _log.warning("[evalkit] scenario '%s' failed: %s", name, exc)
             finally:
-                end_trace(status)
+                _end_scenario_root(end_trace, status, turn_messages, texts, failure)
 
         return _result(scenario_id, name, status, turns, scores, error)
 
@@ -247,7 +283,11 @@ def simulate_user(
     model: Optional[str] = None,
     provider: Optional[str] = None,
     api_key: Optional[str] = None,
+    agent: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """Plays each scenario against `entrypoint`, one root span and one session
+    per scenario. `agent` names the agent under test on every span of the run,
+    so the run's traces list under that agent."""
     from .. import _get_instance
     from ..core.context import get_or_create_ambient_trace_id
 
@@ -259,6 +299,7 @@ def simulate_user(
         "max_turns": max_turns,
         "tags": tags,
         "safe_mode": safe_mode,
+        "agent": agent.strip() if isinstance(agent, str) and agent.strip() else None,
     }
     scenario_list = list(scenarios)
 

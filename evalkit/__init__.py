@@ -469,7 +469,7 @@ def start_trace(
     device_id: Optional[str] = None,
     user_id: Optional[str] = None,
     agent: Optional[str] = None,
-) -> Tuple[str, Callable[[str], None], SpanContext]:
+) -> Tuple[str, Callable[..., None], SpanContext]:
     return _get_instance().start_trace(
         name,
         attributes,

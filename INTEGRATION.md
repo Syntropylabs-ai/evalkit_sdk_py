@@ -1,22 +1,18 @@
-# EvalKit Python SDK — Integration Guide
+# EvalKit Python SDK integration guide
 
-`syntropylabs-evalkit` —
+EvalKit is the SyntropyLabs SDK for Python. It traces your LLM app and sends the traces to [SyntropyLabs](https://syntropylabs.ai). It can also replay test scenarios against your agent and score the answers.
 
-- **Package:** `syntropylabs-evalkit`
-- **Version:** 0.2.8
-- **Requires:** Python ≥ 3.9
+The package is `syntropylabs-evalkit`, at version 0.3.1, and you import it as `evalkit`. It needs Python 3.9 or later. The [README](README.md) is the full reference. It also covers identity, evaluation runs, feedback, prompts and the `evalkit` command.
 
-> One rule the SDK never breaks: **tracing must never break your app.** Every patch, span, and export is wrapped so a failure degrades to a no-op and your code keeps running.
+> Tracing never breaks your app. Every patch, span and export is wrapped, so a failure in tracing becomes a no-op and your code keeps running. If your `mask` function raises, EvalKit drops that span, so content you meant to hide is not sent. Calls to the SyntropyLabs API are the exception: `Eval()`, `feedback()`, `prompts.get()`, `generate_scenarios()` and `evaluate_simulation()` raise when the request fails.
 
----
-
-## 1. Install
+## Install
 
 ```bash
 pip install syntropylabs-evalkit
 ```
 
-Install with the integrations you use (optional extras):
+Extras install the client libraries that EvalKit instruments:
 
 ```bash
 pip install "syntropylabs-evalkit[openai]"      # or anthropic, google, cohere, mistral, groq, bedrock, litellm, langchain
@@ -24,13 +20,15 @@ pip install "syntropylabs-evalkit[all]"         # every provider integration
 pip install "syntropylabs-evalkit[otel]"        # OpenTelemetry bridge (community auto-instrumentation)
 ```
 
----
+The extras are `openai`, `anthropic`, `google`, `cohere`, `mistral`, `groq`, `bedrock`, `litellm`, `ollama`, `langchain`, `langgraph`, `pinecone`, `qdrant`, `chroma`, `weaviate`, `llamaindex`, `elevenlabs`, `assemblyai`, `otel` and `all`. Each extra installs its library, for example `google-genai` for `google` and `boto3` for `bedrock`. `all` installs every one of them.
 
-## 2. Quick start
+You do not need an extra for a library you already have. EvalKit instruments each supported library that it can import when `init()` runs.
 
-Call `init()` once, as early as possible (before importing/creating your LLM clients
-and web app), then use your code normally — LLM calls, HTTP, DB, and your own
-functions are traced automatically.
+The `otel` extra adds nothing to the core install. Its two packages, `opentelemetry-sdk` and `opentelemetry-instrumentation`, are core dependencies, and the OpenTelemetry bridge is part of every install. See [OpenTelemetry interop](#opentelemetry-interop).
+
+## Quick start
+
+Call `init()` once, as early as you can. Do it before you import or create your LLM clients and your web app. From then on, LLM calls, outbound HTTP requests, database queries and your own functions are traced:
 
 ```python
 import evalkit
@@ -45,17 +43,19 @@ evalkit.init(
 # and your own module-level functions are auto-traced and shipped to EvalKit.
 ```
 
-`init()` is **idempotent** — calling it again returns the existing client. Every
-top-level helper raises `RuntimeError("[evalkit] call evalkit.init() before using the SDK")`
-if used before `init()`.
+Subscription keys start with `tk_live_`. Yours is on the Environments page of the SyntropyLabs console. To open it, choose Settings in the sidebar footer, then Environments under This project.
 
----
+A second call to `init()` returns the client from the first call and ignores its arguments.
 
-## 3. Configuration
+Until `init()` has run, most SDK functions raise `RuntimeError("[evalkit] call evalkit.init() before using the SDK")`. The identity and agent helpers, `session()`, `current_trace_id()`, `with_trace()` and `evaluate()` work without it.
+
+## Configuration
+
+`init()` takes these options. Each value shown is the default:
 
 ```python
 evalkit.init(
-    subscription_key,                              # str, REQUIRED — sent as X-Subscription-Key
+    subscription_key,                              # str, REQUIRED (sent as X-Subscription-Key)
     base_url="https://api.syntropylabs.ai",        # trace ingest endpoint base
     api_url="https://api.syntropylabs.ai",         # control-plane base (scenarios/simulation)
     service_name="unknown",                        # stamped on every span
@@ -72,40 +72,64 @@ evalkit.init(
 )
 ```
 
+`base_url` is where spans go. The SDK posts them to `{base_url}/v1/ingest`, with your key in the `X-Subscription-Key` header.
+
+`api_url` is the base for calls to the SyntropyLabs API. These are `Eval()`, feedback and rewards, prompts, `generate_scenarios()` and `evaluate_simulation()`.
+
+With `debug=True`, the exporter logs each export, retry and auth failure at `DEBUG` level on the `evalkit` logger.
+
+`init()` also takes `capture_content`, `capture_secrets` (or its alias `capture_sensitive_headers`), `capture_stream_bodies` and `mask`. These control which content leaves your process. See [Content capture and masking](README.md#content-capture-and-masking) in the README.
+
 ### Environment variables
-| Var | Effect |
-|-----|--------|
-| `EVALKIT_API_URL` | Overrides `api_url` for `generate_scenarios` / `evaluate_simulation`. |
-| `EVALKIT_FUNCTION_TRACE` | Set to `false` to disable import-time function tracing. |
 
----
+`EVALKIT_API_URL` overrides the `api_url` you pass to `init()`, for calls to the SyntropyLabs API. It does not change where spans go. An `api_url` argument passed to one of those functions wins over both.
 
-## 4. What gets traced automatically
+`EVALKIT_FUNCTION_TRACE=false` turns off the tracing of your own functions. Only the exact value `false` has this effect.
 
-After `init()`, the SDK auto-instruments everything installed in your environment:
+The README lists the other variables under [Environment variables](README.md#environment-variables).
 
-- **LLM providers** (class-level, every client instance): OpenAI (Chat Completions + Responses API), Anthropic (Messages + streaming), Google GenAI (`google.genai`) + legacy `google.generativeai`, Cohere, AWS Bedrock (Converse), Mistral, Groq, LiteLLM, LangChain / LangGraph, Claude Agent SDK. Each emits an `llm_call` span with `model`, `provider`, `prompt`, `completion`, token usage, latency, tool calls, and streaming accumulation.
-- **HTTP clients**: `requests`, `httpx`, `aiohttp` → `http_call` spans, with W3C `traceparent` propagation injected outbound.
-- **Databases**: redis, pymongo/motor, asyncpg, psycopg v3, pymysql, SQLAlchemy → `db_query` spans.
-- **MCP** (`mcp.ClientSession.call_tool`) → `tool_call` spans.
-- **Logging**: each `logging` record ≥ DEBUG becomes a child `log` span, with `trace_id` injected into records.
-- **Your own functions**: module-level functions in your source tree are wrapped as `function_call` spans at import time (disable with `function_tracing=False`).
-- **Thread/executor context**: trace context propagates into `Thread` / `ThreadPoolExecutor` so background work doesn't orphan.
+## What gets traced
 
-> Dedup: if the matching OpenTelemetry community instrumentation package is installed, the SDK steps aside and lets OTel own that library (no double spans).
+After `init()`, EvalKit instruments every supported library that is installed. LLM clients are patched on the class, so every client instance is traced.
 
-Re-run HTTP/logging instrumentation manually if needed:
+- LLM clients: OpenAI (Chat Completions and Responses), Anthropic (Messages, streaming included), Google GenAI (`google.genai`) and the older `google.generativeai`, Cohere, Mistral, Groq and Ollama. Anthropic on Vertex (`AnthropicVertex`) and Google GenAI in Vertex mode are covered too.
+- AWS Bedrock: the runtime's Converse and InvokeModel calls, streaming included, and the agent runtime's InvokeAgent, InvokeInlineAgent, Retrieve and RetrieveAndGenerate calls.
+- Frameworks: LiteLLM, LangChain and LangGraph, LlamaIndex, Google ADK and the Claude Agent SDK.
+- Vector stores: Pinecone, Qdrant, Chroma and Weaviate.
+- Voice: OpenAI audio and Realtime, ElevenLabs, AssemblyAI and Google GenAI Live.
+- HTTP clients: `requests`, `httpx` and `aiohttp`, as `http_call` spans.
+- Databases: Redis, PyMongo (Motor included), asyncpg, psycopg 3 and PyMySQL, as `db_query` spans.
+- MCP: `mcp.ClientSession.call_tool`, as `tool_call` spans.
+- Logging: records from Python's `logging` module, as `log` spans.
+- Your own functions: public module-level functions in your source tree, as `function_call` spans.
+
+Each LLM call becomes an `llm_call` span with the model, provider, prompt, completion, token usage, latency and tool calls. A streamed response is collected into the same span.
+
+EvalKit also adds a W3C `traceparent` header to each outgoing HTTP request. With `requests` and `aiohttp`, it adds the header when you pass the headers as a plain dict or pass none.
+
+A log record becomes a span when it passes the root logger's level. The root level is `WARNING` unless your app changes it, so by default only warnings and errors are recorded. EvalKit also adds the trace ID to every record.
+
+The source tree is the directory of the file that calls `init()`. Modules imported after `init()` are covered too. Turn this off with `function_tracing=False`.
+
+Trace context carries into `threading.Thread` and `ThreadPoolExecutor`. Work that you hand to a thread stays in its trace.
+
+Some libraries need a call of your own. The Vertex AI SDK's `GenerativeModel` needs `patch_vertex_generative_model(model)`. SQLAlchemy needs `patch_sqlalchemy_engine(engine)`, unless EvalKit creates the tracer provider, in which case its OpenTelemetry instrumentor traces it.
+
+A few calls are not traced at all. psycopg2 is not instrumented, and neither are OpenAI Responses calls made with the async client and `stream=True`.
+
+EvalKit owns the libraries it patches. [How duplicates are handled](#how-duplicates-are-handled) explains what happens to OpenTelemetry spans for the same calls.
+
+`auto_instrument()` runs the whole setup again, LLM patches included:
 
 ```python
 evalkit.auto_instrument(logging=True, requests=True, httpx=True)
 ```
 
----
+A patch that is already in place is not applied twice. Passing `False` for a flag skips that step on this run. It does not undo what `init()` installed, so these flags cannot turn instrumentation off.
 
-## 5. Manual LLM client patching
+## Patch a client by hand
 
-For clients created in a way the auto-patch can't reach, or to bind a specific
-parent span, patch the instance directly:
+Use a patch function for a client that the class-level patches did not reach. The Vertex AI SDK's `GenerativeModel` always needs one.
 
 ```python
 from openai import OpenAI
@@ -115,7 +139,7 @@ client = OpenAI()
 evalkit.patch_openai_client(client)            # async: patch_async_openai_client
 ```
 
-Available helpers:
+These are the helpers:
 
 ```
 patch_openai_client / patch_async_openai_client
@@ -132,9 +156,17 @@ patch_mistral_client / patch_async_mistral_client
 patch_sqlalchemy_engine / patch_async_sqlalchemy_engine
 ```
 
-### Realtime / voice (WebSocket)
+A patch function skips a client that is already wrapped. Once `init()` has patched a library's classes, the helper for that library does nothing, and its `parent_ctx` argument has no effect. To put such calls under a span you choose, run them inside `with evalkit.with_trace(ctx):`, as shown in [Imperative spans](#imperative-spans).
 
-Trace streaming voice sessions — `voice.session` / `voice.turn` / `tool_call` spans:
+`evalkit` also exports `patch_ollama()`, `patch_pinecone()`, `patch_qdrant()`, `patch_chroma()`, `patch_weaviate()`, `patch_llamaindex()`, `patch_openai_audio()`, `patch_elevenlabs()`, `patch_assemblyai()`, `patch_google_genai_live()` and `patch_openai_realtime()`. They take no arguments. `init()` applies the same patches when the library is installed.
+
+### Realtime voice sessions
+
+A realtime voice session becomes a `voice.session` trace. Each turn is a `voice.turn` span of type `llm_call`, and each tool the model calls is a `tool_call` span named after the tool.
+
+`init()` traces these sessions without any wrapper. It patches `connect()` for Gemini Live on the async `google.genai` client (`client.aio.live.connect()`) and for OpenAI Realtime on the async OpenAI client (`client.beta.realtime.connect()`).
+
+`trace_google_live()` and `trace_openai_realtime()` wrap one connection explicitly. Both return an async context manager:
 
 ```python
 import evalkit
@@ -147,14 +179,14 @@ async with evalkit.trace_google_live(genai_client, model="gemini-2.0-flash-live"
 conn = evalkit.trace_openai_realtime(openai_client, model="gpt-realtime")
 ```
 
----
+Use the wrappers only where `init()` has not patched `connect()`. On a connection that `init()` already traces, a wrapper records a second `voice.session` span.
 
-## 6. Web framework integration
+## Web frameworks
 
-Add the middleware so inbound requests become `http_call` server spans, continue
-upstream `traceparent`, and inject `X-Trace-Id` into responses.
+Add the middleware for your framework. Each inbound request then becomes an `http_call` span named after its method and path, such as `GET /orders`. The middleware continues an incoming `traceparent` header and adds `X-Trace-Id` and `traceparent` headers to the response.
 
-**FastAPI / Starlette**
+For FastAPI or Starlette, add `EvalKitMiddleware`:
+
 ```python
 from fastapi import FastAPI
 from evalkit import EvalKitMiddleware
@@ -163,7 +195,8 @@ app = FastAPI()
 app.add_middleware(EvalKitMiddleware)
 ```
 
-**Django** (`settings.py`)
+For Django, add `evalkit.EvalKitDjangoMiddleware` to `MIDDLEWARE` in `settings.py`:
+
 ```python
 MIDDLEWARE = [
     "evalkit.EvalKitDjangoMiddleware",
@@ -171,7 +204,8 @@ MIDDLEWARE = [
 ]
 ```
 
-**Flask**
+For Flask, call `instrument_flask()` on the app. It raises `RuntimeError` if `init()` has not run yet:
+
 ```python
 from flask import Flask
 import evalkit
@@ -180,7 +214,8 @@ app = Flask(__name__)
 evalkit.instrument_flask(app)
 ```
 
-**Litestar**
+For Litestar, pass the middleware when you create the app:
+
 ```python
 from litestar import Litestar
 from evalkit import create_litestar_middleware
@@ -188,13 +223,16 @@ from evalkit import create_litestar_middleware
 app = Litestar(route_handlers=[...], middleware=[create_litestar_middleware()])
 ```
 
----
+The Django, FastAPI and Starlette middleware also record the id of a signed-in user. See [Identity](README.md#identity) in the README.
 
-## 7. Manual tracing
+## Manual tracing
 
-Use these when you want explicit spans around code the auto-tracer doesn't cover.
+Use these for code that the automatic tracing does not reach.
 
-**Decorators** (sync + async):
+### Decorators and modules
+
+The decorators work on sync and async functions:
+
 ```python
 import evalkit
 
@@ -208,14 +246,24 @@ def search_docs(query): ...
 class Agent: ...
 ```
 
-Trace whole modules / packages:
+`traced` wraps only the methods that the class defines itself, and it skips names that start with `__`. The decorators look up the client when they are applied, so call `init()` before the decorated code is imported.
+
+To trace a whole module or package:
+
 ```python
 import mypkg.tools
 evalkit.trace_module(mypkg.tools)      # wrap every function defined in the module
 evalkit.trace_package(mypkg)           # recurse into the package
 ```
 
-**Imperative spans:**
+`trace_module()` wraps the public functions defined in the module itself. `trace_package()` does the same for the package and imports each of its submodules. Both skip names that start with `_` unless you pass `include_private=True`, and both return the number of functions they wrapped.
+
+The decorators and both module helpers take `capture_io`. With `capture_io=True`, the default, arguments and return values are recorded as JSON and cut to 4096 characters, with `…` at the end. Set `capture_io=False` for sensitive payloads.
+
+### Imperative spans
+
+Open a span yourself when a block of work has no function to decorate:
+
 ```python
 # Generic span
 end, ctx = evalkit.start_span("retrieve", attributes={"k": 5})
@@ -240,16 +288,17 @@ with evalkit.with_trace(ctx):
 evalkit.current_trace_id()             # active trace id (for logging/correlation)
 ```
 
-`capture_io=True` (default on decorators) records args/results as span attributes
-(truncated). Set `capture_io=False` for sensitive payloads.
+`start_span()` opens a `function_call` span under the current span and returns its `end` function and context. It does not make the new span current. To nest the spans opened in a block under it, wrap the block in `with evalkit.with_trace(ctx):`.
 
----
+`start_trace()` opens a root span of type `log` and makes it current until you call `end`. Inside another span, it opens a child in that span's trace. `start_http_trace()` opens an `http_call` span in a new trace, and its `end` records the response.
 
-## 8. Offline evaluation — `evaluate()`
+`end()` sends the status string exactly as you pass it. The SDK defines `"OK"`, `"ERROR"` and `"UNSET"`. `current_trace_id()` returns the current trace's id, and it creates one when no trace is active.
 
-Deterministic metrics computed **locally, no LLM call**. Returns
-`{metric_name: score}` (0.0–1.0) and, if initialised, also emits an `eval_result`
-span to the dashboard.
+The README gives each signature under [Manual spans](README.md#manual-spans).
+
+## Offline evaluation
+
+`evaluate()` scores an output locally with deterministic metrics, and it makes no LLM call. It returns `{metric_name: score}`, with each score from 0.0 to 1.0. It works without `init()`. After `init()`, it also sends the scores as an `eval_result` span.
 
 ```python
 scores = evalkit.evaluate(
@@ -267,25 +316,23 @@ scores = evalkit.evaluate(
 #     "contextual_precision": 0.5, "contextual_recall": 1.0}
 ```
 
-| Metric | Needs | Measures |
-|--------|-------|----------|
-| `tool_trajectory` | `expected_tools` | order-aware tool match (LCS / len expected) |
-| `tool_f1` | `expected_tools` | F1 over tool-name sets |
-| `tool_correctness` | `expected_tools` | recall: fraction of expected tools called |
-| `response_match` | `constraints.requiredTerms` | fraction of required terms present |
-| `constraint_compliance` | `constraints` | requiredTerms / hasCitations / slideCount checks |
-| `contextual_precision` | `retrieved_context` + `expected_context` | retrieved ∩ expected / retrieved |
-| `contextual_recall` | `retrieved_context` + `expected_context` | expected ∩ retrieved / expected |
+Each metric is computed only when its inputs are present. With `metrics=None`, you get every metric your arguments allow. `input` and `expected_output` are accepted, but no metric reads them.
 
-Each metric is computed only when its inputs are present. Constraint keys accept
-snake_case or camelCase.
+| Metric | Computed when | Score |
+| --- | --- | --- |
+| `tool_trajectory` | `expected_tools` is not empty | Longest common subsequence of called and expected tools, over the number expected |
+| `tool_f1` | `tool_calls` or `expected_tools` is not empty | F1 of the called and expected tool-name sets |
+| `tool_correctness` | `expected_tools` is not empty | Share of expected tools that were called |
+| `response_match` | `constraints` has `requiredTerms` | Share of required terms found in the output, ignoring case |
+| `constraint_compliance` | `constraints` is not empty | Share of the `requiredTerms`, `hasCitations` and `slideCount` checks that pass |
+| `contextual_precision` | `retrieved_context` and `expected_context` are both given | Share of retrieved items that are expected |
+| `contextual_recall` | `retrieved_context` and `expected_context` are both given | Share of expected items that were retrieved |
 
----
+Constraint keys accept snake_case or camelCase, such as `required_terms` or `requiredTerms`. `hasCitations` looks for a marker such as `[1]`, a year in parentheses or a URL. `slideCount` counts mentions such as `slide 3`, `section 3` or `## 3.`.
 
-## 9. Scenario generation — `generate_scenarios()`
+## Scenario generation
 
-Generate test scenarios for an agent from its instructions + tools (control-plane,
-bring-your-own-key).
+`generate_scenarios()` has the SyntropyLabs API write test scenarios for your agent, from its instructions and tools. You bring your own key for the model that writes them:
 
 ```python
 scenarios = evalkit.generate_scenarios(
@@ -304,15 +351,15 @@ scenarios = evalkit.generate_scenarios(
 # -> list of scenario dicts ready to feed into simulate_user()
 ```
 
----
+The request goes to `POST {api_url}/scenarios/generate` with a 120-second timeout. The SDK removes `apiKey` from the request body that it records on the span.
 
-## 10. User simulation — `simulate_user()`
+Strings and dicts in `tools` are sent as they are. A callable is sent as its name and the first line of its docstring. `count` defaults to 5. The function also accepts `max_tokens` and `api_url`, and it returns a list of scenario dicts.
 
-Drives a multi-turn synthetic user against your agent locally, tags every span
-with the simulation, and scores each scenario with `evaluate()`.
+## User simulation
 
-Your **entrypoint** receives a `SimContext` per turn and returns text or an
-`AgentTurnResult`:
+`simulate_user()` plays scenarios against your agent in your own process. The user side is scripted: each turn sends the scenario's next message, and no model writes the user's lines.
+
+Your entrypoint is called once per turn with a `SimContext`. It returns a string or an `AgentTurnResult`, and it can be sync or async:
 
 ```python
 from evalkit import SimContext, AgentTurnResult
@@ -340,7 +387,13 @@ result = evalkit.simulate_user(
 #     "results": [{"scenario_id", "name", "status", "turns", "scores", "error?"}, ...]}
 ```
 
-`entrypoint` may be sync **or** async. A hand-written scenario dict can include:
+`ctx.turn` counts from 1. `ctx.state` lasts for the turns of one scenario, and `ctx.session_id` stays the same for all of them.
+
+If no turn returns `tool_calls`, EvalKit uses the tool calls it traced during the scenario. `simulate_user()` does not read `retrieved_context`, so the scores include no contextual metrics.
+
+`safe_mode`, on by default, reaches your entrypoint as `ctx.state["__safe_mode__"]`. The SDK does nothing else with it. `tags` are recorded on the run's spans as `evalkit.tags`.
+
+A hand-written scenario is a dict like this one:
 
 ```python
 {
@@ -354,15 +407,17 @@ result = evalkit.simulate_user(
 }
 ```
 
-All spans produced during a scenario are tagged `isSimulation=true` with the
-`simulationId` / `runId` / `scenarioId`, so they’re filterable in the dashboard.
+The user turns come from `turns`, or from `messages` when there is no `turns`. Each turn is a string, or a dict with `content` whose `role` is `user`, which is the default role. If neither key gives a message, the scenario plays one turn from `starting_prompt`. At most `max_turns` turns are played, 12 by default.
 
----
+Each scenario is scored with `evaluate()` against its `expected_tools` and `constraints`, and its `target_keywords` are added to the required terms. `metrics=` limits which metrics run. The persona's name is recorded on the spans as `evalkit.persona`, and it does not change the scripted messages. `setup.state` seeds `ctx.state`.
 
-## 11. Simulation evaluation (LLM judge) — `evaluate_simulation()`
+Each scenario gets a root span named `scenario:<name>` and its own session, and the whole run shares one trace. A scenario whose entrypoint raises gets status `ERROR` and an `error` message, and the run goes on to the next scenario.
 
-Run your project’s evaluator collection (LLM-as-judge) over a completed simulation,
-server-side. The judge is bring-your-own-key and never stored.
+Every EvalKit span opened during a scenario carries `isSimulation`, `simulationId`, `runId` and `scenarioId`. You can filter for them in the dashboard. Spans that arrive from other OpenTelemetry instrumentors do not carry these fields.
+
+## Simulation evaluation
+
+`evaluate_simulation()` grades a finished simulation on the server. It runs an evaluator collection from your project, with an LLM as the judge. The judge uses your own provider key, which is never stored.
 
 ```python
 report = evalkit.evaluate_simulation(
@@ -375,38 +430,62 @@ report = evalkit.evaluate_simulation(
 # -> per-scenario, per-criterion scores + reasons + aggregate (averageScore, passRate, ...)
 ```
 
----
+The collection id is on the Evaluators page, under Collections. `provider`, `model` and `api_key` are required, and the SDK sends `run_id` and `max_tokens` only when you pass them.
 
-## 12. OpenTelemetry interop
+The request goes to `POST {api_url}/simulations/evaluate` with a 300-second timeout. The SDK removes `apiKey` from the request body that it records on the span.
 
-The SDK is OTel-native in two directions:
+## OpenTelemetry interop
 
-- **Inbound (always on):** EvalKit spans automatically nest under, and share the
-  `trace_id` of, any active OpenTelemetry span (if `opentelemetry-api` is importable).
-- **Outbound bridge (opt-in, `pip install "syntropylabs-evalkit[otel]"`):** community
-  OTel auto-instrumentations are enabled (minus the LLM libs EvalKit hand-instruments),
-  and their spans are mapped to EvalKit envelopes and shipped through the same pipeline.
+EvalKit works with OpenTelemetry in both directions. Both are part of every install.
 
-W3C `traceparent` is the wire format for distributed propagation — emitted on
-outbound HTTP and parsed on inbound requests.
+### OpenTelemetry spans as parents
 
----
+When no EvalKit span is active, a new EvalKit span takes the active OpenTelemetry span as its parent and shares its trace ID. This uses `opentelemetry-api`, which the SDK installs.
 
-## 13. Flushing & shutdown
+### OpenTelemetry spans sent to SyntropyLabs
 
-Spans are batched and exported by a background daemon thread; `atexit` flushes on
-exit. To force a synchronous flush (e.g. in short-lived scripts / serverless):
+If your app has no tracer provider, `init()` creates one and makes it the global provider. It then registers every installed OpenTelemetry instrumentor except those on a skip list. The list holds the libraries that EvalKit instruments itself, plus Replicate, Transformers and psycopg2.
+
+If your app already has a tracer provider, `init()` adds EvalKit's span processor to it and registers no instrumentors. Either way, each OpenTelemetry span is mapped to an EvalKit span and sent through the same exporter.
+
+W3C `traceparent` carries the trace between services. EvalKit adds it to outbound HTTP requests, and the web middleware reads it from inbound requests.
+
+### How duplicates are handled
+
+EvalKit owns the libraries it patches. It drops OpenTelemetry spans from the scopes it owns, which cover `requests`, `httpx`, `aiohttp`, the databases it patches and Bedrock calls through botocore.
+
+An LLM span from another instrumentor is kept, but EvalKit files it as `function_call` and drops its token and cache counts, so usage is not counted twice. Set `EVALKIT_COUNT_FOREIGN_LLM=1` when that instrumentor is the only one that reports the call.
+
+The README has the details under [Spans from other OpenTelemetry instrumentors](README.md#spans-from-other-opentelemetry-instrumentors).
+
+## Flushing and shutdown
+
+A background daemon thread exports spans in batches, and the queue is flushed when the program exits. To export the queue synchronously, for example at the end of a short-lived script or a serverless handler, call `flush()`:
 
 ```python
 evalkit.flush()
 ```
 
----
+## Troubleshooting
 
-## 14. Notes & troubleshooting
+### Nothing shows up
 
-- **Nothing showing up?** Confirm `init()` runs before clients/app are created, and that `subscription_key` is valid. Three consecutive `401/403` responses permanently disable the exporter for the process (a bad key never self-heals) — fix the key and restart.
-- **Duplicate spans?** You likely patched a client that’s also auto-instrumented; remove the manual `patch_*` call (auto-patch already covers it).
-- **Sensitive payloads:** set `capture_io=False` on decorators and lower `max_body_bytes`; captured HTTP/DB bodies are size-capped and oversized spans are trimmed before send.
-- **Async/threads:** context propagates into threads and executors automatically; if you spawn processes, call `init()` in each.
-- **Span types you’ll see:** `llm_call`, `tool_call`, `http_call`, `db_query`, `function_call`, `log`, `eval_result`.
+Check that `init()` runs before your clients and your app are created, and that `subscription_key` is valid. Set `debug=True` to log each export, retry and auth failure.
+
+After 3 consecutive 401 or 403 responses, the exporter stops for the rest of the process. A bad key never recovers on its own, so fix the key and restart.
+
+### Duplicate spans
+
+A `patch_*` call on a client that `init()` already patched does nothing, so it cannot double your spans. A second LLM instrumentor does report each call again. See [How duplicates are handled](#how-duplicates-are-handled).
+
+### Sensitive payloads
+
+Set `capture_io=False` on decorators and lower `max_body_bytes`. Recorded HTTP bodies and database statements are capped at `max_body_bytes`, and a span over 8 MiB is trimmed before it is sent. To strip or mask content on every span, use `capture_content` and `mask`, described in [Content capture and masking](README.md#content-capture-and-masking).
+
+### Threads and processes
+
+Trace context carries into threads and thread pools without extra code. If you start other processes, call `init()` in each one.
+
+### Span types
+
+You will see these span types: `llm_call`, `tool_call`, `http_call`, `db_query`, `function_call`, `log` and `eval_result`.

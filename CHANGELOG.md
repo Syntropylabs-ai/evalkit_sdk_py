@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- `Eval(..., collections=[...])` runs evaluator collections from the dashboard by id, alone or
+  beside rule ids and local scorers in `evaluators`. The server expands each collection into
+  its rules; a run of one collection is scored the way the dashboard scores it (its weights,
+  thresholds, aggregation and hard gates), and two or more run every rule once at weight 1.
+  `evaluators` is now optional when `collections` is given, and `evalkit eval run` configs
+  accept `collections`. Needs a server that supports collections: an older one is detected
+  when the run opens and raises `RuntimeError` before any row is sent.
+
+### Fixed
+- A row's `context` given as one string is sent as one document. It was split into one
+  entry per character, so a grounding evaluator judged the answer against single letters.
+- An HTTP error from an evaluation run reads as the server's reason
+  (`HTTP Error 404: Evaluation rule(s) not found: ...`). It used to read
+  `HTTP Error 404: Not Found`. It is still a `urllib.error.HTTPError` with the same `code` and `response_text`.
+
 ## 0.3.1 — 2026-09-26
 
 ### Fixed
@@ -13,7 +31,7 @@
   sampling, and without these a changed tool set never showed as a new version. The first spans
   after upgrading start a new version entry for each agent, since the parameters are now part of it.
 - An Anthropic `system` prompt passed as a list of blocks (as prompt caching requires) is
-  recorded as its text in the span's prompt instead of the list's Python repr.
+  recorded as its text in the span's prompt. It was recorded as the list's Python repr.
 
 ## 0.3.0 — 2026-09-26
 
@@ -36,7 +54,8 @@ Sessions and named agents. Traces now group into conversations and agents on the
 ### Changed
 - A root `start_trace` always starts a new trace. Consecutive turns handled in one thread or task
   used to share the first turn's trace id, so a whole session showed as one trace.
-  `start_trace(..., join_trace_id=...)` joins an existing trace on purpose.
+  The client's `start_trace(..., join_trace_id=...)` (on the `EvalKitClient` that `init()`
+  returns) joins an existing trace on purpose.
 - OpenTelemetry spans from other libraries keep the session, user and agent in force when they
-  started (they were read on the export thread, which has none), and a span started inside an
-  evalkit span joins that evalkit trace instead of exporting as a separate one.
+  started (they were read on the export thread, which has none). A span started inside an
+  EvalKit span joins that EvalKit trace. It used to be exported as a separate trace.

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
 import time
 import urllib.error
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     Any,
     Callable,
@@ -44,7 +45,7 @@ class EvalRow(TypedDict, total=False):
     output: str
     target: str
     expected: str
-    context: List[str]
+    context: Union[str, List[str]]
     metadata: Dict[str, Any]
 
 
@@ -181,9 +182,19 @@ def _split_evaluators(
         raise ValueError(
             f"evaluators[{index}] = {entry!r} is neither a server rule id (24 hex chars) nor a callable"
         )
-    if not rule_ids:
-        raise ValueError("evaluators must include at least one server rule id")
     return rule_ids, local
+
+
+def _collection_ids(collections: Sequence[str]) -> List[str]:
+    # A lone id would otherwise be read one character at a time.
+    if isinstance(collections, str):
+        raise ValueError("collections must be a list of collection ids, not a single string")
+    ids: List[str] = []
+    for index, entry in enumerate(collections):
+        if not (isinstance(entry, str) and _RULE_ID.match(entry)):
+            raise ValueError(f"collections[{index}] = {entry!r} is not a collection id (24 hex chars)")
+        ids.append(entry)
+    return ids
 
 
 def _build_rows(
@@ -255,12 +266,17 @@ def _run_local(
     return scores, entries
 
 
+def _context_list(context: Any) -> List[Any]:
+    # One retrieved document is a string; list() would send it one character per entry.
+    return [context] if isinstance(context, str) else list(context)
+
+
 def _row_metadata(row: Mapping[str, Any]) -> Dict[str, Any]:
     metadata = row.get("metadata")
     out: Dict[str, Any] = dict(metadata) if isinstance(metadata, Mapping) else {}
     context = row.get("context")
     if context is not None:
-        out["context"] = list(context)
+        out["context"] = _context_list(context)
     return out
 
 
@@ -268,6 +284,7 @@ def _row_metadata(row: Mapping[str, Any]) -> Dict[str, Any]:
 class _RunSpec:
     name: str
     rule_ids: List[str]
+    collection_ids: List[str] = field(default_factory=list)
     judge_model: Optional[str] = None
     judge_model_config_id: Optional[str] = None
     baseline_job_id: Optional[str] = None
@@ -287,6 +304,8 @@ class _RunSpec:
 
     def create_body(self) -> Dict[str, Any]:
         body: Dict[str, Any] = {"name": self.name, "ruleIds": list(self.rule_ids)}
+        if self.collection_ids:
+            body["collectionIds"] = list(self.collection_ids)
         body.update(self._judge_and_hyperparameters())
         if self.baseline_job_id is not None:
             body["baselineJobId"] = self.baseline_job_id
@@ -354,7 +373,7 @@ class _RunRows:
             if target is not None:
                 item["target"] = target
             if row.get("context") is not None:
-                item["context"] = list(row["context"])
+                item["context"] = _context_list(row["context"])
             payload.append(item)
         return payload
 
@@ -382,9 +401,17 @@ class _RunApi:
         self._timeout = timeout
 
     def post(self, path: str, body: Dict[str, Any], span_name: str) -> Dict[str, Any]:
-        return post_json(
-            self._client, self._base + path, body, timeout=self._timeout, span_name=span_name
-        )
+        try:
+            return post_json(
+                self._client, self._base + path, body, timeout=self._timeout, span_name=span_name
+            )
+        except urllib.error.HTTPError as exc:
+            # str(exc) is what a traceback shows; the server's reason ("Evaluation rule(s)
+            # not found: ...") says what to fix where "Not Found" does not.
+            message = _server_message(exc)
+            if message:
+                exc.msg = message
+            raise
 
     def create(self, spec: _RunSpec) -> Dict[str, Any]:
         return self.post("/evaluation-runs", spec.create_body(), "POST /evaluation-runs")
@@ -406,6 +433,17 @@ class _RunApi:
         return self.post("/evaluation-runs", spec.legacy_body(rows, single), "POST /evaluation-runs")
 
 
+def _server_message(exc: urllib.error.HTTPError) -> Optional[str]:
+    try:
+        body = json.loads(getattr(exc, "response_text", None) or "")
+    except ValueError:
+        return None
+    message = body.get("message") if isinstance(body, Mapping) else None
+    if isinstance(message, list):
+        message = "; ".join(str(part) for part in message)
+    return message if isinstance(message, str) and message else None
+
+
 def _quiet() -> bool:
     return os.getenv("EVALKIT_QUIET", "").strip().lower() in _TRUTHY
 
@@ -421,6 +459,14 @@ def _create_run(api: _RunApi, spec: _RunSpec) -> Tuple[str, Optional[str]]:
     run_id = created.get("runId")
     if not run_id:
         raise RuntimeError("[evalkit] POST /evaluation-runs answered without a runId")
+    # A server that predates collections drops the field without an error and would
+    # score only the rule ids; the rule list it echoes is how a newer one answers.
+    if spec.collection_ids and not isinstance(created.get("ruleIds"), list):
+        raise RuntimeError(
+            f"[evalkit] this EvalKit server does not support collections, so run {run_id} "
+            "would score none of their rules; upgrade the server, or pass the collection's "
+            "rule ids in evaluators"
+        )
     url = created.get("url")
     return str(run_id), (str(url) if url else None)
 
@@ -466,7 +512,9 @@ def _run_appended(
         try:
             api.append(run_id, rows.append_payload(start, stop))
         except urllib.error.HTTPError as exc:
-            if exc.code == 404:
+            # The single-call fallback cannot carry collections: re-raise rather than
+            # score a different set of evaluators.
+            if exc.code == 404 and not spec.collection_ids:
                 _rows_endpoint_support[client] = False
                 return None
             raise
@@ -548,7 +596,8 @@ def Eval(
     data: Iterable[Mapping[str, Any]],
     task: Optional[Callable[[Mapping[str, Any]], str]] = None,
     *,
-    evaluators: Sequence[Union[str, LocalEvaluator]],
+    evaluators: Optional[Sequence[Union[str, LocalEvaluator]]] = None,
+    collections: Optional[Sequence[str]] = None,
     judge_model: Optional[str] = None,
     judge_model_config_id: Optional[str] = None,
     baseline_job_id: Optional[str] = None,
@@ -565,13 +614,19 @@ def Eval(
     if batch_size < 1:
         raise ValueError("batch_size must be at least 1")
 
-    rule_ids, local = _split_evaluators(evaluators)
+    rule_ids, local = _split_evaluators(evaluators or ())
+    collection_ids = _collection_ids(collections or ())
+    if not rule_ids and not collection_ids:
+        raise ValueError(
+            "name at least one server evaluator: a rule id in evaluators or a collection id in collections"
+        )
     source, outputs = _build_rows(data, task)
     local_scores, local_entries = _run_local(local, source, outputs)
 
     spec = _RunSpec(
         name=name,
         rule_ids=rule_ids,
+        collection_ids=collection_ids,
         judge_model=judge_model,
         judge_model_config_id=judge_model_config_id,
         baseline_job_id=baseline_job_id,
@@ -590,7 +645,9 @@ def Eval(
     base = (api_url or os.getenv("EVALKIT_API_URL") or client._opts.api_url).rstrip("/")
     api = _RunApi(client, base, timeout)
 
-    if _rows_endpoint_support.get(client) is not False:
+    # Collections exist only on the appended path, so a client once served by an older
+    # deployment still tries it for them; that server then refuses with a clear error.
+    if collection_ids or _rows_endpoint_support.get(client) is not False:
         result = _run_appended(api, client, spec, rows)
         if result is not None:
             return result

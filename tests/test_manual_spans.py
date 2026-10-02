@@ -2,6 +2,7 @@ import asyncio
 import unittest
 
 import evalkit
+from evalkit.core.client import MAX_STATUS_MESSAGE
 from tests.helpers import fresh, reset_context
 
 
@@ -55,6 +56,36 @@ class TestManualSpans(unittest.TestCase):
         self.assertEqual(ctx.trace_id, tid)
         end("OK")
         self.client.flush()
+
+    def test_start_trace_end_records_what_the_root_was_asked_answered_and_why_it_failed(self):
+        _tid, end, _ctx = self.client.start_trace("turn", {"custom.key": "start"})
+        end(
+            "ERROR",
+            status_message="x" * (MAX_STATUS_MESSAGE + 500),
+            prompt="where is my order?",
+            completion="It shipped yesterday.",
+            attributes={"error.type": "TimeoutError", "custom.key": "end"},
+        )
+        self.client.flush()
+        root = [e for e in self.captured if e.operation == "turn"][0]
+        self.assertEqual(root.status, "ERROR")
+        self.assertEqual(root.status_message, "x" * MAX_STATUS_MESSAGE)
+        self.assertEqual((root.prompt, root.completion), ("where is my order?", "It shipped yesterday."))
+        self.assertEqual(root.attributes["error.type"], "TimeoutError")
+        self.assertEqual(
+            root.attributes["custom.key"], "end",
+            "what is only known when the root ends describes it better than what was known when it started",
+        )
+
+    def test_start_trace_end_with_only_a_status_leaves_the_root_bare(self):
+        _tid, end, _ctx = self.client.start_trace("turn")
+        end("OK")
+        self.client.flush()
+        root = [e for e in self.captured if e.operation == "turn"][0]
+        self.assertEqual(root.status, "OK")
+        self.assertIsNone(root.status_message)
+        self.assertIsNone(root.prompt)
+        self.assertIsNone(root.completion)
 
     def test_trace_function_sync_decorator(self):
         @self.client.trace_function("decorated-fn")

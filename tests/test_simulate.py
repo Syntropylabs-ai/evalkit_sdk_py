@@ -3,6 +3,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 
 import evalkit
+from evalkit.core.client import MAX_STATUS_MESSAGE
 from tests.helpers import GenAIResp, fresh, reset_context, install_fake_genai
 
 
@@ -111,6 +112,118 @@ class TestSimulateUser(unittest.TestCase):
         report = evalkit.simulate_user(agent, [{"name": "x", "starting_prompt": "hi"}])
         self.assertEqual(report["results"][0]["status"], "ERROR")
         self.assertIn("boom", report["results"][0]["error"])
+
+
+class TestScenarioRootSpan(unittest.TestCase):
+    """The scenario's root span is the row the platform lists for a scenario
+    execution, so it has to say on its own what the scenario asked, what the
+    agent answered last and why it failed, under the agent and in the session
+    of that one execution."""
+
+    def setUp(self):
+        reset_context()
+        self.captured = []
+        self.client = fresh(self.captured)
+
+    def _roots(self):
+        return [e for e in self.captured if (e.operation or "").startswith("scenario:")]
+
+    def test_root_carries_the_opening_and_the_last_reply_under_the_agent_and_its_session(self):
+        m = install_fake_genai(self.client, response=GenAIResp(text="ok"))
+        replies = iter(["It shipped yesterday.", "The refund is on its way."])
+
+        def agent(ctx):
+            m.generate_content(model="g", contents=ctx.message)
+            return next(replies)
+
+        report = evalkit.simulate_user(
+            agent,
+            [{"name": "refund", "scenario_id": "scn_refund", "turns": ["Where is my order?", "And my refund?"]}],
+            agent=" Support bot ",
+        )
+
+        [root] = self._roots()
+        self.assertEqual(root.prompt, "Where is my order?")
+        self.assertEqual(root.completion, "The refund is on its way.")
+        spans = [e for e in self.captured if e.trace_id == root.trace_id]
+        self.assertTrue(any(e.span_type == "llm_call" for e in spans))
+        session = f"{report['simulation_id']}:{report['run_id']}:scn_refund"
+        self.assertEqual({e.session_id for e in spans}, {session})
+        self.assertEqual({e.agent_name for e in spans}, {"Support bot"})
+        for span in spans:
+            self.assertEqual(span.attributes.get("gen_ai.agent.name"), "Support bot", span.operation)
+            self.assertEqual(span.attributes.get("evalkit.agent_name"), "Support bot", span.operation)
+
+    def test_each_scenario_is_its_own_session(self):
+        report = evalkit.simulate_user(
+            lambda ctx: "ok",
+            [{"name": "a", "scenario_id": "scn_a", "starting_prompt": "hi"},
+             {"name": "b", "scenario_id": "scn_b", "starting_prompt": "hello"}],
+        )
+        prefix = f"{report['simulation_id']}:{report['run_id']}:"
+        self.assertEqual(sorted(e.session_id for e in self._roots()), [prefix + "scn_a", prefix + "scn_b"])
+
+    def test_a_failed_scenario_says_why_on_its_root(self):
+        def agent(ctx):
+            raise TimeoutError("model call timed out after 30s")
+
+        report = evalkit.simulate_user(agent, [{"name": "x", "starting_prompt": "hi"}])
+
+        [root] = self._roots()
+        self.assertEqual(report["results"][0]["status"], "ERROR")
+        self.assertEqual(root.status, "ERROR")
+        self.assertEqual(root.status_message, "model call timed out after 30s")
+        self.assertEqual(root.attributes["error.type"], "TimeoutError")
+        self.assertEqual(root.attributes["error.message"], "model call timed out after 30s")
+        self.assertEqual(root.prompt, "hi")
+        self.assertIsNone(root.completion)
+
+    def test_an_error_without_a_message_is_named_by_its_type_and_a_long_one_is_bounded(self):
+        def silent(ctx):
+            raise RuntimeError()
+
+        def verbose(ctx):
+            raise ValueError("y" * (MAX_STATUS_MESSAGE * 2))
+
+        evalkit.simulate_user(silent, [{"name": "silent", "starting_prompt": "hi"}])
+        evalkit.simulate_user(verbose, [{"name": "verbose", "starting_prompt": "hi"}])
+
+        roots = {e.operation: e for e in self._roots()}
+        self.assertEqual(roots["scenario:silent"].status_message, "RuntimeError")
+        self.assertEqual(roots["scenario:verbose"].status_message, "y" * MAX_STATUS_MESSAGE)
+        self.assertEqual(roots["scenario:verbose"].attributes["error.message"], "y" * MAX_STATUS_MESSAGE)
+
+    def test_the_async_path_ends_its_root_the_same_way(self):
+        async def answers(ctx):
+            return f"echo: {ctx.message}"
+
+        async def fails(ctx):
+            raise ConnectionError("upstream refused")
+
+        evalkit.simulate_user(answers, [{"name": "ok", "turns": ["one", "two"]}], agent="Async bot")
+        evalkit.simulate_user(fails, [{"name": "bad", "starting_prompt": "hi"}], agent="Async bot")
+
+        roots = {e.operation: e for e in self._roots()}
+        self.assertEqual((roots["scenario:ok"].prompt, roots["scenario:ok"].completion), ("one", "echo: two"))
+        self.assertEqual(roots["scenario:bad"].status_message, "upstream refused")
+        self.assertEqual(roots["scenario:bad"].attributes["error.type"], "ConnectionError")
+        self.assertEqual({e.agent_name for e in roots.values()}, {"Async bot"})
+
+    def test_with_content_capture_off_the_conversation_stays_off_the_root(self):
+        saved = self.client._opts.capture_content
+        self.client._opts.capture_content = False
+        try:
+            def agent(ctx):
+                raise RuntimeError("card declined")
+
+            evalkit.simulate_user(agent, [{"name": "s", "starting_prompt": "my card is 4242 4242 4242 4242"}])
+        finally:
+            self.client._opts.capture_content = saved
+
+        [root] = self._roots()
+        self.assertIsNone(root.prompt)
+        self.assertIsNone(root.completion)
+        self.assertEqual(root.status_message, "card declined")
 
 
 if __name__ == "__main__":

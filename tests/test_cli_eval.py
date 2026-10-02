@@ -115,6 +115,10 @@ class TestSpecLoading(unittest.TestCase):
         self.assertEqual(spec, {"name": "n", "judge_model": "gpt-4o", "baseline_job_id": "b", "auto_baseline": True,
                                 "gate": {"minPassRate": 0.9}, "timeout": 5.0, "batch_size": 50})
 
+    def test_collections_are_an_eval_argument(self):
+        spec = normalise_spec({"name": "n", "collections": [RULE]})
+        self.assertEqual(spec, {"name": "n", "collections": [RULE]})
+
     def test_unknown_key_is_refused(self):
         with self.assertRaises(EvalCliError):
             normalise_spec({"name": "n", "judge": "x"})

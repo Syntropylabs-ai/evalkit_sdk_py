@@ -109,10 +109,11 @@ def _legacy_all_pass(body, n):
 
 class RunServer:
 
-    def __init__(self, mode="append", fail_rows_times=0, legacy_respond=_legacy_all_pass):
+    def __init__(self, mode="append", fail_rows_times=0, legacy_respond=_legacy_all_pass, collections=None):
         self.mode = mode
         self.fail_rows_times = fail_rows_times
         self.legacy_respond = legacy_respond
+        self.collections = dict(collections or {})
         self.requests = []
         self.runs = []
         self.rows = {}
@@ -156,11 +157,17 @@ class RunServer:
                 return 400, {"statusCode": 400, "message": "rows should not be empty"}
             if self.mode == "create-404":
                 return 404, {"statusCode": 404, "message": "Evaluation rule(s) not found: 665f0c1234567890abcdef12"}
+            unknown = [cid for cid in body.get("collectionIds") or [] if cid not in self.collections]
+            if unknown:
+                return 404, {"statusCode": 404, "message": f"Evaluator collection(s) not found: {', '.join(unknown)}"}
             run_id = f"run_{len(self.runs) + 1}"
             self.runs.append(run_id)
             self.rows[run_id] = {}
             self.names[run_id] = body.get("name")
-            return 201, {"runId": run_id, "url": f"https://app.test/o/o1/p/p1/evaluations/{run_id}"}
+            opened = {"runId": run_id, "url": f"https://app.test/o/o1/p/p1/evaluations/{run_id}"}
+            if self.mode != "pre-collections":
+                opened["ruleIds"] = self.expanded_rule_ids(body)
+            return 201, opened
         parts = path.split("/")
         if len(parts) == 4 and parts[1] == "evaluation-runs" and parts[3] == "rows":
             if self.mode == "no-rows-endpoint":
@@ -177,6 +184,10 @@ class RunServer:
             self.completes.append(body)
             return 200, self.complete_payload(parts[2], body)
         return 404, {"statusCode": 404, "message": f"Cannot POST {path}"}
+
+    def expanded_rule_ids(self, body):
+        members = [rule for cid in body.get("collectionIds") or [] for rule in self.collections[cid]]
+        return list(dict.fromkeys(members + list(body.get("ruleIds") or [])))
 
     def route_get(self, path):
         return 404, {"statusCode": 404, "message": f"Cannot GET {path}"}

@@ -11,7 +11,9 @@ from tests.helpers import DATASET_HASH, RunServer, fresh, reset_context
 
 RULE_A = "665f0c1234567890abcdef12"
 RULE_B = "665f0c1234567890abcdef34"
+RULE_C = "665f0c1234567890abcdef56"
 BASELINE = "665f0c1234567890abcdefaa"
+COLLECTION = "665f0c1234567890abcdefc0"
 
 
 def _pattern_outcome(g):
@@ -245,8 +247,102 @@ class TestEval(unittest.TestCase):
             self.assertIn("evaluators[1]", str(cm.exception))
 
     def test_local_only_evaluators_raise(self):
-        with self.assertRaises(ValueError):
+        with self.assertRaises(ValueError) as cm:
             evalkit.Eval("x", [{"input": "q", "output": "a"}], evaluators=[lambda r, o: 1.0], api_url="http://127.0.0.1:1")
+        self.assertIn("a collection id in collections", str(cm.exception))
+        with self.assertRaises(ValueError):
+            evalkit.Eval("x", [{"input": "q", "output": "a"}], api_url="http://127.0.0.1:1")
+
+    def test_collections_are_sent_beside_rule_ids_and_local_scorers(self):
+        with RunServer(collections={COLLECTION: [RULE_B, RULE_A]}) as server:
+            result = self._run(
+                server,
+                name="suite",
+                data=[{"input": "q1", "output": "a1", "target": "a1"}],
+                evaluators=[RULE_C, lambda row, output: 1.0],
+                collections=[COLLECTION],
+                judge_model="gpt-4o",
+            )
+        self.assertEqual(
+            server.paths(),
+            ["/evaluation-runs", "/evaluation-runs/run_1/rows", "/evaluation-runs/run_1/complete"],
+        )
+        create = server.requests[0]["body"]
+        self.assertEqual(create["ruleIds"], [RULE_C])
+        self.assertEqual(create["collectionIds"], [COLLECTION])
+        self.assertEqual(create["judgeModelName"], "gpt-4o")
+        self.assertEqual(
+            server.requests[1]["body"]["rows"][0]["localScores"], [{"name": "<lambda>", "score": 1.0}]
+        )
+        self.assertEqual(result.run_id, "run_1")
+        self.assertEqual(result.local_scores, {"<lambda>": [1.0]})
+
+    def test_collections_alone_name_the_evaluators(self):
+        with RunServer(collections={COLLECTION: [RULE_A]}) as server:
+            result = self._run(server, name="suite", data=[{"input": "q1", "output": "a1"}], collections=[COLLECTION])
+        self.assertEqual(server.requests[0]["body"], {"name": "suite", "ruleIds": [], "collectionIds": [COLLECTION]})
+        self.assertEqual(result.total_rows, 1)
+
+    def test_invalid_collection_entry_raises(self):
+        for bad in ("support-suite", "665f0c1234567890abcdef1", 42, None, RULE_A[:-1] + "g"):
+            with self.assertRaises(ValueError) as cm:
+                evalkit.Eval(
+                    "x", [{"input": "q", "output": "a"}], collections=[COLLECTION, bad], api_url="http://127.0.0.1:1"
+                )
+            self.assertIn("collections[1]", str(cm.exception))
+            self.assertIn(repr(bad), str(cm.exception))
+        with self.assertRaises(ValueError) as cm:
+            evalkit.Eval("x", [{"input": "q", "output": "a"}], collections=COLLECTION, api_url="http://127.0.0.1:1")
+        self.assertIn("not a single string", str(cm.exception))
+
+    def test_unknown_collection_is_a_404_that_names_it(self):
+        with RunServer() as server:
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                self._run(server, name="x", data=[{"input": "q1", "output": "a1"}], collections=[COLLECTION])
+        self.assertEqual(cm.exception.code, 404)
+        self.assertIn(f"Evaluator collection(s) not found: {COLLECTION}", str(cm.exception))
+        self.assertEqual(server.paths(), ["/evaluation-runs"])
+
+    def test_collections_on_a_server_that_predates_them_raise_before_any_row_is_sent(self):
+        with RunServer(mode="pre-collections", collections={COLLECTION: [RULE_A]}) as server:
+            with self.assertRaises(RuntimeError) as cm:
+                self._run(
+                    server, name="x", data=[{"input": "q1", "output": "a1"}],
+                    evaluators=[RULE_B], collections=[COLLECTION],
+                )
+        self.assertIn("does not support collections", str(cm.exception))
+        self.assertEqual(server.paths(), ["/evaluation-runs"])
+
+    def test_collections_never_fall_back_to_the_single_call(self):
+        with RunServer(mode="no-rows-endpoint", collections={COLLECTION: [RULE_A]}) as server:
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                self._run(server, name="x", data=[{"input": "q1", "output": "a1"}], collections=[COLLECTION])
+        self.assertEqual(cm.exception.code, 404)
+        self.assertEqual(server.paths(), ["/evaluation-runs", "/evaluation-runs/run_1/rows"])
+        self.assertIsNone(_rows_endpoint_support.get(self.client))
+
+    def test_collections_take_the_appended_path_after_an_older_server(self):
+        _rows_endpoint_support[self.client] = False
+        with RunServer(collections={COLLECTION: [RULE_A]}) as server:
+            result = self._run(server, name="x", data=[{"input": "q1", "output": "a1"}], collections=[COLLECTION])
+        self.assertEqual(
+            server.paths(),
+            ["/evaluation-runs", "/evaluation-runs/run_1/rows", "/evaluation-runs/run_1/complete"],
+        )
+        self.assertEqual(result.run_id, "run_1")
+
+    def test_a_string_context_is_one_document_on_both_paths(self):
+        row = {"input": "q1", "output": "a1", "context": "Refunds within 30 days."}
+        with RunServer() as server:
+            self._run(server, name="x", data=[row], evaluators=[RULE_A])
+        self.assertEqual(
+            server.requests[1]["body"]["rows"][0]["metadata"], {"context": ["Refunds within 30 days."]}
+        )
+
+        with RunServer(mode="no-rows-endpoint") as server:
+            self._run(server, name="x", data=[row], evaluators=[RULE_A])
+        legacy = [body for body in server.bodies("/evaluation-runs") if "rows" in body]
+        self.assertEqual(legacy[0]["rows"][0]["context"], ["Refunds within 30 days."])
 
     def test_batch_boundaries(self):
         for total, expected in ((199, [199]), (200, [200]), (201, [200, 1]), (450, [200, 200, 50])):
@@ -395,6 +491,7 @@ class TestEval(unittest.TestCase):
                 self._run(server, name="missing-rule", data=[{"input": "q1", "output": "a1"}], evaluators=[RULE_A])
         self.assertEqual(cm.exception.code, 404)
         self.assertIn("Evaluation rule(s) not found", cm.exception.response_text)
+        self.assertEqual(str(cm.exception), "HTTP Error 404: Evaluation rule(s) not found: 665f0c1234567890abcdef12")
         self.assertEqual(server.paths(), ["/evaluation-runs"])
         self.assertIsNone(_rows_endpoint_support.get(self.client))
 
