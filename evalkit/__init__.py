@@ -183,10 +183,12 @@ def init(
     capture_sensitive_headers: Optional[bool] = None,
     capture_stream_bodies: Optional[bool] = None,
     mask: Optional[Callable[[TraceEnvelope], Optional[TraceEnvelope]]] = None,
+    export_gzip: Optional[bool] = None,
 ) -> EvalKitClient:
     global _instance
     if _instance is not None:
         return _instance
+    from .core.exporter import resolve_export_gzip
     from .core.redact import (
         resolve_capture_content,
         resolve_capture_secrets,
@@ -212,6 +214,7 @@ def init(
         capture_secrets=resolve_capture_secrets(secrets_explicit),
         capture_stream_bodies=resolve_capture_stream_bodies(capture_stream_bodies),
         mask=mask,
+        export_gzip=resolve_export_gzip(export_gzip),
     )
     set_capture_sensitive_headers(opts.capture_secrets)
     _instance = EvalKitClient(opts)

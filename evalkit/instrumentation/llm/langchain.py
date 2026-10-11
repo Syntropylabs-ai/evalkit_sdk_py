@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import json
 import logging
 import time
+from collections.abc import Mapping
 from threading import Lock
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from ..._version import SDK_VERSION
 from ...core.client import _new_span_id, _now_iso
+from ...core.content import message_content_text
 from ...core.context import _ambient_trace_id, _current_span, current_span_ctx, get_or_create_ambient_trace_id
 from ...core.types import SpanEvent, TraceEnvelope
 from ._bodies import _dump, _safe_body
@@ -56,14 +59,43 @@ def _model_from(serialized: Any, kwargs: Dict[str, Any]) -> str:
     return "unknown"
 
 
+def _langgraph_attrs(metadata: Any) -> Dict[str, Any]:
+    """Where in a LangGraph run a span sits, from the metadata LangGraph gives every run inside a node.
+
+    The triggers go out as a compact JSON array, the same string the TypeScript SDK writes for them.
+    """
+    out: Dict[str, Any] = {}
+    try:
+        if not isinstance(metadata, Mapping):
+            return out
+        node = metadata.get("langgraph_node")
+        if node:
+            out["langgraph.node"] = str(node)
+        step = metadata.get("langgraph_step")
+        if isinstance(step, int) and not isinstance(step, bool):
+            out["langgraph.step"] = step
+        triggers = metadata.get("langgraph_triggers")
+        if isinstance(triggers, str):
+            triggers = [triggers]
+        if isinstance(triggers, (list, tuple)) and triggers:
+            out["langgraph.triggers"] = json.dumps(
+                [str(t) for t in triggers], separators=(",", ":"), ensure_ascii=False
+            )
+        namespace = metadata.get("langgraph_checkpoint_ns")
+        if namespace:
+            out["langgraph.checkpoint_ns"] = str(namespace)
+    except Exception:
+        return {}
+    return out
+
+
 def _messages_to_prompt(messages: Any) -> str:
     parts: List[str] = []
     try:
         batch = messages[0] if messages else []
         for m in batch:
             role = getattr(m, "type", None) or getattr(m, "role", None) or m.__class__.__name__
-            content = getattr(m, "content", "")
-            parts.append(f"{role}: {content}")
+            parts.append(f"{role}: {message_content_text(getattr(m, 'content', ''))}")
     except Exception:
         return _truncate(messages)
     return _truncate("\n".join(parts))
@@ -242,6 +274,7 @@ def _build_handler(client: "EvalKitClient"):
             attrs = {"evalkit.framework": "langchain", "langchain.run_type": "chain"}
             if tags:
                 attrs["langchain.tags"] = list(tags)
+            attrs.update(_langgraph_attrs(metadata))
             self._start(run_id, parent_run_id, "function_call", str(name), attrs=attrs)
 
         def on_chain_end(self, outputs, *, run_id, **kwargs):
@@ -255,6 +288,7 @@ def _build_handler(client: "EvalKitClient"):
             provider = _provider_from_serialized(serialized)
             prompt = _truncate("\n".join(str(p) for p in (prompts or [])))
             attrs = {"evalkit.framework": "langchain", "gen_ai.request.model": model}
+            attrs.update(_langgraph_attrs(kwargs.get("metadata")))
             request_body = _safe_body({"prompts": _dump(prompts), "invocation_params": _dump(kwargs.get("invocation_params"))})
             if request_body:
                 attrs["gen_ai.request.body"] = request_body
@@ -266,6 +300,7 @@ def _build_handler(client: "EvalKitClient"):
             provider = _provider_from_serialized(serialized)
             prompt = _messages_to_prompt(messages)
             attrs = {"evalkit.framework": "langchain", "gen_ai.request.model": model}
+            attrs.update(_langgraph_attrs(kwargs.get("metadata")))
             request_body = _safe_body({"messages": _dump(messages), "invocation_params": _dump(kwargs.get("invocation_params"))})
             if request_body:
                 attrs["gen_ai.request.body"] = request_body
@@ -302,6 +337,7 @@ def _build_handler(client: "EvalKitClient"):
             }
             if tool_call_id:
                 attrs["gen_ai.tool.call.id"] = tool_call_id
+            attrs.update(_langgraph_attrs(kwargs.get("metadata")))
             self._start(run_id, parent_run_id, "tool_call", str(name), attrs=attrs)
 
         def on_tool_end(self, output, *, run_id, **kwargs):
@@ -322,8 +358,9 @@ def _build_handler(client: "EvalKitClient"):
             name = None
             if isinstance(serialized, dict):
                 name = serialized.get("name") or (serialized.get("id") or [None])[-1]
-            self._start(run_id, parent_run_id, "db_query", str(name or "retriever"),
-                        attrs={"evalkit.framework": "langchain", "retriever.query": _truncate(query)})
+            attrs = {"evalkit.framework": "langchain", "retriever.query": _truncate(query)}
+            attrs.update(_langgraph_attrs(kwargs.get("metadata")))
+            self._start(run_id, parent_run_id, "db_query", str(name or "retriever"), attrs=attrs)
 
         def on_retriever_end(self, documents, *, run_id, **kwargs):
             try:

@@ -512,7 +512,54 @@ print(result.pass_rate, result.average_score, result.overall_scores)
 2. `POST /evaluation-runs/{runId}/rows` appends the rows in batches of at most 200. `batch_size=` sets a smaller batch, a larger value is clamped to 200, and a value below 1 raises `ValueError`. Every row carries its absolute `rowIndex`, so the server recognizes a row it already has. When a batch fails with a network error or a 5xx response, the SDK sends the same payload again, up to 3 attempts in all, after 0.25 and 0.75 seconds. No row is counted twice. A 4xx response raises at once.
 3. `POST /evaluation-runs/{runId}/complete` judges every row, applies the gate to the whole run and compares the run with the baseline. However many batches were uploaded, the run has one job, one gate verdict and one comparison.
 
-Row fields are `input`, `output` (or a `task` that produces it), `expected`, `metadata` and `context`. `target` is still accepted in place of `expected`. `context` is sent inside `metadata.context`.
+Row fields are `input`, `output` (or a `task` that produces it), `expected`, `metadata` and `context`. `target` is still accepted in place of `expected`. `context` is sent inside `metadata.context`. Agent rows add `trace_id`, `session_id`, `messages`, `tools` and `system_prompt`, described next.
+
+### Agent rows
+
+Agent evaluators score the agent's turns and tool calls, not only its final answer. A row can give them those in one of three ways. On every kind of row, `input`, `output` and `expected` still feed the row-level metrics.
+
+- A trace or session: `trace_id` or `session_id` points at a trace or session already recorded in the same project and environment as your subscription key. The server rebuilds the agent's turns, its tool calls with their arguments and results, the tools it declared and its system prompt, and scores the agent metrics on that. A trace that has not arrived yet (ingest lag) skips the agent metrics on that row, with a reason that says so.
+- The conversation itself: `messages` in OpenAI chat format, with `tools` (OpenAI tool definitions) and `system_prompt` when you have them. Every agent metric can run on it, Parameter Validation included.
+- Text only: a row with neither skips the agent metrics with the reason "This row has only text. Pass trace_id, session_id or messages to evaluate the agent's turns and tool calls."
+
+Point at a session your agent already traced:
+
+```python
+rows = [{"input": "Where is order 42?", "output": "It shipped on Monday.", "session_id": "sess_8f2c"}]
+```
+
+Or pass the conversation, with its tool call and the tool's result:
+
+```python
+rows = [{
+    "input": "Where is order 42?",
+    "output": "Order 42 shipped on Monday.",
+    "system_prompt": "You are a support agent. Look an order up before you answer.",
+    "tools": [{
+        "type": "function",
+        "function": {
+            "name": "lookup_order",
+            "description": "Find an order by id",
+            "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}}, "required": ["order_id"]},
+        },
+    }],
+    "messages": [
+        {"role": "user", "content": "Where is order 42?"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "call_1", "type": "function",
+             "function": {"name": "lookup_order", "arguments": '{"order_id": "42"}'}},
+        ]},
+        {"role": "tool", "tool_call_id": "call_1", "content": '{"status": "shipped", "date": "Monday"}'},
+        {"role": "assistant", "content": "Order 42 shipped on Monday."},
+    ],
+}]
+
+evalkit.Eval("support-agent", data=rows, evaluators=["665f0c1234567890abcdef12"])
+```
+
+The fields travel as the top-level row keys `traceId`, `sessionId`, `messages`, `tools` and `systemPrompt`, never inside `metadata`, and an empty string or list is left out. The SDK checks only the shape: `trace_id` and `session_id` must be non-empty strings, `messages` and `tools` lists and `system_prompt` a string. Anything else raises `TypeError` or `ValueError`, naming the row, before the run opens. The fallback for older servers does not carry these fields.
+
+With SDK 0.3.2, put the same snake_case keys in `metadata` (`"metadata": {"session_id": "sess_8f2c"}`). The server reads them there too.
 
 ### Local scorers
 
@@ -985,6 +1032,7 @@ evalkit.init(
     capture_sensitive_headers=None,           # alias of capture_secrets
     capture_stream_bodies=None,               # None = env var, else True/False
     mask=None,                                # callable(envelope) -> envelope | None
+    export_gzip=None,                         # None = env var, else True/False
 )
 ```
 
@@ -992,7 +1040,7 @@ evalkit.init(
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `max_export_batch_size` | `512` | When this many spans are waiting, the queue is exported at once. |
+| `max_export_batch_size` | `512` | When this many spans are waiting, the queue is exported at once. No export request carries more spans than this. |
 | `scheduled_delay_ms` | `5000` | How often, in milliseconds, the background thread exports |
 | `max_queue_size` | `4096` | The most spans waiting for export. When the queue is full, the oldest span is dropped. |
 | `max_body_bytes` | 10 MiB | The largest HTTP body recorded per request or response |
@@ -1011,9 +1059,12 @@ evalkit.flush()
 
 The SDK sends spans to `{base_url}/v1/ingest` with your key in the `X-Subscription-Key` header. Each request times out after 10 seconds.
 
-- A 5xx response or a network error is retried up to 3 times, after 0.2, 0.6 and 1.8 seconds.
-- Any other 4xx response drops the batch with a warning.
-- A 401 or 403 is not retried. After 3 in a row, the SDK stops exporting for the rest of the process and logs a warning to check your subscription key. A successful export resets the count.
+- The queue goes out in requests of at most `max_export_batch_size` spans and 4 MiB of JSON. A span larger than 4 MiB goes in a request of its own.
+- Each request is gzip-compressed and sent with `Content-Encoding: gzip`. To send plain JSON, pass `export_gzip=False` or set `EVALKIT_EXPORT_GZIP=false`. A receiver without compressed ingest answers 415, or 400 because it reads the gzip bytes as JSON. The SDK then sends the same request uncompressed. Unless that is refused with 400 too, every later request goes uncompressed, and the SDK logs one warning.
+- A 413 splits the request in half, and each half is sent again, down to a single span. A span that is still refused is dropped with a warning that names it and gives its size.
+- A 5xx response or a network error is retried up to 3 times, after 0.2, 0.6 and 1.8 seconds. When the retries run out, the rest of the queue being exported is dropped rather than sent into the same failure.
+- Any other 4xx response drops that request's spans with a warning.
+- A 401 or 403 is not retried, and the rest of the queue being exported is dropped. After 3 in a row, the SDK stops exporting for the rest of the process and logs a warning to check your subscription key. A successful export resets the count.
 - A span larger than 8 MiB is trimmed in stages until it fits. First, request and response bodies longer than 1024 characters are replaced by a note. Next, a long prompt and completion are replaced the same way, and the status message is cut to 4096 characters. Then every string attribute is cut to 512 characters. As a last step, the attributes are replaced by a single `trace.truncated` marker, and the events, prompt and completion are removed. A span that still does not fit is dropped.
 
 ### Environment variables
@@ -1026,11 +1077,12 @@ The SDK sends spans to `{base_url}/v1/ingest` with your key in the `X-Subscripti
 | `EVALKIT_CAPTURE_SECRETS` | `1` turns off secret masking. |
 | `EVALKIT_CAPTURE_SENSITIVE_HEADERS` | An alias of `EVALKIT_CAPTURE_SECRETS`, read after it |
 | `EVALKIT_CAPTURE_STREAM_BODIES` | `false` stops teeing streamed HTTP bodies. |
+| `EVALKIT_EXPORT_GZIP` | `false` sends export requests uncompressed. See [How spans are exported](#how-spans-are-exported). |
 | `EVALKIT_FUNCTION_TRACE` | Exactly `false` turns off function tracing. |
 | `EVALKIT_COUNT_FOREIGN_LLM` | `1`, `true` or `yes` keeps the token counts of foreign LLM spans. |
 | `EVALKIT_QUIET` | `1`, `true`, `yes` or `on` stops the evaluation-run link from printing. |
 
-An argument to `init()` or to the function wins over its environment variable. The capture variables accept `1`, `true`, `yes` or `on`, and `0`, `false`, `no` or `off`. For any other value, EvalKit logs a warning and keeps the default.
+An argument to `init()` or to the function wins over its environment variable. The capture variables and `EVALKIT_EXPORT_GZIP` accept `1`, `true`, `yes` or `on`, and `0`, `false`, `no` or `off`. For any other value, EvalKit logs a warning and keeps the default.
 
 The `evalkit` command also reads `EVALKIT_API_KEY`, `EVALKIT_SUBSCRIPTION_KEY`, `EVALKIT_OTLP_ENDPOINT`, `EVALKIT_CONTENT_CAPTURE` and `EVALKIT_TENANT_ID`. The last four override the values that `evalkit coding install` stored.
 

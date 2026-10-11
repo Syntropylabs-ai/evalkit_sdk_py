@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 
 from ..._version import SDK_VERSION
 from ...core.client import _new_span_id, _now_iso
+from ...core.content import message_content_text
 from ...core.context import (
     _ambient_trace_id,
     _current_span, child_span_ctx, current_span_ctx,
@@ -24,7 +25,7 @@ def _messages_to_prompt(messages: Any) -> str:
     for m in messages or []:
         role = m.get("role", "") if isinstance(m, dict) else getattr(m, "role", "")
         content = m.get("content", "") if isinstance(m, dict) else getattr(m, "content", "")
-        parts.append(f"{role}: {content}")
+        parts.append(f"{role}: {message_content_text(content)}")
     return "\n".join(parts)
 
 

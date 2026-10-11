@@ -27,6 +27,7 @@ from .context import (
     get_or_create_ambient_trace_id,
 )
 from .exporter import _Exporter
+from .otel_provider import note_sdk_model_call
 from .types import EvalKitOptions, TraceEnvelope
 
 _log = logging.getLogger("evalkit")
@@ -236,6 +237,10 @@ class EvalKitClient:
 
     def enqueue(self, envelope: TraceEnvelope) -> None:
         try:
+            if envelope.span_type == "llm_call" and envelope.sdk_version:
+                # Recorded while the framework span around the call is still open, so the bridge can tell
+                # that span is a second record of this request when it exports it.
+                note_sdk_model_call(envelope.span_id, envelope.parent_span_id)
             self._apply_identity(envelope)
             self._apply_simulation(envelope)
             self._apply_prompt(envelope)
@@ -272,9 +277,22 @@ class EvalKitClient:
         with self._lock:
             if not self._queue:
                 return True
-            batch = self._queue[:]
+            pending = self._queue[:]
             self._queue.clear()
-        return self._exporter.export(batch)
+        size = max(1, int(self._opts.max_export_batch_size or 1))
+        ok = True
+        for start in range(0, len(pending), size):
+            if self._exporter.export(pending[start:start + size]):
+                continue
+            ok = False
+            # Behind a receiver that does not answer, or refuses the key, every later batch would meet
+            # the same failure, and a flush at exit would wait out the retries of each one.
+            if getattr(self._exporter, "halted", False):
+                left = len(pending) - start - size
+                if left > 0:
+                    _log.warning("export stopped; dropping the %d queued span(s) after the failed batch", left)
+                break
+        return ok
 
     def _flush_bridge(self) -> None:
         try:
@@ -449,11 +467,18 @@ class EvalKitClient:
         attributes: Optional[Dict[str, str]] = None,
         upstream_trace_id: Optional[str] = None,
         upstream_span_id: Optional[str] = None,
+        span_id: Optional[str] = None,
     ) -> Tuple[str, Callable[..., None], "SpanContext"]:
+        """Open the server span of one incoming request; `end` closes it.
+
+        `span_id` reuses the id of a request span the framework already opened, so what the framework
+        records under it stays in this trace. `end(route=...)` names the span by the framework's route
+        template (`GET /orders/{order_id}`), which a raw path with ids in it cannot be grouped by.
+        """
         import json
 
         trace_id = upstream_trace_id or _new_trace_id()
-        span_id = _new_span_id()
+        span_id = span_id or _new_span_id()
         _ambient_trace_id.set(trace_id)
         identity = current_identity()
         start_ms = time.time() * 1000
@@ -473,6 +498,7 @@ class EvalKitClient:
             status_code: Optional[int] = None,
             response_body: Any = None,
             response_headers: Optional[Dict[str, str]] = None,
+            route: Optional[str] = None,
         ) -> None:
             end_iso = _now_iso()
             latency = int(time.time() * 1000 - start_ms)
@@ -480,6 +506,8 @@ class EvalKitClient:
                 "http.method": method,
                 "http.url": url,
             }
+            if route:
+                attrs["http.route"] = route
             if headers:
                 attrs["http.request.headers"] = json.dumps(headers)
             if request_body is not None:
@@ -497,9 +525,10 @@ class EvalKitClient:
                 trace_id=trace_id,
                 span_id=span_id,
                 parent_span_id=upstream_span_id,
+                span_kind="SERVER",
                 span_type="http_call",
                 status=status,
-                operation=name,
+                operation=f"{method} {route}" if route else name,
                 service_name=self._opts.service_name,
                 attributes=attrs,
                 latency_ms=latency,

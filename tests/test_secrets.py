@@ -296,7 +296,12 @@ class SecretKeyTest(unittest.TestCase):
     def test_telemetry_vocabulary_is_not_mistaken_for_a_secret(self):
         for key in ("gen_ai.usage.input_tokens", "gen_ai.server.time_to_first_token_ms", "token_count",
                     "prompt_token_count", "x-amzn-bedrock-input-token-count", "token_usage",
-                    "input_token_details", "tokenizer"):
+                    "input_token_details", "tokenizer",
+                    "gen_ai.server.time_to_first_token", "gen_ai.server.time_per_output_token",
+                    "GEN_AI.SERVER.TIME_TO_FIRST_TOKEN", "time-to-first-token", "input_cost_per_token",
+                    "output_cost_per_token", "cost_per_token", "gen_ai.usage.output_tokens",
+                    "llm.usage.total_tokens", "llm.token_count.prompt", "gen_ai.request.max_tokens", "max_tokens",
+                    "max_completion_tokens", "maxTokens"):
             with self.subTest(key):
                 self.assertFalse(
                     is_secret_key(key),
@@ -307,6 +312,45 @@ class SecretKeyTest(unittest.TestCase):
             is_secret_key("access_token"),
             "'token' still has to be caught as the whole key or the last segment, which is where a credential "
             "actually sits",
+        )
+
+
+    def test_credentials_named_token_stay_masked(self):
+        for key in ("token", "access_token", "refresh_token", "id_token", "auth_token", "csrf_token",
+                    "session_token", "bearer_token", "api_token", "github_token", "oauth.token", "x-access-token",
+                    "X-Auth-Token", "first_token", "per_user_token"):
+            with self.subTest(key):
+                self.assertTrue(
+                    is_secret_key(key),
+                    "the time-to-first-token and per-token exemption is a vocabulary, not a loophole: any other "
+                    "key ending in token can still hold a credential",
+                )
+
+    def test_a_bridged_span_keeps_its_timing_and_usage_numbers(self):
+        envelope = TraceEnvelope(
+            trace_id="t", span_id="s", span_type="llm_call", created_at="2026-10-11T00:00:00Z",
+            attributes={
+                "gen_ai.server.time_to_first_token": 0.42,
+                "gen_ai.server.time_per_output_token": 0.012,
+                "gen_ai.request.max_tokens": 256,
+                "gen_ai.usage.input_tokens": 120,
+                "gen_ai.usage.output_tokens": 30,
+                "auth_token": "abc123",
+            },
+        )
+        attrs = scrub_secrets(envelope).attributes
+        self.assertEqual(
+            attrs,
+            {
+                "gen_ai.server.time_to_first_token": 0.42,
+                "gen_ai.server.time_per_output_token": 0.012,
+                "gen_ai.request.max_tokens": 256,
+                "gen_ai.usage.input_tokens": 120,
+                "gen_ai.usage.output_tokens": 30,
+                "auth_token": "***",
+            },
+            "OpenTelemetry instrumentations report time-to-first-token as gen_ai.server.time_to_first_token; "
+            "masking it to *** drops the span's TTFT from every latency view",
         )
 
 

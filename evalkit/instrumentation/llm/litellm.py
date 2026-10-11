@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from ..._version import SDK_VERSION
 from ...core.client import _exc_attrs, _new_span_id, _now_iso
+from ...core.content import message_content_text
 from ...core.context import (
     _ambient_trace_id,
     _current_span, child_span_ctx, current_span_ctx,
@@ -28,7 +29,7 @@ if TYPE_CHECKING:
 def _messages_to_prompt(messages: Any) -> str:
     try:
         return "\n".join(
-            f"{m.get('role', '')}: {m.get('content', '')}"
+            f"{m.get('role', '')}: {message_content_text(m.get('content'))}"
             for m in (messages or [])
             if isinstance(m, dict)
         )

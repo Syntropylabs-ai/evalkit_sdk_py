@@ -19,6 +19,17 @@ SECRET_KEY_RE = re.compile(
 
 SECRET_TOKEN_KEY_RE = re.compile(r"(?:^|[._-])token$", re.IGNORECASE)
 
+# Keys that end in "token" because they measure or price tokens rather than hold
+# one: OpenTelemetry's gen_ai.server.time_to_first_token and
+# gen_ai.server.time_per_output_token on bridged spans, and per-token prices such
+# as input_cost_per_token. Masking them blanks out time-to-first-token and cost
+# and protects nothing, since no credential is named "to first token" or
+# "per ... token".
+TELEMETRY_TOKEN_KEY_RE = re.compile(
+    r"(?:^|[._-])(?:to[._-]first|per(?:[._-](?:input|output|prompt|completion|generated))?)[._-]token$",
+    re.IGNORECASE,
+)
+
 SECRET_QUERY_KEY_RE = re.compile(r"(?:^|[._-])(key|sig|signature)$", re.IGNORECASE)
 
 SECRET_PATTERNS = (
@@ -42,7 +53,9 @@ _MAX_DEPTH = 12
 
 
 def is_secret_key(key: str, header_like: bool = False) -> bool:
-    if SECRET_KEY_RE.search(key) or SECRET_TOKEN_KEY_RE.search(key):
+    if SECRET_KEY_RE.search(key):
+        return True
+    if SECRET_TOKEN_KEY_RE.search(key) and not TELEMETRY_TOKEN_KEY_RE.search(key):
         return True
     return bool(header_like and SENSITIVE_RE.match(key))
 

@@ -8,7 +8,7 @@ from ..._version import SDK_VERSION
 from ...core.client import EvalKitClient, _new_span_id, _now_iso
 from ...core.context import _current_span, current_span_ctx, _in_http_span, get_or_create_ambient_trace_id
 from ...core.types import TraceEnvelope
-from ...utils.headers import make_traceparent, path_from_url, sanitize_headers
+from ...utils.headers import client_span_name, make_traceparent, sanitize_headers
 from ._stream_body import attach_aiohttp, new_capture
 
 _BODY_MAX = 10 * 1024 * 1024
@@ -92,7 +92,7 @@ def patch_aiohttp(client: EvalKitClient) -> None:
             client.enqueue(TraceEnvelope(
                 trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                 span_type="http_call", status="ERROR", status_message=str(e),
-                operation=f"{method.upper()} {path_from_url(url)}",
+                span_kind="CLIENT", operation=client_span_name(method),
                 service_name=client._opts.service_name,
                 attributes=attrs, latency_ms=latency, start_time=ts, end_time=end_ts,
                 created_at=ts, environment=client._opts.environment,
@@ -137,7 +137,7 @@ def patch_aiohttp(client: EvalKitClient) -> None:
                 client.enqueue(TraceEnvelope(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                     span_type="http_call", status=status, status_message=message,
-                    operation=f"{method.upper()} {path_from_url(url)}",
+                    span_kind="CLIENT", operation=client_span_name(method),
                     service_name=client._opts.service_name,
                     attributes=stream_attrs,
                     latency_ms=int(time.time() * 1000 - start_ms),
@@ -155,7 +155,7 @@ def patch_aiohttp(client: EvalKitClient) -> None:
         client.enqueue(TraceEnvelope(
             trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
             span_type="http_call", status="ERROR" if status_code >= 400 else "OK",
-            operation=f"{method.upper()} {path_from_url(url)}",
+            span_kind="CLIENT", operation=client_span_name(method),
             service_name=client._opts.service_name,
             attributes=attrs, latency_ms=latency, start_time=ts, end_time=end_ts,
             created_at=ts, environment=client._opts.environment,

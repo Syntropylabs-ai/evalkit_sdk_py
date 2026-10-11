@@ -99,6 +99,67 @@ class TestLangChain(unittest.TestCase):
         self.assertEqual(llm.tokens_out, 6)
         self.assertEqual(tool.attributes.get("tool.name"), "search")
 
+    def test_langgraph_metadata_places_every_span_in_the_graph_run(self):
+        handler = evalkit.patch_langchain()
+        agent = {
+            "langgraph_step": 3,
+            "langgraph_node": "agent",
+            "langgraph_triggers": ("branch:to:agent",),
+            "langgraph_path": ("__pregel_pull", "agent"),
+            "langgraph_checkpoint_ns": "agent:6f0e2b7c",
+            "checkpoint_ns": "agent:6f0e2b7c",
+        }
+        tools = {**agent, "langgraph_step": 4, "langgraph_node": "tools",
+                 "langgraph_triggers": ["branch:to:tools", "agent"], "langgraph_checkpoint_ns": "tools:91aa"}
+
+        handler.on_chain_start({"name": "LangGraph"}, {}, run_id="G", parent_run_id=None)
+        handler.on_chain_start({"name": "agent"}, {}, run_id="A", parent_run_id="G",
+                               tags=["graph:step:3"], metadata=agent)
+        handler.on_chat_model_start({"id": ["langchain", "chat_models", "openai", "ChatOpenAI"]},
+                                    [[self._make_human_msg("hi")]], run_id="B", parent_run_id="A",
+                                    tags=["seq:step:1"], metadata=agent)
+        handler.on_llm_end(self._make_llm_output("calling search"), run_id="B")
+        handler.on_llm_start({"id": ["langchain", "llms", "openai", "OpenAI"]}, ["hi"],
+                             run_id="L", parent_run_id="A", metadata=agent)
+        handler.on_llm_end(self._make_llm_output("done"), run_id="L")
+        handler.on_chain_end({}, run_id="A")
+        handler.on_tool_start({"name": "search"}, "query", run_id="C", parent_run_id="G", metadata=tools)
+        handler.on_tool_end("result", run_id="C")
+        handler.on_chain_end({}, run_id="G")
+        self.client.flush()
+
+        spans = {e.operation: e.attributes for e in self.captured}
+        self.assertFalse(
+            [k for k in spans["LangGraph"] if k.startswith("langgraph.")],
+            "the graph's own run sits outside every node and carries no node metadata",
+        )
+        for operation in ("agent", "chat.generate", "llm.generate"):
+            attrs = spans[operation]
+            self.assertEqual(attrs.get("langgraph.node"), "agent", operation)
+            self.assertEqual(attrs.get("langgraph.step"), 3, operation)
+            self.assertIs(type(attrs.get("langgraph.step")), int, operation)
+            self.assertEqual(attrs.get("langgraph.triggers"), '["branch:to:agent"]', operation)
+            self.assertEqual(attrs.get("langgraph.checkpoint_ns"), "agent:6f0e2b7c", operation)
+        tool = spans["search"]
+        self.assertEqual(tool.get("langgraph.node"), "tools")
+        self.assertEqual(tool.get("langgraph.step"), 4)
+        self.assertEqual(tool.get("langgraph.triggers"), '["branch:to:tools","agent"]',
+                         "the same compact JSON array the TypeScript SDK writes")
+        self.assertEqual(tool.get("langgraph.checkpoint_ns"), "tools:91aa")
+        self.assertEqual(spans["agent"].get("langchain.tags"), ["graph:step:3"], "tags keep their own attribute")
+        self.assertNotIn("langgraph.path", spans["agent"])
+
+    def test_metadata_without_langgraph_keys_adds_nothing(self):
+        handler = evalkit.patch_langchain()
+        handler.on_chain_start({"name": "chain"}, {}, run_id="A", parent_run_id=None,
+                               metadata={"user": "u1", "langgraph_step": True, "langgraph_triggers": []})
+        handler.on_chain_end({}, run_id="A")
+        handler.on_tool_start({"name": "t"}, "x", run_id="T", parent_run_id=None, metadata="not a mapping")
+        handler.on_tool_end("y", run_id="T")
+        self.client.flush()
+        for envelope in self.captured:
+            self.assertFalse([k for k in envelope.attributes if k.startswith("langgraph.")], envelope.operation)
+
     def test_handler_actually_gets_attached_to_new_callback_managers(self):
         handler = evalkit.patch_langchain()
         self.assertIsNotNone(handler)

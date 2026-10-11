@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import time
 from typing import Any, Dict, Optional
@@ -8,7 +9,7 @@ from ..._version import SDK_VERSION
 from ...core.client import EvalKitClient, _new_span_id, _now_iso
 from ...core.context import SpanContext, _current_span, current_span_ctx, _in_http_span, get_or_create_ambient_trace_id
 from ...core.types import TraceEnvelope
-from ...utils.headers import make_traceparent, path_from_url, sanitize_headers
+from ...utils.headers import client_span_name, make_traceparent, sanitize_headers
 from ._stream_body import attach_requests, new_capture
 
 _SKIP = {"/v1/ingest", "/health", "/healthz"}
@@ -18,6 +19,24 @@ _STREAM_BODIES = True
 
 def _should_skip(url: str) -> bool:
     return any(pat in url for pat in _SKIP)
+
+
+def _otel_http_suppressed() -> Any:
+    """Keep OpenTelemetry's urllib3 instrumentation out of a call this wrapper records itself.
+
+    requests sends through urllib3, so with that instrumentation installed the same call would be
+    recorded twice, and its traceparent would replace the one set here with an id that never
+    exports. urllib3 used directly (botocore, boto3) is still traced: the suppression lasts only
+    for this call.
+    """
+    try:
+        from opentelemetry.instrumentation.utils import suppress_http_instrumentation
+    except Exception:
+        return contextlib.nullcontext()
+    try:
+        return suppress_http_instrumentation()
+    except Exception:
+        return contextlib.nullcontext()
 
 
 def patch_requests(client: EvalKitClient) -> None:
@@ -73,7 +92,8 @@ def patch_requests(client: EvalKitClient) -> None:
 
         _http_token = _in_http_span.set(True)
         try:
-            resp = original(self, method, url, **kwargs)
+            with _otel_http_suppressed():
+                resp = original(self, method, url, **kwargs)
         except Exception as e:
             _in_http_span.reset(_http_token)
             end_ts = _now_iso()
@@ -91,7 +111,7 @@ def patch_requests(client: EvalKitClient) -> None:
             client.enqueue(TraceEnvelope(
                 trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                 span_type="http_call", status="ERROR", status_message=str(e),
-                operation=f"{method.upper()} {path_from_url(url)}",
+                span_kind="CLIENT", operation=client_span_name(method),
                 service_name=client._opts.service_name,
                 attributes=attrs, latency_ms=latency, start_time=ts, end_time=end_ts,
                 created_at=ts, environment=client._opts.environment,
@@ -134,7 +154,7 @@ def patch_requests(client: EvalKitClient) -> None:
                 client.enqueue(TraceEnvelope(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                     span_type="http_call", status=status, status_message=message,
-                    operation=f"{method.upper()} {path_from_url(url)}",
+                    span_kind="CLIENT", operation=client_span_name(method),
                     service_name=client._opts.service_name,
                     attributes=stream_attrs,
                     latency_ms=int(time.time() * 1000 - start_ms),
@@ -160,7 +180,7 @@ def patch_requests(client: EvalKitClient) -> None:
         client.enqueue(TraceEnvelope(
             trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
             span_type="http_call", status="ERROR" if status_code >= 400 else "OK",
-            operation=f"{method.upper()} {path_from_url(url)}",
+            span_kind="CLIENT", operation=client_span_name(method),
             service_name=client._opts.service_name,
             attributes=attrs, latency_ms=latency, start_time=ts, end_time=end_ts,
             created_at=ts, environment=client._opts.environment,

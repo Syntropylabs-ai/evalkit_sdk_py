@@ -47,6 +47,26 @@ class EvalRow(TypedDict, total=False):
     expected: str
     context: Union[str, List[str]]
     metadata: Dict[str, Any]
+    # A trace or session already recorded in the key's project and environment.
+    trace_id: str
+    session_id: str
+    # The conversation itself, in OpenAI chat format, with the tools it could call.
+    messages: List[Dict[str, Any]]
+    tools: List[Dict[str, Any]]
+    system_prompt: str
+
+
+# Row fields that let the server score the agent's turns and tool calls, with the
+# top-level key each one travels under.
+_AGENT_FIELDS = (
+    ("trace_id", "traceId"),
+    ("session_id", "sessionId"),
+    ("messages", "messages"),
+    ("tools", "tools"),
+    ("system_prompt", "systemPrompt"),
+)
+_AGENT_IDS = ("trace_id", "session_id")
+_AGENT_LISTS = ("messages", "tools")
 
 
 class EvalResult:
@@ -197,6 +217,26 @@ def _collection_ids(collections: Sequence[str]) -> List[str]:
     return ids
 
 
+def _agent_fields(index: int, row: Mapping[str, Any]) -> Dict[str, Any]:
+    # Only the shape is checked here: the server reads the messages and tools and
+    # reports a row it cannot use, so a deep check would only duplicate it.
+    fields: Dict[str, Any] = {}
+    for key, wire in _AGENT_FIELDS:
+        value = row.get(key)
+        if value is None:
+            continue
+        if key in _AGENT_LISTS:
+            if not isinstance(value, (list, tuple)):
+                raise TypeError(f"data[{index}]['{key}'] must be a list, got {type(value).__name__}")
+        elif not isinstance(value, str):
+            raise TypeError(f"data[{index}]['{key}'] must be a string, got {type(value).__name__}")
+        elif key in _AGENT_IDS and not value.strip():
+            raise ValueError(f"data[{index}]['{key}'] is empty; pass an id or leave the field out")
+        if value:
+            fields[wire] = list(value) if key in _AGENT_LISTS else value
+    return fields
+
+
 def _build_rows(
     data: Iterable[Mapping[str, Any]],
     task: Optional[Callable[[Mapping[str, Any]], str]],
@@ -206,6 +246,7 @@ def _build_rows(
     for index, row in enumerate(data):
         if row.get("input") is None:
             raise ValueError(f"data[{index}] has no 'input'")
+        _agent_fields(index, row)
         if task is not None:
             output = task(row)
         else:
@@ -356,6 +397,7 @@ class _RunRows:
             expected = row.get("expected") if row.get("expected") is not None else row.get("target")
             if expected is not None:
                 item["expected"] = expected
+            item.update(_agent_fields(index, row))
             metadata = _row_metadata(row)
             if metadata:
                 item["metadata"] = metadata

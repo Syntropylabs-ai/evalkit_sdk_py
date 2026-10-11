@@ -44,6 +44,21 @@ def _sanitize_response_headers(response: Any) -> dict:
     return out
 
 
+def django_route(request: Any) -> "str | None":
+    """The resolved URL pattern (`/orders/<int:order_id>/`), or None when nothing resolved (a 404).
+
+    Django's `ResolverMatch.route` joins the patterns of every included urlconf, without the
+    leading slash the request path has.
+    """
+    try:
+        route = getattr(getattr(request, "resolver_match", None), "route", None)
+    except Exception:
+        return None
+    if not isinstance(route, str) or not route:
+        return None
+    return route if route.startswith("/") else "/" + route
+
+
 class EvalKitDjangoMiddleware:
     def __init__(self, get_response: Callable) -> None:
         self.get_response = get_response
@@ -122,7 +137,8 @@ class EvalKitDjangoMiddleware:
                 pass
             try:
                 end("ERROR" if sc >= 400 else "OK", status_code=sc,
-                    response_body=resp_body, response_headers=resp_headers)
+                    response_body=resp_body, response_headers=resp_headers,
+                    route=django_route(request))
             except Exception:
                 pass
             try:
@@ -133,7 +149,7 @@ class EvalKitDjangoMiddleware:
             return response
         except Exception:
             try:
-                end("ERROR", status_code=500)
+                end("ERROR", status_code=500, route=django_route(request))
             except Exception:
                 pass
             raise

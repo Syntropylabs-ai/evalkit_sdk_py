@@ -14,6 +14,7 @@ from ._streaming import (
 from ._toolcalls import from_anthropic_blocks, from_openai_chat, from_openai_responses
 from .llm.anthropic import _extract_thinking
 from ..core.client import _exc_attrs
+from ..core.content import message_content_text
 
 if TYPE_CHECKING:
     from ..core.client import EvalKitClient
@@ -103,7 +104,7 @@ def _patch_openai_class_sync(ek: "EvalKitClient", cls, provider: str = "openai")
         ts = _now_iso()
         model = kwargs.get("model", "unknown")
         messages = kwargs.get("messages", [])
-        prompt = "\n".join(f"{m.get('role','')}: {m.get('content','')}" for m in messages)
+        prompt = "\n".join(f"{m.get('role','')}: {message_content_text(m.get('content'))}" for m in messages)
 
         if kwargs.get("stream"):
             state = _StreamState(start_ms)
@@ -228,7 +229,7 @@ def _patch_openai_class_async(ek: "EvalKitClient", cls, provider: str = "openai"
         ts = _now_iso()
         model = kwargs.get("model", "unknown")
         messages = kwargs.get("messages", [])
-        prompt = "\n".join(f"{m.get('role','')}: {m.get('content','')}" for m in messages)
+        prompt = "\n".join(f"{m.get('role','')}: {message_content_text(m.get('content'))}" for m in messages)
 
         if kwargs.get("stream"):
             state = _StreamState(start_ms)
@@ -388,7 +389,7 @@ def _patch_anthropic_class_sync(ek: "EvalKitClient", cls) -> None:
         system = kwargs.get("system")
         messages = kwargs.get("messages", [])
         parts = ([f"system: {_system_text(system)}"] if system else []) + [
-            f"{m.get('role','')}: {m.get('content','')}" for m in messages
+            f"{m.get('role','')}: {message_content_text(m.get('content'))}" for m in messages
         ]
         prompt = "\n".join(parts)
 
@@ -520,7 +521,7 @@ def _patch_anthropic_class_async(ek: "EvalKitClient", cls) -> None:
         system = kwargs.get("system")
         messages = kwargs.get("messages", [])
         parts = ([f"system: {_system_text(system)}"] if system else []) + [
-            f"{m.get('role','')}: {m.get('content','')}" for m in messages
+            f"{m.get('role','')}: {message_content_text(m.get('content'))}" for m in messages
         ]
         prompt = "\n".join(parts)
 

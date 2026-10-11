@@ -24,7 +24,9 @@ class TraceEnvelope:
     span_id: str
     created_at: str
 
-    span_type: Literal["llm_call", "tool_call", "log", "http_call", "function_call", "db_query", "eval_result"] = "log"
+    span_type: Literal[
+        "llm_call", "tool_call", "log", "http_call", "function_call", "db_query", "eval_result", "agent", "internal"
+    ] = "log"
     parent_span_id: Optional[str] = None
     span_kind: Optional[Literal["CLIENT", "SERVER", "INTERNAL", "PRODUCER", "CONSUMER"]] = None
     status: Optional[Literal["OK", "ERROR", "UNSET"]] = None
@@ -147,6 +149,7 @@ class EvalKitOptions:
     capture_secrets: bool = False
     capture_stream_bodies: bool = True
     mask: Optional[Callable[["TraceEnvelope"], Optional["TraceEnvelope"]]] = None
+    export_gzip: bool = True
 
     @property
     def capture_sensitive_headers(self) -> bool:

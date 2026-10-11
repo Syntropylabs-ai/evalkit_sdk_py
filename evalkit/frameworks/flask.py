@@ -9,6 +9,15 @@ from ..utils.headers import parse_traceparent, sanitize_headers
 _BODY_MAX = 10 * 1024 * 1024
 
 
+def flask_route(request: Any) -> "str | None":
+    """The matched URL rule (`/orders/<int:order_id>`), or None when no rule matched (a 404)."""
+    try:
+        rule = getattr(getattr(request, "url_rule", None), "rule", None)
+    except Exception:
+        return None
+    return rule if isinstance(rule, str) and rule else None
+
+
 def instrument_flask(app: Any, client: EvalKitClient) -> None:
     global _BODY_MAX
     _BODY_MAX = client._opts.max_body_bytes
@@ -70,6 +79,7 @@ def instrument_flask(app: Any, client: EvalKitClient) -> None:
                     status_code=response.status_code,
                     response_body=resp_body,
                     response_headers=resp_headers,
+                    route=flask_route(flask_request),
                 )
                 g._ek_ended = True
             if trace_id:
@@ -86,7 +96,7 @@ def instrument_flask(app: Any, client: EvalKitClient) -> None:
             end = getattr(g, "_ek_end", None)
             if end and not getattr(g, "_ek_ended", False):
                 try:
-                    end("ERROR", status_code=500)
+                    end("ERROR", status_code=500, route=flask_route(flask_request))
                 except Exception:
                     pass
                 g._ek_ended = True

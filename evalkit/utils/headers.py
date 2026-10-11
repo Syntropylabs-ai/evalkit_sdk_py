@@ -49,6 +49,13 @@ def parse_traceparent(header: str) -> tuple[str | None, str | None]:
     return None, None
 
 
+def client_span_name(method: str) -> str:
+    """An outbound HTTP span's name: the method alone, as OpenTelemetry names a client span whose URL
+    template is unknown. The URL, ids and all, stays in `http.url`; a name carrying the path would
+    make every order id or charge id a separate operation."""
+    return (method or "GET").upper()
+
+
 def path_from_url(url: str) -> str:
     try:
         from urllib.parse import urlparse
