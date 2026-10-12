@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.3.4 — 2026-10-12
+
+### Added
+- `simulate_user()` plays a live simulated user. After a scenario's scripted turns, or when it has
+  none, the platform plays the user from the scenario's persona, `user_goal`, `hidden_info` and
+  tool fixtures, reading the conversation so far, and the user stops once its goal is met or
+  `max_turns` user turns were played (at most 50). New parameters: `user_model` (the model
+  configuration the user runs on, by name or id; falls back to `model`) and `live_user` (on by
+  default for a scenario with a `user_goal` or `conversation_plan` and no `turns`; turns-only
+  scenarios replay as before). Tool calls an `AgentTurnResult` reports, with `result` or
+  `error`, reach the user as what the agent was told. Each user turn is its own span marked
+  `evalkit.simulation.role: user`, never judged as the agent. Live results carry `transcript`,
+  `ended_by` and `simulated_user_usage`. Needs the platform's `POST /simulations/user-turn`
+  (paid plans with simulations).
+- `generate_scenarios()` writes scenarios for the live user by default (persona, `user_goal`,
+  `hidden_info`, `success_criteria`, the opening message, no later turns). Pass
+  `scripted_turns=True` for every turn written out.
+
+### Changed
+- A 429 from the receiver is retried like a 5xx instead of dropping the spans. On a 429 or 503,
+  `Retry-After` (seconds or an HTTP-date) sets the wait, capped at 10 s; without it the backoff
+  steps (0.2 s, 0.6 s, 1.8 s) are jittered so clients refused together do not retry together.
+  One export spends at most 20 s waiting across all its requests, which also bounds the flush at
+  exit. A 429 that outlasts the retries stops the rest of that export, as a 5xx does. Every other
+  4xx is still final.
+- The `evalkit` CLI retries the same answers while the caller has time: a coding-agent hook
+  within its 5 s limit, `evalkit coding backfill` for up to 20 s per post. `evalkit coding doctor`
+  still tries each request once and reports what it got.
+
 ## 0.3.3 — 2026-10-11
 
 ### Added

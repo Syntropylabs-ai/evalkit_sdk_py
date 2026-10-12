@@ -75,6 +75,9 @@ def build_records(vendor: str, event: str, payload: Dict[str, Any], capture_cont
 
 
 def run_hook(vendor: str, event: str) -> int:
+    # Retries stop a second short of the hard timeout, so the last answer is read before the hook returns.
+    deadline = time.monotonic() + _HARD_TIMEOUT - 1
+
     def work() -> None:
         try:
             store = ConfigStore()
@@ -88,7 +91,7 @@ def run_hook(vendor: str, event: str) -> int:
             timeout = min(4.0, _HARD_TIMEOUT - 1)
             for signal, body in build_records(vendor, event, payload, cfg.capture == "full"):
                 sender = send_traces if signal == TRACES else send_logs
-                sender(cfg.endpoint, cfg.key, body, timeout=timeout)
+                sender(cfg.endpoint, cfg.key, body, timeout=timeout, deadline=deadline)
         except Exception:
             return
 

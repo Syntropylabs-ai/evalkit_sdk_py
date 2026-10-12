@@ -13,7 +13,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tupl
 from . import codex_rollout as rollout
 from .config import ConfigStore, SharedConfig
 from .files import write_atomic
-from .otlp import MAX_CONTENT, attr, json_text, log_envelope, log_item, send_logs
+from .otlp import MAX_CONTENT, RETRY_BUDGET, attr, json_text, log_envelope, log_item, send_logs
 from .spans import attributes
 
 VENDOR = "codex"
@@ -105,9 +105,16 @@ def build(items: Iterable[rollout.Item], thread_id: str, capture_full: bool) -> 
     return out
 
 
-def post(cfg: SharedConfig, records: Sequence[Dict[str, Any]], timeout: float = POST_TIMEOUT) -> bool:
+def post(
+    cfg: SharedConfig, records: Sequence[Dict[str, Any]], timeout: float = POST_TIMEOUT, retry: bool = False
+) -> bool:
+    # A hook leaves the offsets where they were when a post fails, so its records go out with the next hook;
+    # only a backfill, which nothing follows, waits out an overloaded receiver.
+    deadline = time.monotonic() + RETRY_BUDGET if retry else None
     for batch in _batches(records):
-        status, _ = send_logs(cfg.endpoint, cfg.key, log_envelope(VENDOR, batch, service=SERVICE), timeout=timeout)
+        status, _ = send_logs(
+            cfg.endpoint, cfg.key, log_envelope(VENDOR, batch, service=SERVICE), timeout=timeout, deadline=deadline
+        )
         if status is None or status >= 300:
             return False
     return True
@@ -131,7 +138,7 @@ def emit(cfg: SharedConfig, chunk: rollout.Chunk, thread_id: str, dry_run: bool 
     built = build(chunk.items, thread_id, cfg.capture == FULL)
     posted = True
     if built.records and not dry_run:
-        posted = post(cfg, built.records)
+        posted = post(cfg, built.records, retry=True)
     return Emission(built.messages, built.reasoning, chunk.read, chunk.offset, posted)
 
 

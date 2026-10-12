@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import email.utils
 import gzip
 import json
 import logging
+import random
 import threading
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
+from datetime import timezone
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 from .redact import _resolve_flag
 from .types import EvalKitOptions, TraceEnvelope
@@ -36,8 +39,52 @@ _BODY_SUFFIX = b"]}"
 _SENT = "sent"
 # The receiver refused this request's spans; the next request may still be accepted.
 _REFUSED = "refused"
-# No answer, only 5xx ones, or a refused key: every later request would meet the same failure.
+# No answer, only 5xx or 429 ones, or a refused key: every later request would meet the same failure.
 _HALT = "halt"
+
+# How long one export may spend waiting between attempts, every request in it included. The flush at
+# exit waits for the export in flight, and behind the OpenTelemetry bridge the BatchSpanProcessor gives
+# an export 30 s (OTEL_BSP_EXPORT_TIMEOUT).
+_RETRY_BUDGET_S = 20.0
+# The longest single wait, whatever Retry-After asks for, so one request cannot use up the budget.
+_MAX_RETRY_WAIT_S = 10.0
+_BACKOFF_S = (0.2, 0.6, 1.8)
+
+_clock: Callable[[], float] = time.monotonic
+_jitter: Callable[[], float] = random.random
+
+
+def _retryable(status: int) -> bool:
+    """429 and 5xx say the receiver could not take the request now; every other 4xx is about the request."""
+    return status == 429 or status >= 500
+
+
+def _retry_after_s(header: Optional[str], now: float) -> Optional[float]:
+    """Retry-After as delta-seconds or an HTTP-date, measured from the wall-clock `now`; None when unreadable."""
+    value = (header or "").strip()
+    if not value:
+        return None
+    if value.isascii() and value.isdigit():
+        return float(value)
+    if not any(c.isalpha() for c in value):
+        return None
+    try:
+        at = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)
+    return max(0.0, at.timestamp() - now)
+
+
+def _retry_delay_s(attempt: int, retry_after: Optional[str], now: float) -> float:
+    """What the receiver asked for, capped, or else the backoff step spread between half and one and a
+    half times its value, so clients refused together do not return together."""
+    asked = _retry_after_s(retry_after, now)
+    if asked is not None:
+        return min(asked, _MAX_RETRY_WAIT_S)
+    step = _BACKOFF_S[min(attempt, len(_BACKOFF_S) - 1)]
+    return step / 2 + _jitter() * step
 
 
 def resolve_export_gzip(explicit: Optional[bool]) -> bool:
@@ -181,11 +228,12 @@ class _Exporter:
                 spans.append(_Span(data, e.operation or e.span_type))
         if not spans:
             return True
+        deadline = _clock() + _RETRY_BUDGET_S
         ok = True
         for group in _group(spans, self._max_request_bytes, self._max_request_spans):
             if self._disabled:
                 return False
-            outcome = self._send(group)
+            outcome = self._send(group, deadline)
             if outcome == _SENT:
                 continue
             ok = False
@@ -194,14 +242,14 @@ class _Exporter:
                 break
         return ok
 
-    def _send(self, spans: List[_Span]) -> str:
-        status, text = self._deliver(_body(spans))
+    def _send(self, spans: List[_Span], deadline: float) -> str:
+        status, text = self._deliver(_body(spans), deadline)
         if 200 <= status < 300:
             self._auth_failures = 0
             if self._debug:
                 _log.debug("exported %d span(s) — %s", len(spans), _status_field(text))
             return _SENT
-        if status == 0 or status >= 500:
+        if status == 0 or _retryable(status):
             return _HALT
         if status in (401, 403):
             # One refusal per export, however many requests it takes: a receiver briefly unable to check
@@ -211,10 +259,10 @@ class _Exporter:
         if status == 413:
             if len(spans) > 1:
                 half = len(spans) // 2
-                first = self._send(spans[:half])
+                first = self._send(spans[:half], deadline)
                 if first == _HALT:
                     return first
-                second = self._send(spans[half:])
+                second = self._send(spans[half:], deadline)
                 return first if second == _SENT else second
             _log.warning(
                 "dropping span %r (%d bytes): the receiver rejected it as too large (HTTP 413)",
@@ -224,16 +272,16 @@ class _Exporter:
         _log.warning("export rejected %d: %s", status, text)
         return _REFUSED
 
-    def _deliver(self, body: bytes) -> Tuple[int, str]:
+    def _deliver(self, body: bytes, deadline: float) -> Tuple[int, str]:
         if not self._gzip:
-            return self._post(body, compressed=False)
-        status, text = self._post(gzip.compress(body, _GZIP_LEVEL), compressed=True)
+            return self._post(body, compressed=False, deadline=deadline)
+        status, text = self._post(gzip.compress(body, _GZIP_LEVEL), compressed=True, deadline=deadline)
         if status not in (400, 415):
             return status, text
         # A receiver that predates compressed ingest answers 415, or 400 when it parses the gzip bytes
         # as JSON. The same body sent uncompressed tells that 400 from one about the spans themselves,
         # which the receiver refuses again.
-        plain_status, plain_text = self._post(body, compressed=False)
+        plain_status, plain_text = self._post(body, compressed=False, deadline=deadline)
         if status == 415 or plain_status != 400:
             self._stop_compressing(status)
         return plain_status, plain_text
@@ -261,12 +309,12 @@ class _Exporter:
         elif self._debug:
             _log.debug("export rejected %d (auth failure %d/%d)", code, self._auth_failures, _AUTH_FAIL_LIMIT)
 
-    def _post(self, payload: bytes, *, compressed: bool, max_retries: int = 3) -> Tuple[int, str]:
-        """POST one body, retrying network errors and 5xx answers.
+    def _post(self, payload: bytes, *, compressed: bool, deadline: float, max_retries: int = 3) -> Tuple[int, str]:
+        """POST one body, retrying no answer, 429 and 5xx while the export's budget lasts.
 
-        Returns the status and the response text. The status is 0 when no response arrived.
+        A Retry-After on 429 or 503 sets the wait. Returns the status and the response text; the status is 0
+        when no response arrived.
         """
-        delays = [0.2, 0.6, 1.8]
         headers = {
             "Content-Type": "application/json",
             "X-Subscription-Key": self._key,
@@ -276,25 +324,36 @@ class _Exporter:
         req = urllib.request.Request(self._url, data=payload, headers=headers, method="POST")
         last_err: Optional[Exception] = None
         status = 0
+        retries = 0
         for attempt in range(max_retries + 1):
+            retry_after: Optional[str] = None
             try:
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     return resp.status, _text(resp) if self._debug else ""
             except urllib.error.HTTPError as e:
-                if e.code < 500:
+                if not _retryable(e.code):
                     return e.code, _text(e)
                 last_err = e
                 status = e.code
-                if attempt < max_retries:
-                    if self._debug:
-                        _log.debug("HTTP %d, retry %d/%d", e.code, attempt + 1, max_retries)
-                    time.sleep(delays[attempt] if attempt < len(delays) else 1.8)
+                if e.code in (429, 503) and e.headers is not None:
+                    retry_after = e.headers.get("Retry-After")
+                # An unread error body holds its connection for as long as the wait lasts.
+                try:
+                    e.close()
+                except Exception:
+                    pass
             except Exception as e:
                 last_err = e
                 status = 0
-                if attempt < max_retries:
-                    if self._debug:
-                        _log.debug("network error, retry %d/%d: %s", attempt + 1, max_retries, e)
-                    time.sleep(delays[attempt] if attempt < len(delays) else 1.8)
-        _log.warning("export failed after %d retries: %s", max_retries, last_err)
+            if attempt == max_retries:
+                break
+            wait = _retry_delay_s(attempt, retry_after, time.time())
+            if _clock() + wait > deadline:
+                break
+            if self._debug:
+                _log.debug("%s, retry %d/%d in %.1fs", f"HTTP {status}" if status else "network error",
+                           attempt + 1, max_retries, wait)
+            time.sleep(wait)
+            retries += 1
+        _log.warning("export failed after %d retries: %s", retries, last_err)
         return status, ""

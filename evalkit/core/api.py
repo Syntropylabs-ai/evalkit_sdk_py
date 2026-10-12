@@ -18,11 +18,12 @@ def post_json(
     timeout: float,
     span_name: str,
     redact: Iterable[str] = (),
+    trace: bool = True,
 ) -> Dict[str, Any]:
     payload = json.dumps(body, default=str)
     hidden = set(redact)
     logged = json.dumps({k: v for k, v in body.items() if k not in hidden}, default=str) if hidden else payload
-    return _request(client, "POST", url, payload.encode(), logged, timeout=timeout, span_name=span_name)
+    return _request(client, "POST", url, payload.encode(), logged, timeout=timeout, span_name=span_name, trace=trace)
 
 
 def get_json(client: Any, url: str, *, timeout: float, span_name: str) -> Dict[str, Any]:
@@ -38,6 +39,7 @@ def _request(
     *,
     timeout: float,
     span_name: str,
+    trace: bool = True,
 ) -> Dict[str, Any]:
     headers = {"X-Subscription-Key": client._opts.subscription_key}
     if data is not None:
@@ -51,10 +53,12 @@ def _request(
     }
     if logged_body is not None:
         attrs["http.request.body"] = logged_body[:_BODY_CAP]
-    try:
-        end_span, ctx = client.start_span(span_name, attrs)
-    except Exception:
-        end_span, ctx = None, None
+    end_span, ctx = None, None
+    if trace:
+        try:
+            end_span, ctx = client.start_span(span_name, attrs)
+        except Exception:
+            end_span, ctx = None, None
 
     try:
         token = _current_span.set(ctx) if ctx is not None else None

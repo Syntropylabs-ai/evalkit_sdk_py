@@ -36,13 +36,22 @@ def generate_scenarios(
     max_completion_tokens: Optional[int] = None,
     max_tokens: Optional[int] = None,
     api_url: Optional[str] = None,
+    scripted_turns: bool = False,
 ) -> List[Dict[str, Any]]:
+    """Writes scenarios for the agent. By default each carries what a live
+    simulated user plays from (persona, user_goal, hidden_info, success_criteria
+    and the opening message) and no later turns; scripted_turns=True writes
+    every user turn out instead, for replaying a conversation verbatim."""
     from .. import _get_instance
 
     client = _get_instance()
     base = (api_url or os.getenv("EVALKIT_API_URL") or client._opts.api_url).rstrip("/")
 
-    body: Dict[str, Any] = {"agentInstructions": agent_instructions, "count": count}
+    body: Dict[str, Any] = {
+        "agentInstructions": agent_instructions,
+        "count": count,
+        "scriptedTurns": bool(scripted_turns),
+    }
     if tools is not None:
         body["tools"] = [_jsonable_tool(t) for t in tools]
     if function_schemas is not None:

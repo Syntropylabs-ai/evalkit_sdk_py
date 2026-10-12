@@ -702,11 +702,13 @@ evalkit.Eval("support-golden", data=rows, evaluators=[RULE_ID], hyperparameters=
 
 ## Scenario simulation
 
-Simulation tests your agent against synthetic users in three steps. You generate scenarios from your agent's prompt and tools, replay each one against your real agent, and grade the run with LLM-as-judge evaluators.
+Simulation tests your agent against simulated users in three steps. You generate scenarios from your agent's prompt and tools, play each one against your real agent in your own process, and grade the run with LLM-as-judge evaluators. The server routes need a plan with simulations.
+
+> The live simulated user (`user_model`, `live_user`, the `transcript`, `ended_by` and `simulated_user_usage` results) and the scenario briefs that `generate_scenarios()` writes by default are in the next release after 0.3.3 (see `CHANGELOG.md`, Unreleased). With 0.3.3, `simulate_user()` replays scripted turns only and `generate_scenarios()` writes every turn out.
 
 ### Generate scenarios
 
-`generate_scenarios()` has the server write test scenarios. You bring your own provider key for the generation call:
+`generate_scenarios()` has the server write test scenarios. Pass `provider`, `api_key` and `model` to generate with your own provider key; without them the server uses its default model:
 
 ```python
 scenarios = evalkit.generate_scenarios(
@@ -719,28 +721,68 @@ scenarios = evalkit.generate_scenarios(
 )
 ```
 
-It returns a list of scenario dicts, and `count` defaults to 5. It also accepts `function_schemas`, `context`, `rag`, `categories`, `temperature`, `reasoning_effort`, `max_completion_tokens`, `max_tokens` and `api_url`.
+It returns a list of scenario dicts, and `count` defaults to 5. It also accepts `function_schemas`, `context`, `rag`, `categories`, `temperature`, `reasoning_effort`, `max_completion_tokens`, `max_tokens`, `api_url` and `scripted_turns`.
 
-### Replay them against your agent
+By default each scenario is a brief for the live simulated user: its `persona`, `user_goal` (what the user wants and what would satisfy them), `hidden_info` (facts the user knows but shares only once the agent asks about them, as `{"key": {"value", "reveal_trigger"}}`), `success_criteria` (what a correct agent does) and its opening message in `starting_prompt`, with no later turns. `scripted_turns=True` writes every user turn out in `turns` instead, for replaying a conversation verbatim. Either way a scenario also carries `expected_tools`, `constraints`, `target_keywords` and `tool_fixtures`.
 
-`simulate_user()` replays each scenario against an entrypoint that calls your agent:
+### Play them against your agent
+
+`simulate_user()` plays each scenario against an entrypoint that runs one turn of your agent:
 
 ```python
 def entrypoint(ctx: evalkit.SimContext) -> evalkit.AgentTurnResult:
-    # ctx.message:    the synthetic user's message for this turn
+    # ctx.message:    the simulated user's message for this turn
     # ctx.session_id: stable per scenario; use it to keep multi-turn context
-    reply, tools_used = run_my_agent(ctx.session_id, ctx.message)
-    return evalkit.AgentTurnResult(text=reply, tool_calls=[{"name": t} for t in tools_used])
+    reply, calls = run_my_agent(ctx.session_id, ctx.message)
+    # calls: [{"name": "lookup_order", "arguments": {...}, "result": {...}}], "error" for a failed call
+    return evalkit.AgentTurnResult(text=reply, tool_calls=calls)
 
-report = evalkit.simulate_user(entrypoint, scenarios, tags=["ci"])
-print(report["simulation_id"], report["run_id"])
+report = evalkit.simulate_user(
+    entrypoint,
+    scenarios,
+    agent="support-bot",        # the agent under test, named on every span of the run
+    user_model="sim-user",      # a model configuration of your organization, by name or id
+    max_turns=10,
+    tags=["ci"],
+)
+for result in report["results"]:
+    print(result["name"], result["status"], result.get("ended_by"), result.get("simulated_user_usage"))
 ```
-
-The user side is scripted. Each turn's message comes from the scenario's `turns` or `messages`, or from its `starting_prompt` when it has neither. A scenario plays at most `max_turns` turns, 12 by default.
 
 The entrypoint receives a `SimContext` with `message`, `session_id`, `state` and `turn`. It returns a string or an `AgentTurnResult` with `text`, `tool_calls` and `retrieved_context`. It can also be a coroutine function.
 
-Each scenario gets its own root span, named `scenario:<name>`, and its own session. The whole run shares one trace. `agent=` names the agent under test on every span of the run. Each scenario is also scored locally with `evaluate()`, against its `expected_tools`, `constraints` and `target_keywords`, and `metrics=` limits which metrics run. `simulate_user()` returns a dict with `simulation_id`, `run_id` and `results`.
+Each user turn comes, in order, from the scenario's scripted turns (`turns`, else `messages`, else `starting_prompt`), then from a `turn_events` entry scheduled for that turn (`{"at_user_turn": n, "message": ...}`), then, for a live scenario, from the simulated user. A scenario plays at most `max_turns` user turns, 12 by default.
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `max_turns` | `12` | The most user turns one scenario plays. The live user plays at most 50, whatever this says. |
+| `user_model` | `model` | The model configuration the simulated user runs on, by its name or id in your organization. A live scenario without one fails with the platform's "No model is configured for the simulated user". |
+| `live_user` | `None` | `None` plays the live user for a scenario that has a `user_goal` or `conversation_plan` and no `turns`, so a turns-only scenario replays as written. `True` plays it after the scripted turns of any scenario; `False` never. |
+| `agent` | none | Names the agent under test on every span of the run, so the run's traces list under that agent. |
+| `metrics` | all | Which deterministic metrics score each scenario locally. |
+| `tags` | none | Labels for the run. |
+| `safe_mode` | `True` | Copied into `ctx.state["__safe_mode__"]`, for your agent to guard side effects. |
+| `api_url` | `EVALKIT_API_URL`, then the client's | Where the user-turn requests go. |
+
+#### The live simulated user
+
+Each live turn is one `POST /simulations/user-turn` with the scenario's brief (persona, `user_goal` or else `conversation_plan`, `hidden_info`, `tool_fixtures`, `min_user_turns`), the conversation so far and the turn number. The platform plays the user on your model configuration and answers with the next message, or that the user is done because its goal was met or it gave up. The values in the tool fixtures' inputs, such as an order id, are details the user can hand over when the agent asks. The tool calls an `AgentTurnResult` reports go with the agent's reply: each with `name`, `arguments` and `result` or `error`, each field cut to 2,000 characters. They let the user tell whether what the agent says actually happened, such as a refund its tool refused, without ever quoting them.
+
+Each user turn is recorded as its own `simulated_user` span under the scenario's root, with `evalkit.simulation.role: user`, the turn number, whether the user was done, the tokens and the cost. It names no agent, and evaluations never read it as the agent's turn, tool call or output.
+
+A live scenario's result carries three more keys:
+
+- `transcript`: the conversation, as `{"role", "content"}` messages.
+- `ended_by`: `user` (the user was done), `max_turns`, or `error`.
+- `simulated_user_usage`: `calls`, `input_tokens`, `output_tokens` and `cost_usd`, which is `None` when the model has no price.
+
+When the platform cannot play a turn (no model, a refused key, an answer it cannot read, a limit), the scenario ends with status `ERROR` and the platform's reason in `error`.
+
+Limits: at most 50 user turns per scenario; 120 user-turn requests a minute per environment; 5,000 simulated user turns per organization per UTC day, after which the platform answers `429` until midnight UTC. The simulated user runs on your own model configuration, so its calls are billed to your provider account, and the platform records their tokens and cost per environment; the Cost page shows that spend as Simulated user.
+
+#### Traces and scores
+
+Each scenario gets its own root span, named `scenario:<name>`, and its own session, `<simulation_id>:<run_id>:<scenario_id>`. The whole run shares one trace. Each scenario is also scored locally with `evaluate()`, against its `expected_tools`, `constraints` and `target_keywords`. `simulate_user()` returns a dict with `simulation_id`, `run_id` and `results`, one per scenario with `scenario_id`, `name`, `status`, `turns`, `scores` and, on failure, `error`.
 
 ### Grade the run
 
@@ -1071,7 +1113,7 @@ The SDK sends spans to `{base_url}/v1/ingest` with your key in the `X-Subscripti
 
 | Variable | Effect |
 | --- | --- |
-| `EVALKIT_API_URL` | Sets the control-plane base for `Eval()`, feedback, prompts, `generate_scenarios()` and `evaluate_simulation()`. It does not change where traces go. |
+| `EVALKIT_API_URL` | Sets the control-plane base for `Eval()`, feedback, prompts, `generate_scenarios()`, the live simulated user of `simulate_user()` and `evaluate_simulation()`. It does not change where traces go. |
 | `EVALKIT_CAPTURE_CONTENT` | `false` drops payloads. See [Content capture and masking](#content-capture-and-masking). |
 | `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` | The same, read after `EVALKIT_CAPTURE_CONTENT` |
 | `EVALKIT_CAPTURE_SECRETS` | `1` turns off secret masking. |

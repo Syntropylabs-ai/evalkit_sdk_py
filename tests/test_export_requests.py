@@ -1,18 +1,28 @@
+import email.utils
 import gzip
 import json
 import os
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
 from evalkit.core.client import EvalKitClient
-from evalkit.core.exporter import MAX_REQUEST_BYTES, _Exporter, resolve_export_gzip
+from evalkit.core.exporter import (
+    _MAX_RETRY_WAIT_S,
+    _RETRY_BUDGET_S,
+    MAX_REQUEST_BYTES,
+    _Exporter,
+    _retry_after_s,
+    resolve_export_gzip,
+)
 from evalkit.core.types import EvalKitOptions, TraceEnvelope
 
 
 class _Receiver:
-    """A stand-in for /v1/ingest that records every request and answers with `respond(request)`."""
+    """A stand-in for /v1/ingest that records every request and answers with `respond(request)`: a status,
+    or (status, Retry-After)."""
 
     def __init__(self, respond=None):
         self.requests = []
@@ -30,7 +40,8 @@ class _Receiver:
                     request["json_bytes"] = len(body)
                 except Exception:
                     pass
-                status = receiver.respond(request)
+                answer = receiver.respond(request)
+                status, retry_after = answer if isinstance(answer, tuple) else (answer, None)
                 request["status"] = status
                 receiver.requests.append(request)
                 if status < 300:
@@ -40,6 +51,8 @@ class _Receiver:
                 data = json.dumps(payload).encode()
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
+                if retry_after is not None:
+                    self.send_header("Retry-After", retry_after)
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
@@ -216,11 +229,95 @@ class TestRetries(_ReceiverTest):
     def test_a_receiver_that_stays_down_halts_the_export_after_one_round_of_retries(self):
         self.receiver.respond = lambda r: 503
         exporter = _exporter(self.receiver.url, max_export_batch_size=2)
-        with mock.patch("evalkit.core.exporter.time.sleep") as sleep, self.assertLogs("evalkit", level="WARNING"):
+        with mock.patch("evalkit.core.exporter.time.sleep") as sleep, \
+                mock.patch("evalkit.core.exporter._jitter", lambda: 0.5), \
+                self.assertLogs("evalkit", level="WARNING"):
             self.assertFalse(exporter.export([_envelope(i) for i in range(6)]))
         self.assertEqual(len(self.receiver.requests), 4, "a 5xx is retried 3 times, and the other requests are not sent")
         self.assertEqual([c.args[0] for c in sleep.call_args_list], [0.2, 0.6, 1.8])
         self.assertTrue(exporter.halted)
+
+    def test_the_backoff_is_spread_around_each_step(self):
+        self.receiver.respond = lambda r: 503
+        with mock.patch("evalkit.core.exporter.time.sleep") as sleep, self.assertLogs("evalkit", level="WARNING"):
+            self.assertFalse(_exporter(self.receiver.url).export([_envelope(0)]))
+        waits = [c.args[0] for c in sleep.call_args_list]
+        for wait, step in zip(waits, (0.2, 0.6, 1.8)):
+            self.assertTrue(step / 2 <= wait <= step * 1.5, waits)
+
+    def test_a_429_is_retried_like_a_5xx(self):
+        answers = iter([429, 202])
+        self.receiver.respond = lambda r: next(answers)
+        with mock.patch("evalkit.core.exporter.time.sleep"):
+            self.assertTrue(_exporter(self.receiver.url).export([_envelope(0)]))
+        self.assertEqual([r["status"] for r in self.receiver.requests], [429, 202])
+
+    def test_a_429_that_never_clears_halts_the_export(self):
+        self.receiver.respond = lambda r: 429
+        exporter = _exporter(self.receiver.url, max_export_batch_size=2)
+        with mock.patch("evalkit.core.exporter.time.sleep"), self.assertLogs("evalkit", level="WARNING"):
+            self.assertFalse(exporter.export([_envelope(i) for i in range(4)]))
+        self.assertEqual(len(self.receiver.requests), 4, "the batch after it is not sent into an overloaded receiver")
+        self.assertTrue(exporter.halted)
+
+    def test_retry_after_sets_the_wait(self):
+        for status, retry_after, expected in ((503, "4", 4.0), (429, "0", 0.0), (429, "3600", _MAX_RETRY_WAIT_S)):
+            with self.subTest(status=status, retry_after=retry_after):
+                answers = iter([(status, retry_after), 202])
+                self.receiver.respond = lambda r: next(answers)
+                with mock.patch("evalkit.core.exporter.time.sleep") as sleep:
+                    self.assertTrue(_exporter(self.receiver.url).export([_envelope(0)]))
+                self.assertEqual([c.args[0] for c in sleep.call_args_list], [expected])
+
+    def test_an_http_date_retry_after_is_honored(self):
+        answers = iter([(429, email.utils.formatdate(time.time() + 7, usegmt=True)), 202])
+        self.receiver.respond = lambda r: next(answers)
+        with mock.patch("evalkit.core.exporter.time.sleep") as sleep:
+            self.assertTrue(_exporter(self.receiver.url).export([_envelope(0)]))
+        [wait] = [c.args[0] for c in sleep.call_args_list]
+        self.assertTrue(5.5 <= wait <= 7.0, wait)
+
+    def _fake_clock(self):
+        now = [1000.0]
+
+        def sleep(seconds):
+            now[0] += seconds
+
+        return (
+            mock.patch("evalkit.core.exporter._clock", lambda: now[0]),
+            mock.patch("evalkit.core.exporter.time.sleep", side_effect=sleep),
+        )
+
+    def test_no_wait_is_taken_past_the_budget(self):
+        self.receiver.respond = lambda r: (429, "3600")
+        clock, sleep_patch = self._fake_clock()
+        with clock, sleep_patch as sleep, self.assertLogs("evalkit", level="WARNING"):
+            self.assertFalse(_exporter(self.receiver.url).export([_envelope(0)]))
+        waits = [c.args[0] for c in sleep.call_args_list]
+        self.assertEqual(waits, [_MAX_RETRY_WAIT_S, _MAX_RETRY_WAIT_S])
+        self.assertLessEqual(sum(waits), _RETRY_BUDGET_S)
+        self.assertEqual(len(self.receiver.requests), 3, "the retry that would end past the budget is not sent")
+
+    def test_the_budget_covers_every_request_of_the_export(self):
+        answers = iter([(429, "8"), (429, "8"), 202, (429, "8"), 202])
+        self.receiver.respond = lambda r: next(answers)
+        clock, sleep_patch = self._fake_clock()
+        exporter = _exporter(self.receiver.url, max_export_batch_size=1)
+        with clock, sleep_patch as sleep, self.assertLogs("evalkit", level="WARNING"):
+            self.assertFalse(exporter.export([_envelope(0), _envelope(1)]))
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [8.0, 8.0])
+        self.assertEqual([r["events"][0]["spanId"] for r in self.receiver.requests], [f"{0:016x}"] * 3 + [f"{1:016x}"])
+        self.assertTrue(exporter.halted)
+
+    def test_other_4xx_answers_are_not_retried(self):
+        for status in (400, 404, 422):
+            with self.subTest(status=status):
+                self.receiver.requests.clear()
+                self.receiver.respond = lambda r, status=status: (status, "1")
+                with mock.patch("evalkit.core.exporter.time.sleep") as sleep, self.assertLogs("evalkit", level="WARNING"):
+                    self.assertFalse(_exporter(self.receiver.url, export_gzip=False).export([_envelope(0)]))
+                self.assertEqual(len(self.receiver.requests), 1)
+                sleep.assert_not_called()
 
     def test_a_5xx_then_success_delivers_the_spans(self):
         answers = iter([503, 202])
@@ -239,6 +336,21 @@ class TestRetries(_ReceiverTest):
             exporter.export([_envelope(3)])
             exporter.export([_envelope(4)])
         self.assertTrue(exporter._disabled, "three refused exports in a row still turn tracing off")
+
+
+class TestRetryAfter(unittest.TestCase):
+    NOW = 1767225600.0  # 2026-01-01T00:00:00Z
+
+    def test_delta_seconds_and_http_dates_are_read(self):
+        self.assertEqual(_retry_after_s("5", self.NOW), 5.0)
+        self.assertEqual(_retry_after_s(" 7 ", self.NOW), 7.0)
+        self.assertEqual(_retry_after_s("Thu, 01 Jan 2026 00:00:07 GMT", self.NOW), 7.0)
+        self.assertEqual(_retry_after_s("Wed, 31 Dec 2025 23:59:00 GMT", self.NOW), 0.0, "a past date means now")
+
+    def test_an_unreadable_value_is_ignored(self):
+        for value in (None, "", "soon", "1.5", "-3", "\u00b2"):
+            with self.subTest(value=value):
+                self.assertIsNone(_retry_after_s(value, self.NOW))
 
 
 class TestDrain(_ReceiverTest):
