@@ -4,13 +4,15 @@ import sys
 from typing import TYPE_CHECKING
 
 from ._streaming import (
-    _AsyncStreamTracer,
     _StreamState,
-    _SyncStreamTracer,
+    record_stream_open_failure,
     stream_response_attrs,
     stream_tool_events,
+    trace_async_stream,
+    trace_sync_stream,
     with_stream_usage_warning,
 )
+from ._safe import field, hook_failed
 from ._toolcalls import from_anthropic_blocks, from_openai_chat, from_openai_responses
 from .llm.anthropic import _extract_thinking
 from ..core.client import _exc_attrs
@@ -66,6 +68,21 @@ def _system_text(system) -> str:
     return "\n".join(t for t in texts if isinstance(t, str))
 
 
+def _chat_prompt(messages, system=None) -> str:
+    """A chat request's messages as "role: text" lines.
+
+    A message may be a dict or the provider's own object sent back from an earlier reply. Only a
+    list or tuple is read: the clients also accept any iterable, and reading a generator here
+    would leave nothing for the request itself.
+    """
+    parts = [f"system: {_system_text(system)}"] if system else []
+    if isinstance(messages, (list, tuple)):
+        parts.extend(
+            f"{field(m, 'role', '') or ''}: {message_content_text(field(m, 'content'))}" for m in messages
+        )
+    return "\n".join(parts)
+
+
 def _try_patch_openai(ek: "EvalKitClient") -> None:
     try:
         import openai.resources.chat.completions.completions as _oc
@@ -96,15 +113,19 @@ def _patch_openai_class_sync(ek: "EvalKitClient", cls, provider: str = "openai")
     original = cls.create
 
     def traced(self, *args, **kwargs):
-        ctx_parent = current_span_ctx()
-        trace_id = ctx_parent.trace_id if ctx_parent else get_or_create_ambient_trace_id()
-        span_id = _new_span_id()
-        parent_span_id = ctx_parent.span_id if ctx_parent else None
-        start_ms = time.time() * 1000
-        ts = _now_iso()
-        model = kwargs.get("model", "unknown")
-        messages = kwargs.get("messages", [])
-        prompt = "\n".join(f"{m.get('role','')}: {message_content_text(m.get('content'))}" for m in messages)
+        try:
+            ctx_parent = current_span_ctx()
+            trace_id = ctx_parent.trace_id if ctx_parent else get_or_create_ambient_trace_id()
+            span_id = _new_span_id()
+            parent_span_id = ctx_parent.span_id if ctx_parent else None
+            start_ms = time.time() * 1000
+            ts = _now_iso()
+            model = kwargs.get("model", "unknown")
+            prompt = _chat_prompt(kwargs.get("messages"))
+            span_ctx = child_span_ctx(trace_id, span_id)
+        except Exception as exc:
+            hook_failed("chat.completions.create", exc)
+            return original(self, *args, **kwargs)
 
         if kwargs.get("stream"):
             state = _StreamState(start_ms)
@@ -142,36 +163,40 @@ def _patch_openai_class_sync(ek: "EvalKitClient", cls, provider: str = "openai")
                     sdk_version=SDK_VERSION,
                 ))
             wrapped_done = with_stream_usage_warning(on_stream_done, kwargs, provider == "openai")
-            return _SyncStreamTracer(
-                original(self, *args, **kwargs), wrapped_done, start_ms=start_ms, state=state,
-            )
+            try:
+                raw = original(self, *args, **kwargs)
+            except Exception as exc:
+                record_stream_open_failure(on_stream_done, state, exc)
+                raise
+            return trace_sync_stream(raw, wrapped_done, start_ms=start_ms, state=state)
 
-        span_ctx = child_span_ctx(trace_id, span_id)
         token = _current_span.set(span_ctx)
         try:
             result = original(self, *args, **kwargs)
         except Exception as exc:
-            end_ts = _now_iso()
-            ek.enqueue(TraceEnvelope(
-                trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                span_type="llm_call", status="ERROR", status_message=str(exc),
-                operation="chat.completions.create",
-                service_name=ek._opts.service_name, provider=provider, model=model,
-                prompt=prompt, latency_ms=int(time.time() * 1000 - start_ms),
-                start_time=ts, end_time=_now_iso(), created_at=ts,
-                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs), **_exc_attrs(exc)},
-                environment=ek._opts.environment, app_version=ek._opts.app_version,
-                sdk_version=SDK_VERSION,
-            ))
+            try:
+                end_ts = _now_iso()
+                ek.enqueue(TraceEnvelope(
+                    trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
+                    span_type="llm_call", status="ERROR", status_message=str(exc),
+                    operation="chat.completions.create",
+                    service_name=ek._opts.service_name, provider=provider, model=model,
+                    prompt=prompt, latency_ms=int(time.time() * 1000 - start_ms),
+                    start_time=ts, end_time=_now_iso(), created_at=ts,
+                    attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs), **_exc_attrs(exc)},
+                    environment=ek._opts.environment, app_version=ek._opts.app_version,
+                    sdk_version=SDK_VERSION,
+                ))
+            except Exception as hook_exc:
+                hook_failed("model call", hook_exc)
             raise
         finally:
             _current_span.reset(token)
-        end_ts = _now_iso()
-        latency = int(time.time() * 1000 - start_ms)
-
-        if not hasattr(result, "choices"):
-            return result
         try:
+            end_ts = _now_iso()
+            latency = int(time.time() * 1000 - start_ms)
+            if not hasattr(result, "choices"):
+                return result
             choice = result.choices[0] if result.choices else None
             completion = (choice.message.content or "") if choice else ""
             usage = getattr(result, "usage", None)
@@ -201,8 +226,8 @@ def _patch_openai_class_sync(ek: "EvalKitClient", cls, provider: str = "openai")
                 environment=ek._opts.environment, app_version=ek._opts.app_version,
                 sdk_version=SDK_VERSION,
             ))
-        except Exception:
-            pass
+        except Exception as exc:
+            hook_failed("chat.completions.create", exc)
         return result
 
     traced._evalkit = True
@@ -221,15 +246,19 @@ def _patch_openai_class_async(ek: "EvalKitClient", cls, provider: str = "openai"
     original = cls.create
 
     async def traced_async(self, *args, **kwargs):
-        ctx_parent = current_span_ctx()
-        trace_id = ctx_parent.trace_id if ctx_parent else get_or_create_ambient_trace_id()
-        span_id = _new_span_id()
-        parent_span_id = ctx_parent.span_id if ctx_parent else None
-        start_ms = time.time() * 1000
-        ts = _now_iso()
-        model = kwargs.get("model", "unknown")
-        messages = kwargs.get("messages", [])
-        prompt = "\n".join(f"{m.get('role','')}: {message_content_text(m.get('content'))}" for m in messages)
+        try:
+            ctx_parent = current_span_ctx()
+            trace_id = ctx_parent.trace_id if ctx_parent else get_or_create_ambient_trace_id()
+            span_id = _new_span_id()
+            parent_span_id = ctx_parent.span_id if ctx_parent else None
+            start_ms = time.time() * 1000
+            ts = _now_iso()
+            model = kwargs.get("model", "unknown")
+            prompt = _chat_prompt(kwargs.get("messages"))
+            span_ctx = child_span_ctx(trace_id, span_id)
+        except Exception as exc:
+            hook_failed("chat.completions.create", exc)
+            return await original(self, *args, **kwargs)
 
         if kwargs.get("stream"):
             state = _StreamState(start_ms)
@@ -267,34 +296,40 @@ def _patch_openai_class_async(ek: "EvalKitClient", cls, provider: str = "openai"
                     sdk_version=SDK_VERSION,
                 ))
             wrapped_done = with_stream_usage_warning(on_stream_done, kwargs, provider == "openai")
-            raw = await original(self, *args, **kwargs)
-            return _AsyncStreamTracer(raw, wrapped_done, start_ms=start_ms, state=state)
+            try:
+                raw = await original(self, *args, **kwargs)
+            except Exception as exc:
+                record_stream_open_failure(on_stream_done, state, exc)
+                raise
+            return trace_async_stream(raw, wrapped_done, start_ms=start_ms, state=state)
 
-        span_ctx = child_span_ctx(trace_id, span_id)
         token = _current_span.set(span_ctx)
         try:
             result = await original(self, *args, **kwargs)
         except Exception as exc:
-            end_ts = _now_iso()
-            ek.enqueue(TraceEnvelope(
-                trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                span_type="llm_call", status="ERROR", status_message=str(exc),
-                operation="chat.completions.create",
-                service_name=ek._opts.service_name, provider=provider, model=model,
-                prompt=prompt, latency_ms=int(time.time() * 1000 - start_ms),
-                start_time=ts, end_time=end_ts, created_at=ts,
-                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs), **_exc_attrs(exc)},
-                environment=ek._opts.environment, app_version=ek._opts.app_version,
-                sdk_version=SDK_VERSION,
-            ))
+            try:
+                end_ts = _now_iso()
+                ek.enqueue(TraceEnvelope(
+                    trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
+                    span_type="llm_call", status="ERROR", status_message=str(exc),
+                    operation="chat.completions.create",
+                    service_name=ek._opts.service_name, provider=provider, model=model,
+                    prompt=prompt, latency_ms=int(time.time() * 1000 - start_ms),
+                    start_time=ts, end_time=end_ts, created_at=ts,
+                    attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs), **_exc_attrs(exc)},
+                    environment=ek._opts.environment, app_version=ek._opts.app_version,
+                    sdk_version=SDK_VERSION,
+                ))
+            except Exception as hook_exc:
+                hook_failed("model call", hook_exc)
             raise
         finally:
             _current_span.reset(token)
-        end_ts = _now_iso()
-        latency = int(time.time() * 1000 - start_ms)
-        if not hasattr(result, "choices"):
-            return result
         try:
+            end_ts = _now_iso()
+            latency = int(time.time() * 1000 - start_ms)
+            if not hasattr(result, "choices"):
+                return result
             choice = result.choices[0] if result.choices else None
             completion = (choice.message.content or "") if choice else ""
             usage = getattr(result, "usage", None)
@@ -324,8 +359,8 @@ def _patch_openai_class_async(ek: "EvalKitClient", cls, provider: str = "openai"
                 environment=ek._opts.environment, app_version=ek._opts.app_version,
                 sdk_version=SDK_VERSION,
             ))
-        except Exception:
-            pass
+        except Exception as exc:
+            hook_failed("chat.completions.create", exc)
         return result
 
     traced_async._evalkit = True
@@ -379,19 +414,19 @@ def _patch_anthropic_class_sync(ek: "EvalKitClient", cls) -> None:
     original = cls.create
 
     def traced(self, *args, **kwargs):
-        ctx_parent = current_span_ctx()
-        trace_id = ctx_parent.trace_id if ctx_parent else get_or_create_ambient_trace_id()
-        span_id = _new_span_id()
-        parent_span_id = ctx_parent.span_id if ctx_parent else None
-        start_ms = time.time() * 1000
-        ts = _now_iso()
-        model = kwargs.get("model", "unknown")
-        system = kwargs.get("system")
-        messages = kwargs.get("messages", [])
-        parts = ([f"system: {_system_text(system)}"] if system else []) + [
-            f"{m.get('role','')}: {message_content_text(m.get('content'))}" for m in messages
-        ]
-        prompt = "\n".join(parts)
+        try:
+            ctx_parent = current_span_ctx()
+            trace_id = ctx_parent.trace_id if ctx_parent else get_or_create_ambient_trace_id()
+            span_id = _new_span_id()
+            parent_span_id = ctx_parent.span_id if ctx_parent else None
+            start_ms = time.time() * 1000
+            ts = _now_iso()
+            model = kwargs.get("model", "unknown")
+            prompt = _chat_prompt(kwargs.get("messages"), kwargs.get("system"))
+            span_ctx = child_span_ctx(trace_id, span_id)
+        except Exception as exc:
+            hook_failed("messages.create", exc)
+            return original(self, *args, **kwargs)
 
         if kwargs.get("stream"):
             state = _StreamState(start_ms)
@@ -428,71 +463,80 @@ def _patch_anthropic_class_sync(ek: "EvalKitClient", cls) -> None:
                     environment=ek._opts.environment, app_version=ek._opts.app_version,
                     sdk_version=SDK_VERSION,
                 ))
-            return _SyncStreamTracer(
-                original(self, *args, **kwargs), on_stream_done,
-                is_anthropic=True, start_ms=start_ms, state=state,
+            try:
+                raw = original(self, *args, **kwargs)
+            except Exception as exc:
+                record_stream_open_failure(on_stream_done, state, exc)
+                raise
+            return trace_sync_stream(
+                raw, on_stream_done, is_anthropic=True, start_ms=start_ms, state=state,
             )
 
-        span_ctx = child_span_ctx(trace_id, span_id)
         token = _current_span.set(span_ctx)
         try:
             result = original(self, *args, **kwargs)
         except Exception as exc:
-            end_ts = _now_iso()
-            ek.enqueue(TraceEnvelope(
-                trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                span_type="llm_call", status="ERROR", status_message=str(exc),
-                operation="messages.create",
-                service_name=ek._opts.service_name, provider="anthropic", model=model,
-                prompt=prompt, latency_ms=int(time.time() * 1000 - start_ms),
-                start_time=ts, end_time=end_ts, created_at=ts,
-                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs), **_exc_attrs(exc)},
-                environment=ek._opts.environment, app_version=ek._opts.app_version,
-                sdk_version=SDK_VERSION,
-            ))
+            try:
+                end_ts = _now_iso()
+                ek.enqueue(TraceEnvelope(
+                    trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
+                    span_type="llm_call", status="ERROR", status_message=str(exc),
+                    operation="messages.create",
+                    service_name=ek._opts.service_name, provider="anthropic", model=model,
+                    prompt=prompt, latency_ms=int(time.time() * 1000 - start_ms),
+                    start_time=ts, end_time=end_ts, created_at=ts,
+                    attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs), **_exc_attrs(exc)},
+                    environment=ek._opts.environment, app_version=ek._opts.app_version,
+                    sdk_version=SDK_VERSION,
+                ))
+            except Exception as hook_exc:
+                hook_failed("model call", hook_exc)
             raise
         finally:
             _current_span.reset(token)
-        end_ts = _now_iso()
-        latency = int(time.time() * 1000 - start_ms)
-        content = getattr(result, "content", [])
-        completion = next((b.text for b in content if hasattr(b, "text")), "")
-        thinking_text, has_redacted_thinking = _extract_thinking(content)
-        usage = getattr(result, "usage", None)
-        tokens_out = getattr(usage, "output_tokens", 0) or 0
-        cache_read_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
-        cache_creation_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
-        tokens_in = (getattr(usage, "input_tokens", 0) or 0) + cache_read_tokens + cache_creation_tokens
-        events = from_anthropic_blocks(content, end_ts)
-        stop_reason = getattr(result, "stop_reason", None)
-        attrs = {
-            **ek._meta_attrs(),
-            "gen_ai.request.model": model,
-            **_request_attrs(kwargs),
-            "gen_ai.response.model": getattr(result, "model", model),
-            "gen_ai.response.id": getattr(result, "id", ""),
-            "gen_ai.usage.total_tokens": tokens_in + tokens_out,
-        }
-        if stop_reason:
-            attrs["gen_ai.response.finish_reasons"] = [stop_reason]
-        if thinking_text:
-            attrs["gen_ai.response.thinking"] = thinking_text[:32768]
-        if has_redacted_thinking:
-            attrs["gen_ai.response.has_redacted_thinking"] = True
-        ek.enqueue(TraceEnvelope(
-            trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-            span_type="llm_call", status="OK",
-            operation="messages.create",
-            service_name=ek._opts.service_name, provider="anthropic", model=model,
-            prompt=prompt, completion=completion,
-            tokens_in=tokens_in, tokens_out=tokens_out,
-            cache_read_tokens=cache_read_tokens or None, cache_creation_tokens=cache_creation_tokens or None,
-            latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
-            events=events or None,
-            attributes=attrs,
-            environment=ek._opts.environment, app_version=ek._opts.app_version,
-            sdk_version=SDK_VERSION,
-        ))
+        try:
+            end_ts = _now_iso()
+            latency = int(time.time() * 1000 - start_ms)
+            content = getattr(result, "content", [])
+            completion = next((b.text for b in content if hasattr(b, "text")), "")
+            thinking_text, has_redacted_thinking = _extract_thinking(content)
+            usage = getattr(result, "usage", None)
+            tokens_out = getattr(usage, "output_tokens", 0) or 0
+            cache_read_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
+            cache_creation_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
+            tokens_in = (getattr(usage, "input_tokens", 0) or 0) + cache_read_tokens + cache_creation_tokens
+            events = from_anthropic_blocks(content, end_ts)
+            stop_reason = getattr(result, "stop_reason", None)
+            attrs = {
+                **ek._meta_attrs(),
+                "gen_ai.request.model": model,
+                **_request_attrs(kwargs),
+                "gen_ai.response.model": getattr(result, "model", model),
+                "gen_ai.response.id": getattr(result, "id", ""),
+                "gen_ai.usage.total_tokens": tokens_in + tokens_out,
+            }
+            if stop_reason:
+                attrs["gen_ai.response.finish_reasons"] = [stop_reason]
+            if thinking_text:
+                attrs["gen_ai.response.thinking"] = thinking_text[:32768]
+            if has_redacted_thinking:
+                attrs["gen_ai.response.has_redacted_thinking"] = True
+            ek.enqueue(TraceEnvelope(
+                trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
+                span_type="llm_call", status="OK",
+                operation="messages.create",
+                service_name=ek._opts.service_name, provider="anthropic", model=model,
+                prompt=prompt, completion=completion,
+                tokens_in=tokens_in, tokens_out=tokens_out,
+                cache_read_tokens=cache_read_tokens or None, cache_creation_tokens=cache_creation_tokens or None,
+                latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
+                events=events or None,
+                attributes=attrs,
+                environment=ek._opts.environment, app_version=ek._opts.app_version,
+                sdk_version=SDK_VERSION,
+            ))
+        except Exception as exc:
+            hook_failed("messages.create", exc)
         return result
 
     traced._evalkit = True
@@ -511,19 +555,19 @@ def _patch_anthropic_class_async(ek: "EvalKitClient", cls) -> None:
     original = cls.create
 
     async def traced_async(self, *args, **kwargs):
-        ctx_parent = current_span_ctx()
-        trace_id = ctx_parent.trace_id if ctx_parent else get_or_create_ambient_trace_id()
-        span_id = _new_span_id()
-        parent_span_id = ctx_parent.span_id if ctx_parent else None
-        start_ms = time.time() * 1000
-        ts = _now_iso()
-        model = kwargs.get("model", "unknown")
-        system = kwargs.get("system")
-        messages = kwargs.get("messages", [])
-        parts = ([f"system: {_system_text(system)}"] if system else []) + [
-            f"{m.get('role','')}: {message_content_text(m.get('content'))}" for m in messages
-        ]
-        prompt = "\n".join(parts)
+        try:
+            ctx_parent = current_span_ctx()
+            trace_id = ctx_parent.trace_id if ctx_parent else get_or_create_ambient_trace_id()
+            span_id = _new_span_id()
+            parent_span_id = ctx_parent.span_id if ctx_parent else None
+            start_ms = time.time() * 1000
+            ts = _now_iso()
+            model = kwargs.get("model", "unknown")
+            prompt = _chat_prompt(kwargs.get("messages"), kwargs.get("system"))
+            span_ctx = child_span_ctx(trace_id, span_id)
+        except Exception as exc:
+            hook_failed("messages.create", exc)
+            return await original(self, *args, **kwargs)
 
         if kwargs.get("stream"):
             state = _StreamState(start_ms)
@@ -560,71 +604,80 @@ def _patch_anthropic_class_async(ek: "EvalKitClient", cls) -> None:
                     environment=ek._opts.environment, app_version=ek._opts.app_version,
                     sdk_version=SDK_VERSION,
                 ))
-            raw = await original(self, *args, **kwargs)
-            return _AsyncStreamTracer(
+            try:
+                raw = await original(self, *args, **kwargs)
+            except Exception as exc:
+                record_stream_open_failure(on_stream_done, state, exc)
+                raise
+            return trace_async_stream(
                 raw, on_stream_done, is_anthropic=True, start_ms=start_ms, state=state,
             )
 
-        span_ctx = child_span_ctx(trace_id, span_id)
         token = _current_span.set(span_ctx)
         try:
             result = await original(self, *args, **kwargs)
         except Exception as exc:
-            end_ts = _now_iso()
-            ek.enqueue(TraceEnvelope(
-                trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                span_type="llm_call", status="ERROR", status_message=str(exc),
-                operation="messages.create",
-                service_name=ek._opts.service_name, provider="anthropic", model=model,
-                prompt=prompt, latency_ms=int(time.time() * 1000 - start_ms),
-                start_time=ts, end_time=end_ts, created_at=ts,
-                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs), **_exc_attrs(exc)},
-                environment=ek._opts.environment, app_version=ek._opts.app_version,
-                sdk_version=SDK_VERSION,
-            ))
+            try:
+                end_ts = _now_iso()
+                ek.enqueue(TraceEnvelope(
+                    trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
+                    span_type="llm_call", status="ERROR", status_message=str(exc),
+                    operation="messages.create",
+                    service_name=ek._opts.service_name, provider="anthropic", model=model,
+                    prompt=prompt, latency_ms=int(time.time() * 1000 - start_ms),
+                    start_time=ts, end_time=end_ts, created_at=ts,
+                    attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs), **_exc_attrs(exc)},
+                    environment=ek._opts.environment, app_version=ek._opts.app_version,
+                    sdk_version=SDK_VERSION,
+                ))
+            except Exception as hook_exc:
+                hook_failed("model call", hook_exc)
             raise
         finally:
             _current_span.reset(token)
-        end_ts = _now_iso()
-        latency = int(time.time() * 1000 - start_ms)
-        content = getattr(result, "content", [])
-        completion = next((b.text for b in content if hasattr(b, "text")), "")
-        thinking_text, has_redacted_thinking = _extract_thinking(content)
-        usage = getattr(result, "usage", None)
-        tokens_out = getattr(usage, "output_tokens", 0) or 0
-        cache_read_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
-        cache_creation_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
-        tokens_in = (getattr(usage, "input_tokens", 0) or 0) + cache_read_tokens + cache_creation_tokens
-        events = from_anthropic_blocks(content, end_ts)
-        stop_reason = getattr(result, "stop_reason", None)
-        attrs = {
-            **ek._meta_attrs(),
-            "gen_ai.request.model": model,
-            **_request_attrs(kwargs),
-            "gen_ai.response.model": getattr(result, "model", model),
-            "gen_ai.response.id": getattr(result, "id", ""),
-            "gen_ai.usage.total_tokens": tokens_in + tokens_out,
-        }
-        if stop_reason:
-            attrs["gen_ai.response.finish_reasons"] = [stop_reason]
-        if thinking_text:
-            attrs["gen_ai.response.thinking"] = thinking_text[:32768]
-        if has_redacted_thinking:
-            attrs["gen_ai.response.has_redacted_thinking"] = True
-        ek.enqueue(TraceEnvelope(
-            trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-            span_type="llm_call", status="OK",
-            operation="messages.create",
-            service_name=ek._opts.service_name, provider="anthropic", model=model,
-            prompt=prompt, completion=completion,
-            tokens_in=tokens_in, tokens_out=tokens_out,
-            cache_read_tokens=cache_read_tokens or None, cache_creation_tokens=cache_creation_tokens or None,
-            latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
-            events=events or None,
-            attributes=attrs,
-            environment=ek._opts.environment, app_version=ek._opts.app_version,
-            sdk_version=SDK_VERSION,
-        ))
+        try:
+            end_ts = _now_iso()
+            latency = int(time.time() * 1000 - start_ms)
+            content = getattr(result, "content", [])
+            completion = next((b.text for b in content if hasattr(b, "text")), "")
+            thinking_text, has_redacted_thinking = _extract_thinking(content)
+            usage = getattr(result, "usage", None)
+            tokens_out = getattr(usage, "output_tokens", 0) or 0
+            cache_read_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
+            cache_creation_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
+            tokens_in = (getattr(usage, "input_tokens", 0) or 0) + cache_read_tokens + cache_creation_tokens
+            events = from_anthropic_blocks(content, end_ts)
+            stop_reason = getattr(result, "stop_reason", None)
+            attrs = {
+                **ek._meta_attrs(),
+                "gen_ai.request.model": model,
+                **_request_attrs(kwargs),
+                "gen_ai.response.model": getattr(result, "model", model),
+                "gen_ai.response.id": getattr(result, "id", ""),
+                "gen_ai.usage.total_tokens": tokens_in + tokens_out,
+            }
+            if stop_reason:
+                attrs["gen_ai.response.finish_reasons"] = [stop_reason]
+            if thinking_text:
+                attrs["gen_ai.response.thinking"] = thinking_text[:32768]
+            if has_redacted_thinking:
+                attrs["gen_ai.response.has_redacted_thinking"] = True
+            ek.enqueue(TraceEnvelope(
+                trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
+                span_type="llm_call", status="OK",
+                operation="messages.create",
+                service_name=ek._opts.service_name, provider="anthropic", model=model,
+                prompt=prompt, completion=completion,
+                tokens_in=tokens_in, tokens_out=tokens_out,
+                cache_read_tokens=cache_read_tokens or None, cache_creation_tokens=cache_creation_tokens or None,
+                latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
+                events=events or None,
+                attributes=attrs,
+                environment=ek._opts.environment, app_version=ek._opts.app_version,
+                sdk_version=SDK_VERSION,
+            ))
+        except Exception as exc:
+            hook_failed("messages.create", exc)
         return result
 
     traced_async._evalkit = True
@@ -770,184 +823,204 @@ def _try_patch_openai_responses(ek: "EvalKitClient") -> None:
         pass
 
 
+def _responses_reasoning(output_items) -> str:
+    """The reasoning a Responses reply shows: the summaries and any reasoning text of its items."""
+    texts = []
+    for item in output_items or ():
+        if field(item, "type") != "reasoning":
+            continue
+        for part in [*(field(item, "summary") or ()), *(field(item, "content") or ())]:
+            text = field(part, "text")
+            if isinstance(text, str) and text:
+                texts.append(text)
+    return "\n".join(texts)
+
+
+def _responses_prompt(kwargs: dict) -> str:
+    """A Responses request's instructions and input as "role: text" lines.
+
+    Only a string or a list is read: the client also accepts other iterables, and reading a
+    generator here would leave nothing for the request itself.
+    """
+    raw_input = kwargs.get("input", "")
+    instructions = kwargs.get("instructions") or ""
+    if isinstance(raw_input, str):
+        input_text = raw_input
+    elif isinstance(raw_input, list):
+        parts = []
+        for item in raw_input:
+            if isinstance(item, dict):
+                role = item.get("role", "")
+                content = item.get("content", "")
+                if isinstance(content, list):
+                    content = " ".join(
+                        str((c.get("text", "") if isinstance(c, dict) else getattr(c, "text", "")) or "")
+                        for c in content
+                    )
+                parts.append(f"{role}: {content}" if role else str(content))
+            else:
+                parts.append(str(item))
+        input_text = "\n".join(parts)
+    else:
+        input_text = str(raw_input)
+    return (f"system: {instructions}\n" if instructions else "") + input_text
+
+
+class _ResponsesCall:
+    """One responses.create call and the llm_call span recorded from how it ended.
+
+    The sync and the async client, streamed or not, record their span through this one class, so
+    the four ways of calling the Responses API cannot drift apart.
+    """
+
+    def __init__(self, ek: "EvalKitClient", kwargs: dict) -> None:
+        import time
+        from ..core.client import _new_span_id, _now_iso
+        from ..core.context import child_span_ctx, current_span_ctx, get_or_create_ambient_trace_id
+
+        parent = current_span_ctx()
+        self.ek = ek
+        self.kwargs = kwargs
+        self.trace_id = parent.trace_id if parent else get_or_create_ambient_trace_id()
+        self.span_id = _new_span_id()
+        self.parent_span_id = parent.span_id if parent else None
+        self.start_ms = time.time() * 1000
+        self.ts = _now_iso()
+        self.model = kwargs.get("model", "unknown")
+        self.prompt = _responses_prompt(kwargs)
+        self.span_ctx = child_span_ctx(self.trace_id, self.span_id)
+
+    def _attrs(self) -> dict:
+        return {**self.ek._meta_attrs(), "gen_ai.request.model": self.model, **_request_attrs(self.kwargs)}
+
+    def _enqueue(self, *, status: str, attributes: dict, end_ts: str, status_message=None, completion=None,
+                 tokens_in=None, tokens_out=None, cache_read_tokens=0, events=None) -> None:
+        import time
+        from ..core.types import TraceEnvelope
+        from .._version import SDK_VERSION
+
+        ek = self.ek
+        ek.enqueue(TraceEnvelope(
+            trace_id=self.trace_id, span_id=self.span_id, parent_span_id=self.parent_span_id,
+            span_type="llm_call", status=status, status_message=status_message,
+            operation="responses.create",
+            service_name=ek._opts.service_name, provider="openai", model=self.model,
+            prompt=self.prompt[:32768], completion=completion[:32768] if completion is not None else None,
+            tokens_in=tokens_in, tokens_out=tokens_out, cache_read_tokens=cache_read_tokens or None,
+            latency_ms=int(time.time() * 1000 - self.start_ms), start_time=self.ts, end_time=end_ts,
+            created_at=self.ts, events=events or None, attributes=attributes,
+            environment=ek._opts.environment, app_version=ek._opts.app_version,
+            sdk_version=SDK_VERSION,
+        ))
+
+    def failed(self, exc: BaseException) -> None:
+        """The call raised before it returned a response or a stream."""
+        from ..core.client import _now_iso
+
+        try:
+            self._enqueue(status="ERROR", status_message=str(exc), end_ts=_now_iso(),
+                          attributes={**self._attrs(), **_exc_attrs(exc)})
+        except Exception as hook_exc:
+            hook_failed("model call", hook_exc)
+
+    def returned(self, result) -> None:
+        from ..core.client import _now_iso
+        from ._streaming import openai_responses_usage
+
+        try:
+            # A raw response (with_raw_response, with_streaming_response) is not a Response.
+            if not hasattr(result, "output_text"):
+                return
+            end_ts = _now_iso()
+            tokens_in, tokens_out, total, reasoning, cached = openai_responses_usage(getattr(result, "usage", None))
+            attrs = {**self._attrs(),
+                     "gen_ai.response.model": getattr(result, "model", self.model),
+                     "gen_ai.response.id": getattr(result, "id", ""),
+                     "gen_ai.usage.total_tokens": total}
+            if reasoning:
+                attrs["gen_ai.usage.reasoning_tokens"] = reasoning
+            output_items = list(getattr(result, "output", []) or [])
+            thinking = _responses_reasoning(output_items)
+            if thinking:
+                attrs["gen_ai.response.thinking"] = thinking[:32768]
+            self._enqueue(
+                status="OK", completion=result.output_text or "", tokens_in=tokens_in, tokens_out=tokens_out,
+                cache_read_tokens=cached, end_ts=end_ts, attributes=attrs,
+                events=_responses_tool_events(output_items, end_ts),
+            )
+        except Exception as exc:
+            hook_failed("responses.create", exc)
+
+    def stream_recorder(self):
+        """The state a stream tracer fills and the callback that records the span when it ends."""
+        from ..core.client import _now_iso
+
+        state = _StreamState(self.start_ms)
+
+        def on_stream_done(
+            completion: str, tokens_in: int, tokens_out: int,
+            thinking: str, reasoning_tokens: int, has_redacted_thinking: bool,
+            ttft_ms=None, cache_read_tokens: int = 0, cache_creation_tokens: int = 0,
+            error=None,
+        ) -> None:
+            end_ts = _now_iso()
+            attrs = {**self._attrs(), "gen_ai.streaming": True}
+            if reasoning_tokens:
+                attrs["gen_ai.usage.reasoning_tokens"] = reasoning_tokens
+            if ttft_ms is not None:
+                attrs["gen_ai.server.time_to_first_token_ms"] = ttft_ms
+            if tokens_in or tokens_out:
+                attrs["gen_ai.usage.total_tokens"] = tokens_in + tokens_out
+            thinking = thinking or _responses_reasoning(state.output_items)
+            if thinking:
+                attrs["gen_ai.response.thinking"] = thinking[:32768]
+            attrs.update(stream_response_attrs(state))
+            failure = str(error) if error is not None else state.failure
+            # The final response lists every call, built-in tools and citations included, as the
+            # unstreamed reply does; a stream cut short has only what its deltas assembled.
+            events = (_responses_tool_events(state.output_items, end_ts) if state.output_items
+                      else stream_tool_events(state, end_ts))
+            self._enqueue(
+                status="ERROR" if failure is not None else "OK", status_message=failure,
+                completion=completion, tokens_in=tokens_in, tokens_out=tokens_out,
+                cache_read_tokens=cache_read_tokens, end_ts=end_ts, attributes=attrs, events=events,
+            )
+
+        return state, on_stream_done
+
+
 def _patch_openai_responses_sync(ek: "EvalKitClient", cls) -> None:
     if getattr(cls.create, "_evalkit", False):
         return
-    import time
-    from ..core.client import _new_span_id, _now_iso
-    from ..core.context import _current_span, child_span_ctx, current_span_ctx, get_or_create_ambient_trace_id
-    from ..core.types import SpanEvent, TraceEnvelope
-    from .._version import SDK_VERSION
+    from ..core.context import _current_span
 
     original = cls.create
 
     def traced(self, *args, **kwargs):
-        ctx_parent = current_span_ctx()
-        trace_id = ctx_parent.trace_id if ctx_parent else get_or_create_ambient_trace_id()
-        span_id = _new_span_id()
-        parent_span_id = ctx_parent.span_id if ctx_parent else None
-        start_ms = time.time() * 1000
-        ts = _now_iso()
-        model = kwargs.get("model", "unknown")
-        raw_input = kwargs.get("input", "")
-        instructions = kwargs.get("instructions") or ""
-        if isinstance(raw_input, str):
-            input_text = raw_input
-        elif isinstance(raw_input, list):
-            parts = []
-            for item in raw_input:
-                if isinstance(item, dict):
-                    role = item.get("role", "")
-                    content = item.get("content", "")
-                    if isinstance(content, list):
-                        content = " ".join(
-                            (c.get("text", "") if isinstance(c, dict) else getattr(c, "text", ""))
-                            for c in content
-                        )
-                    parts.append(f"{role}: {content}" if role else str(content))
-                else:
-                    parts.append(str(item))
-            input_text = "\n".join(parts)
-        else:
-            input_text = str(raw_input)
-        prompt = (f"system: {instructions}\n" if instructions else "") + input_text
+        try:
+            call = _ResponsesCall(ek, kwargs)
+            stream = bool(kwargs.get("stream"))
+            if stream:
+                state, on_done = call.stream_recorder()
+        except Exception as exc:
+            hook_failed("responses.create", exc)
+            return original(self, *args, **kwargs)
 
-        if kwargs.get("stream"):
-            chunks: list[str] = []
-            tokens_in_box = [0]
-            tokens_out_box = [0]
-            tool_events_box: list[SpanEvent] = []
-            done_box = [False]
-
-            span_ctx = child_span_ctx(trace_id, span_id)
-            token = _current_span.set(span_ctx)
-            try:
-                raw_stream = original(self, *args, **kwargs)
-            except Exception as exc:
-                _current_span.reset(token)
-                end_ts = _now_iso()
-                ek.enqueue(TraceEnvelope(
-                    trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                    span_type="llm_call", status="ERROR", status_message=str(exc),
-                    operation="responses.create",
-                    service_name=ek._opts.service_name, provider="openai", model=model,
-                    prompt=prompt[:32768], latency_ms=int(time.time() * 1000 - start_ms),
-                    start_time=ts, end_time=end_ts, created_at=ts,
-                    attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs), **_exc_attrs(exc)},
-                    environment=ek._opts.environment, app_version=ek._opts.app_version,
-                    sdk_version=SDK_VERSION,
-                ))
-                raise
-            _current_span.reset(token)
-
-            def _emit_responses_span() -> None:
-                if done_box[0]:
-                    return
-                done_box[0] = True
-                end_ts2 = _now_iso()
-                latency2 = int(time.time() * 1000 - start_ms)
-                ek.enqueue(TraceEnvelope(
-                    trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                    span_type="llm_call", status="OK",
-                    operation="responses.create",
-                    service_name=ek._opts.service_name, provider="openai", model=model,
-                    prompt=prompt[:32768], completion="".join(chunks)[:32768],
-                    tokens_in=tokens_in_box[0], tokens_out=tokens_out_box[0],
-                    latency_ms=latency2, start_time=ts, end_time=end_ts2, created_at=ts,
-                    events=tool_events_box or None,
-                    attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs),
-                                "gen_ai.streaming": True,
-                                "gen_ai.usage.total_tokens": tokens_in_box[0] + tokens_out_box[0]},
-                    environment=ek._opts.environment, app_version=ek._opts.app_version,
-                    sdk_version=SDK_VERSION,
-                ))
-
-            class _ResponsesStreamWrapper:
-                def __iter__(self_inner):
-                    try:
-                        for event in raw_stream:
-                            etype = getattr(event, "type", "")
-                            if etype == "response.output_text.delta":
-                                delta = getattr(event, "delta", "")
-                                if delta:
-                                    chunks.append(delta)
-                            elif etype in ("response.completed", "response.done"):
-                                resp = getattr(event, "response", None)
-                                if resp:
-                                    usage = getattr(resp, "usage", None)
-                                    tokens_in_box[0] = getattr(usage, "input_tokens", 0) or 0
-                                    tokens_out_box[0] = getattr(usage, "output_tokens", 0) or 0
-                                    end_ts3 = _now_iso()
-                                    tool_events_box.extend(
-                                        from_openai_responses(list(getattr(resp, "output", []) or []), end_ts3)
-                                    )
-                            yield event
-                    finally:
-                        _emit_responses_span()
-
-                def __enter__(self_inner):
-                    if hasattr(raw_stream, "__enter__"):
-                        raw_stream.__enter__()
-                    return self_inner
-
-                def __exit__(self_inner, exc_type, exc_val, exc_tb):
-                    _emit_responses_span()
-                    if hasattr(raw_stream, "__exit__"):
-                        return raw_stream.__exit__(exc_type, exc_val, exc_tb)
-
-                def __getattr__(self_inner, name):
-                    return getattr(raw_stream, name)
-
-            return _ResponsesStreamWrapper()
-
-        span_ctx = child_span_ctx(trace_id, span_id)
-        token = _current_span.set(span_ctx)
+        token = _current_span.set(call.span_ctx)
         try:
             result = original(self, *args, **kwargs)
         except Exception as exc:
-            end_ts = _now_iso()
-            ek.enqueue(TraceEnvelope(
-                trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                span_type="llm_call", status="ERROR", status_message=str(exc),
-                operation="responses.create",
-                service_name=ek._opts.service_name, provider="openai", model=model,
-                prompt=prompt[:32768], latency_ms=int(time.time() * 1000 - start_ms),
-                start_time=ts, end_time=end_ts, created_at=ts,
-                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs), **_exc_attrs(exc)},
-                environment=ek._opts.environment, app_version=ek._opts.app_version,
-                sdk_version=SDK_VERSION,
-            ))
+            if stream:
+                record_stream_open_failure(on_done, state, exc)
+            else:
+                call.failed(exc)
             raise
         finally:
             _current_span.reset(token)
-        end_ts = _now_iso()
-        latency = int(time.time() * 1000 - start_ms)
-        try:
-            completion = result.output_text or ""
-            usage = getattr(result, "usage", None)
-            tokens_in = getattr(usage, "input_tokens", 0) or 0
-            tokens_out = getattr(usage, "output_tokens", 0) or 0
-            total_tokens = getattr(usage, "total_tokens", 0) or 0
-            output_items = list(getattr(result, "output", []) or [])
-            events = _responses_tool_events(output_items, end_ts)
-            ek.enqueue(TraceEnvelope(
-                trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                span_type="llm_call", status="OK",
-                operation="responses.create",
-                service_name=ek._opts.service_name, provider="openai", model=model,
-                prompt=prompt[:32768], completion=completion[:32768],
-                tokens_in=tokens_in, tokens_out=tokens_out,
-                latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
-                events=events or None,
-                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs),
-                            "gen_ai.response.model": getattr(result, "model", model),
-                            "gen_ai.response.id": getattr(result, "id", ""),
-                            "gen_ai.usage.total_tokens": total_tokens},
-                environment=ek._opts.environment, app_version=ek._opts.app_version,
-                sdk_version=SDK_VERSION,
-            ))
-        except Exception:
-            pass
+        if stream:
+            return trace_sync_stream(result, on_done, start_ms=call.start_ms, state=state,
+                                     process=_StreamState.process_openai_responses_event)
+        call.returned(result)
         return result
 
     traced._evalkit = True
@@ -957,93 +1030,37 @@ def _patch_openai_responses_sync(ek: "EvalKitClient", cls) -> None:
 def _patch_openai_responses_async(ek: "EvalKitClient", cls) -> None:
     if getattr(cls.create, "_evalkit", False):
         return
-    import time
-    from ..core.client import _new_span_id, _now_iso
-    from ..core.context import _current_span, child_span_ctx, current_span_ctx, get_or_create_ambient_trace_id
-    from ..core.types import SpanEvent, TraceEnvelope
-    from .._version import SDK_VERSION
+    from ..core.context import _current_span
 
     original = cls.create
 
     async def traced_async(self, *args, **kwargs):
-        ctx_parent = current_span_ctx()
-        trace_id = ctx_parent.trace_id if ctx_parent else get_or_create_ambient_trace_id()
-        span_id = _new_span_id()
-        parent_span_id = ctx_parent.span_id if ctx_parent else None
-        start_ms = time.time() * 1000
-        ts = _now_iso()
-        model = kwargs.get("model", "unknown")
-        raw_input = kwargs.get("input", "")
-        instructions = kwargs.get("instructions") or ""
-        if isinstance(raw_input, str):
-            input_text = raw_input
-        elif isinstance(raw_input, list):
-            parts = []
-            for item in raw_input:
-                if isinstance(item, dict):
-                    role = item.get("role", "")
-                    content = item.get("content", "")
-                    if isinstance(content, list):
-                        content = " ".join(
-                            (c.get("text", "") if isinstance(c, dict) else getattr(c, "text", ""))
-                            for c in content
-                        )
-                    parts.append(f"{role}: {content}" if role else str(content))
-                else:
-                    parts.append(str(item))
-            input_text = "\n".join(parts)
-        else:
-            input_text = str(raw_input)
-        prompt = (f"system: {instructions}\n" if instructions else "") + input_text
+        try:
+            call = _ResponsesCall(ek, kwargs)
+            stream = bool(kwargs.get("stream"))
+            if stream:
+                state, on_done = call.stream_recorder()
+        except Exception as exc:
+            hook_failed("responses.create", exc)
+            return await original(self, *args, **kwargs)
 
-        span_ctx = child_span_ctx(trace_id, span_id)
-        token = _current_span.set(span_ctx)
+        token = _current_span.set(call.span_ctx)
         try:
             result = await original(self, *args, **kwargs)
         except Exception as exc:
-            end_ts = _now_iso()
-            ek.enqueue(TraceEnvelope(
-                trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                span_type="llm_call", status="ERROR", status_message=str(exc),
-                operation="responses.create",
-                service_name=ek._opts.service_name, provider="openai", model=model,
-                prompt=prompt[:32768], latency_ms=int(time.time() * 1000 - start_ms),
-                start_time=ts, end_time=end_ts, created_at=ts,
-                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs), **_exc_attrs(exc)},
-                environment=ek._opts.environment, app_version=ek._opts.app_version,
-                sdk_version=SDK_VERSION,
-            ))
+            if stream:
+                record_stream_open_failure(on_done, state, exc)
+            else:
+                call.failed(exc)
             raise
         finally:
             _current_span.reset(token)
-        end_ts = _now_iso()
-        latency = int(time.time() * 1000 - start_ms)
-        try:
-            completion = result.output_text or ""
-            usage = getattr(result, "usage", None)
-            tokens_in = getattr(usage, "input_tokens", 0) or 0
-            tokens_out = getattr(usage, "output_tokens", 0) or 0
-            total_tokens = getattr(usage, "total_tokens", 0) or 0
-            output_items = list(getattr(result, "output", []) or [])
-            events = _responses_tool_events(output_items, end_ts)
-            ek.enqueue(TraceEnvelope(
-                trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                span_type="llm_call", status="OK",
-                operation="responses.create",
-                service_name=ek._opts.service_name, provider="openai", model=model,
-                prompt=prompt[:32768], completion=completion[:32768],
-                tokens_in=tokens_in, tokens_out=tokens_out,
-                latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
-                events=events or None,
-                attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs),
-                            "gen_ai.response.model": getattr(result, "model", model),
-                            "gen_ai.response.id": getattr(result, "id", ""),
-                            "gen_ai.usage.total_tokens": total_tokens},
-                environment=ek._opts.environment, app_version=ek._opts.app_version,
-                sdk_version=SDK_VERSION,
-            ))
-        except Exception:
-            pass
+        if stream:
+            # responses.stream() on the async client awaits this same create(stream=True), so its
+            # AsyncResponseStream reads through the tracer as well.
+            return trace_async_stream(result, on_done, start_ms=call.start_ms, state=state,
+                                      process=_StreamState.process_openai_responses_event)
+        call.returned(result)
         return result
 
     traced_async._evalkit = True
@@ -1316,13 +1333,14 @@ def _try_patch_databases(ek: "EvalKitClient") -> None:
         "redis": ("opentelemetry.instrumentation.redis",),
         "pymongo": ("opentelemetry.instrumentation.pymongo",),
         "asyncpg": ("opentelemetry.instrumentation.asyncpg",),
-        "psycopg": ("opentelemetry.instrumentation.psycopg",
-                    "opentelemetry.instrumentation.psycopg2"),
+        "psycopg": ("opentelemetry.instrumentation.psycopg",),
+        "psycopg2": ("opentelemetry.instrumentation.psycopg2",),
         "pymysql": ("opentelemetry.instrumentation.pymysql",),
     }
     try:
-        from .db._common import set_stmt_max
+        from .db._common import set_stmt_max, watch_sqlalchemy_statements
         set_stmt_max(ek._opts.max_body_bytes)
+        watch_sqlalchemy_statements()
     except Exception:
         pass
     for mod_name, fn_name in (
@@ -1330,12 +1348,15 @@ def _try_patch_databases(ek: "EvalKitClient") -> None:
         ("pymongo", "patch_pymongo"),
         ("asyncpg", "patch_asyncpg"),
         ("psycopg", "patch_psycopg"),
+        ("psycopg2", "patch_psycopg2"),
         ("pymysql", "patch_pymysql"),
     ):
         try:
             mod = importlib.import_module(f".db.{mod_name}", __package__)
-            getattr(mod, fn_name)(ek)
-            _mark_owned(*_otel_scopes[mod_name])
+            # A patcher that reports False traced nothing, so OpenTelemetry's spans for that
+            # driver are the only record of its queries and are kept.
+            if getattr(mod, fn_name)(ek) is not False:
+                _mark_owned(*_otel_scopes[mod_name])
         except Exception:
             pass
 
@@ -1367,8 +1388,8 @@ def setup_auto_instrumentation(
 
     if logging:
         try:
-            from .runtime.logging import install_logging_handler
-            install_logging_handler(client)
+            from .runtime.logging import install_log_capture
+            install_log_capture(client)
         except Exception:
             pass
     if requests:
@@ -1381,8 +1402,8 @@ def setup_auto_instrumentation(
     if httpx:
         try:
             from .http.httpx import patch_httpx
-            patch_httpx(client)
-            _mark_owned("opentelemetry.instrumentation.httpx")
+            for name in patch_httpx(client):
+                _mark_owned(f"opentelemetry.instrumentation.{name}")
         except Exception:
             pass
     if aiohttp:

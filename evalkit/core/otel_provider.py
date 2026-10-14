@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 from .content import compact_json, message_content_text, parse_json_text
-from .context import AGENT_NAME_KEYS, SESSION_ID_KEYS, USER_ID_KEYS, first_attr
+from .context import AGENT_NAME_KEYS, SESSION_ID_KEYS, USER_ID_KEYS, first_attr, tracing_suppressed
 from .types import SpanEvent, TraceEnvelope
 
 _log = logging.getLogger("evalkit")
@@ -178,7 +179,18 @@ _Scope = Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]
 # Spans that start but never end must not grow this without bound.
 _MAX_TRACKED_SPANS = 10000
 _started_scopes: "OrderedDict[Tuple[int, int], _Scope]" = OrderedDict()
-_scopes_lock = threading.Lock()
+# Re-entrant, as the export path can run again from a garbage-collected stream on the same thread.
+_scopes_lock = threading.RLock()
+
+
+def _reset_lock_after_fork() -> None:
+    # A lock another thread held at the fork stays held in the child.
+    global _scopes_lock
+    _scopes_lock = threading.RLock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_lock_after_fork)
 # OTel trace id -> (evalkit trace id, evalkit parent span id, OTel root span id). A span from
 # another OpenTelemetry library that starts with no OTel parent while an evalkit span is current
 # belongs to that evalkit trace; without this it and its children would export as a trace of
@@ -342,6 +354,31 @@ def capture_start_scope(span: Any) -> None:
         _started_scopes[key] = scope
         while len(_started_scopes) > _MAX_TRACKED_SPANS:
             _started_scopes.popitem(last=False)
+
+
+# Spans another instrumentation started while a health probe was answered. They are exported from
+# the processor's own thread, where the probe's context is gone, so they are told apart as they start.
+_suppressed_spans: "OrderedDict[Tuple[int, int], None]" = OrderedDict()
+
+
+def _note_suppressed(span: Any) -> None:
+    key = _span_key(span)
+    if key is not None:
+        with _scopes_lock:
+            _remember(_suppressed_spans, key, None)
+
+
+def _take_suppressed(span: Any) -> bool:
+    if not _suppressed_spans:
+        return False
+    key = _span_key(span)
+    if key is None:
+        return False
+    with _scopes_lock:
+        if key not in _suppressed_spans:
+            return False
+        del _suppressed_spans[key]
+        return True
 
 
 def _take_start_scope(span: Any) -> _Scope:
@@ -739,10 +776,21 @@ def setup_otel(client: Any) -> bool:
         class _ScopeCapturingProcessor(BatchSpanProcessor):
             def on_start(self, span: Any, parent_context: Any = None) -> None:
                 try:
-                    capture_start_scope(span)
+                    if tracing_suppressed():
+                        _note_suppressed(span)
+                    else:
+                        capture_start_scope(span)
                 except Exception:
                     pass
                 super().on_start(span, parent_context=parent_context)
+
+            def on_end(self, span: Any) -> None:
+                try:
+                    if _take_suppressed(span):
+                        return
+                except Exception:
+                    pass
+                super().on_end(span)
 
         processor = _ScopeCapturingProcessor(
             _EnvelopeExporter(),

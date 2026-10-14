@@ -178,5 +178,180 @@ class TestStreamFailures(unittest.TestCase):
                       "replace the caller's exception with ours and send them debugging the wrong thing")
 
 
+
+class ProviderRefused(Exception):
+    """What a provider client raises when the request fails before any chunk arrives."""
+
+
+def _raising(exc, is_async=False):
+    if is_async:
+        async def create(*a, **k):
+            raise exc
+    else:
+        def create(*a, **k):
+            raise exc
+    return create
+
+
+class TestStreamOpenFailures(unittest.TestCase):
+    """A streamed call that fails before its stream opens is recorded like the same call without stream=True."""
+
+    KWARGS = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "Where is order 1001?"}],
+              "stream": True, "temperature": 0.2}
+
+    def setUp(self):
+        reset_context()
+        self.captured = []
+        self.client = fresh(self.captured)
+
+    def _span(self):
+        self.client.flush()
+        spans = [e for e in self.captured if e.span_type == "llm_call"]
+        self.assertEqual(len(spans), 1, "a stream that never opened must still leave exactly one model-call span")
+        return spans[0]
+
+    def _check(self, span, exc, model="gpt-4o-mini"):
+        self.assertEqual(span.status, "ERROR")
+        self.assertEqual(span.model, model)
+        self.assertIn("refused", span.status_message or "")
+        self.assertIn("Where is order 1001?", span.prompt or "")
+        self.assertIs(span.attributes.get("gen_ai.streaming"), True)
+        self.assertEqual(span.attributes.get("gen_ai.request.model"), model)
+        self.assertEqual(span.attributes.get("exception.type"), type(exc).__qualname__)
+        self.assertNotIn(TTFT, span.attributes)
+
+    def _call(self, create, is_async=False, **over):
+        exc = ProviderRefused("connection refused")
+        kwargs = {**self.KWARGS, **over}
+        if is_async:
+            async def run():
+                await create(**kwargs)
+            with self.assertRaises(ProviderRefused) as raised:
+                asyncio.run(run())
+        else:
+            with self.assertRaises(ProviderRefused) as raised:
+                create(**kwargs)
+        return raised.exception
+
+    def _patched_class(self, patcher, exc, is_async=False):
+        from evalkit.instrumentation import auto as _auto
+
+        class FakeCompletions:
+            pass
+
+        FakeCompletions.create = _raising(exc, is_async)
+        getattr(_auto, patcher)(self.client, FakeCompletions)
+        return FakeCompletions()
+
+    def test_openai_sync(self):
+        exc = ProviderRefused("connection refused")
+        fc = self._patched_class("_patch_openai_class_sync", exc)
+        with self.assertRaises(ProviderRefused) as raised:
+            fc.create(**self.KWARGS)
+        self.assertIs(raised.exception, exc, "the provider's own exception object must reach the caller")
+        span = self._span()
+        self._check(span, exc)
+        self.assertEqual(span.attributes.get("gen_ai.request.temperature"), 0.2)
+
+    def test_openai_async(self):
+        exc = ProviderRefused("connection refused")
+        fc = self._patched_class("_patch_openai_class_async", exc, is_async=True)
+
+        async def run():
+            await fc.create(**self.KWARGS)
+        with self.assertRaises(ProviderRefused) as raised:
+            asyncio.run(run())
+        self.assertIs(raised.exception, exc)
+        self._check(self._span(), exc)
+
+    def test_anthropic_sync_and_async(self):
+        for patcher, is_async in (("_patch_anthropic_class_sync", False), ("_patch_anthropic_class_async", True)):
+            with self.subTest(patcher=patcher):
+                self.captured.clear()
+                exc = ProviderRefused("connection refused")
+                fm = self._patched_class(patcher, exc, is_async)
+                kwargs = {**self.KWARGS, "model": "claude-sonnet-4-5", "max_tokens": 64}
+                if is_async:
+                    async def run():
+                        await fm.create(**kwargs)
+                    with self.assertRaises(ProviderRefused):
+                        asyncio.run(run())
+                else:
+                    with self.assertRaises(ProviderRefused):
+                        fm.create(**kwargs)
+                span = self._span()
+                self._check(span, exc, model="claude-sonnet-4-5")
+                self.assertEqual(span.attributes.get("gen_ai.request.max_tokens"), 64)
+
+    def test_explicit_client_patchers(self):
+        from evalkit.instrumentation.llm.anthropic import patch_anthropic
+        from evalkit.instrumentation.llm.anthropic_async import patch_async_anthropic
+        from evalkit.instrumentation.llm.openai import patch_openai
+        from evalkit.instrumentation.llm.openai_async import patch_async_openai
+        from evalkit.instrumentation.llm.vertex_ai import patch_anthropic_vertex
+
+        cases = (
+            ("openai", patch_openai, False, "chat"),
+            ("openai_async", patch_async_openai, True, "chat"),
+            ("anthropic", patch_anthropic, False, "messages"),
+            ("anthropic_async", patch_async_anthropic, True, "messages"),
+            ("anthropic_vertex", patch_anthropic_vertex, False, "messages"),
+        )
+        for name, patcher, is_async, shape in cases:
+            with self.subTest(name):
+                self.captured.clear()
+                exc = ProviderRefused("connection refused")
+                api = types.SimpleNamespace(create=_raising(exc, is_async), stream=None)
+                fake = (types.SimpleNamespace(chat=types.SimpleNamespace(completions=api)) if shape == "chat"
+                        else types.SimpleNamespace(messages=api))
+                patcher(self.client, fake)
+                raised = self._call(api.create, is_async)
+                self.assertIsInstance(raised, ProviderRefused)
+                span = self._span()
+                self.assertEqual(span.status, "ERROR")
+                self.assertEqual(span.model, "gpt-4o-mini")
+                self.assertIs(span.attributes.get("gen_ai.streaming"), True)
+                self.assertIn("gen_ai.request.body", span.attributes, "the request is recorded, as on the non-stream path")
+                self.assertEqual(span.attributes.get("exception.type"), "ProviderRefused")
+
+    def test_litellm_sync_and_async(self):
+        from evalkit.instrumentation.llm import litellm as ek_litellm
+
+        for is_async in (False, True):
+            with self.subTest(is_async=is_async):
+                self.captured.clear()
+                exc = ProviderRefused("connection refused")
+                fake = types.SimpleNamespace(
+                    completion=_raising(exc), acompletion=_raising(exc, is_async=True),
+                )
+                ek_litellm._patch_sync(self.client, fake)
+                ek_litellm._patch_async(self.client, fake)
+                raised = self._call(fake.acompletion if is_async else fake.completion, is_async)
+                self.assertIs(raised, exc)
+                span = self._span()
+                self.assertEqual(span.status, "ERROR")
+                self.assertEqual(span.operation, "litellm.acompletion" if is_async else "litellm.completion")
+                self.assertEqual(span.attributes.get("exception.type"), "ProviderRefused")
+
+    def test_real_clients_with_a_refused_connection(self):
+        """The provider SDKs themselves, pointed at a closed local port: no request leaves the machine."""
+        import anthropic
+        import openai
+
+        oai = openai.OpenAI(base_url="http://127.0.0.1:1/v1", api_key="sk-test-not-a-real-key-000000", max_retries=0)
+        ant = anthropic.Anthropic(base_url="http://127.0.0.1:1", api_key="sk-ant-test", max_retries=0)
+        with self.assertRaises(openai.APIConnectionError):
+            oai.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": "hi"}], stream=True)
+        with self.assertRaises(anthropic.APIConnectionError):
+            ant.messages.create(model="claude-sonnet-4-5", max_tokens=8, messages=[{"role": "user", "content": "hi"}],
+                                stream=True)
+        self.client.flush()
+        spans = sorted((e.operation, e.model, e.status) for e in self.captured if e.span_type == "llm_call")
+        self.assertEqual(spans, [
+            ("chat.completions.create", "gpt-4o-mini", "ERROR"),
+            ("messages.create", "claude-sonnet-4-5", "ERROR"),
+        ])
+
+
 if __name__ == "__main__":
     unittest.main()

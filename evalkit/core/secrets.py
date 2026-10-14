@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import json
 import re
 from typing import Any, Optional
@@ -22,23 +23,67 @@ SECRET_TOKEN_KEY_RE = re.compile(r"(?:^|[._-])token$", re.IGNORECASE)
 # Keys that end in "token" because they measure or price tokens rather than hold
 # one: OpenTelemetry's gen_ai.server.time_to_first_token and
 # gen_ai.server.time_per_output_token on bridged spans, and per-token prices such
-# as input_cost_per_token. Masking them blanks out time-to-first-token and cost
-# and protects nothing, since no credential is named "to first token" or
-# "per ... token".
+# as input_cost_per_token, input_cost_per_audio_token and
+# output_cost_per_reasoning_token in LiteLLM's price sheet. A price says so before
+# "per" (cost_per_..., price_per_...); a bare "per" is followed only by the kinds of
+# token a model is billed for. Masking them blanks out time-to-first-token and cost
+# and protects nothing. A per-something token outside those kinds (per_user_token)
+# could hold a credential and is still masked. The TypeScript SDK decides by the same
+# rule, so a key masks alike from either SDK.
 TELEMETRY_TOKEN_KEY_RE = re.compile(
-    r"(?:^|[._-])(?:to[._-]first|per(?:[._-](?:input|output|prompt|completion|generated))?)[._-]token$",
+    r"(?:^|[._-])(?:"
+    r"to[._-]first"
+    r"|(?:cost|price)[._-]per(?:[._-][a-z0-9]+)*"
+    r"|per(?:[._-](?:input|output|prompt|completion|generated|audio|text|image|video|cached|cache|read|write"
+    r"|creation|reasoning|thinking|tool|character))*"
+    r")[._-]token$",
     re.IGNORECASE,
 )
 
 SECRET_QUERY_KEY_RE = re.compile(r"(?:^|[._-])(key|sig|signature)$", re.IGNORECASE)
 
+# The vocabulary in an assignment such as api_key='...' or "password": "...", searched for by the
+# word itself so that scanning a long payload costs one pass; the full name is read back from the
+# text before the match and decided by is_secret_key, so tokens= and max_tokens: stay untouched.
+_ASSIGNED_SECRET_RE = re.compile(
+    r"(?P<word>key|secret|passw(?:or)?d|token|credentials?|authorization|cookie)"
+    r"(?P<name_quote>['\"]?)\s*[=:]\s*"
+    r"(?P<quote>['\"])(?P<value>(?:[^'\"\\\n]|\\.){1,1024})(?P=quote)",
+    re.IGNORECASE,
+)
+
+_NAME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-")
+
+
+def _mask_assigned_secret(match: "re.Match[str]") -> str:
+    text, start = match.string, match.start()
+    begin = start
+    while begin > 0 and start - begin < 64 and text[begin - 1] in _NAME_CHARS:
+        begin -= 1
+    if not is_secret_key(text[begin:start] + match.group("word")):
+        return match.group(0)
+    quote = match.group("quote")
+    return match.group(0)[: match.start("value") - start] + MASK + quote
+
+
 SECRET_PATTERNS = (
+    # A whole PEM private key, or what is left of one when the text was cut inside it.
+    (re.compile(
+        r"-----BEGIN[A-Z ]*PRIVATE KEY-----.*?(?:-----END[A-Z ]*PRIVATE KEY-----|\Z)", re.DOTALL,
+    ), MASK),
     (re.compile(r"tk_live_[0-9a-f]{8,}"), "tk_live_" + MASK),
     (re.compile(r"tk_test_[0-9a-f]{8,}"), "tk_test_" + MASK),
     (re.compile(r"sk-[A-Za-z0-9_-]{16,}"), "sk-" + MASK),
+    # A JSON Web Token: three base64url segments, the first two encoding JSON objects.
+    (re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), MASK),
     (re.compile(r"(Bearer)\s+[A-Za-z0-9._~+/=-]{8,}", re.IGNORECASE), r"\1 " + MASK),
     (re.compile(r"AKIA[0-9A-Z]{16}"), "AKIA" + MASK),
     (re.compile(r"ghp_[A-Za-z0-9]{20,}"), "ghp_" + MASK),
+    # Google API keys (Gemini, Maps, Firebase).
+    (re.compile(r"AIza[0-9A-Za-z_-]{30,}"), "AIza" + MASK),
+    # The userinfo of a URL or DSN written into free text: postgres://user:pass@host, https://key@host.
+    (re.compile(r"\b([A-Za-z][A-Za-z0-9+.-]{1,30}://)[^\s/?#@'\"<>]+@"), r"\1" + MASK + "@"),
+    (_ASSIGNED_SECRET_RE, _mask_assigned_secret),
 )
 
 HEADER_ATTRIBUTES = frozenset({"http.request.headers", "http.response.headers"})
@@ -51,13 +96,56 @@ URL_RE = re.compile(r"^(?:https?|wss?)://\S+$", re.IGNORECASE)
 
 _MAX_DEPTH = 12
 
+_CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_FLAG_WORDS = frozenset({"has", "is", "needs", "requires", "uses", "use", "with", "no", "supports", "missing"})
 
-def is_secret_key(key: str, header_like: bool = False) -> bool:
+
+def _is_secret_spelling(key: str) -> bool:
     if SECRET_KEY_RE.search(key):
         return True
-    if SECRET_TOKEN_KEY_RE.search(key) and not TELEMETRY_TOKEN_KEY_RE.search(key):
+    return bool(SECRET_TOKEN_KEY_RE.search(key) and not TELEMETRY_TOKEN_KEY_RE.search(key))
+
+
+def is_secret_key(key: str, header_like: bool = False) -> bool:
+    if _is_secret_spelling(key):
         return True
+    # camelCase keys (accessToken, secretKey, authToken) split at their capitals, so they match
+    # by segment as their snake_case spellings do; maxTokens and inputCostPerAudioToken stay exempt,
+    # and so does a flag about a token (hasToken, isTokenValid), which holds a yes or no, not a token.
+    split = _CAMEL_BOUNDARY_RE.sub("_", key)
+    if split != key:
+        if SECRET_KEY_RE.search(split):
+            return True
+        if (SECRET_TOKEN_KEY_RE.search(split) and not TELEMETRY_TOKEN_KEY_RE.search(split)
+                and split.split("_", 1)[0].lower() not in _FLAG_WORDS):
+            return True
     return bool(header_like and SENSITIVE_RE.match(key))
+
+
+# Words that make a parameter or function name a credential's wherever they stand in it: a
+# parameter is a single variable, so key, auth or dsn in its name is enough to withhold its value.
+_SECRET_NAME_WORDS = frozenset({
+    "key", "keys", "apikey", "secret", "secrets", "password", "passwords", "passwd", "pwd", "passphrase",
+    "credential", "credentials", "creds", "auth", "oauth", "authorization", "authenticate",
+    "authentication", "cookie", "cookies", "bearer", "jwt", "dsn",
+})
+
+_NAME_WORD_RE = re.compile(r"[a-z]+|[A-Z][a-z]*|[0-9]+")
+
+
+
+@functools.lru_cache(maxsize=4096)
+def is_secret_name(name: str) -> bool:
+    """Whether a parameter, keyword or function name says its value is a credential.
+
+    Broader than is_secret_key, which decides span attribute and payload keys: a parameter
+    named key, auth or dsn holds nothing else, while a payload key named key often does.
+    """
+    if not name:
+        return False
+    if is_secret_key(name):
+        return True
+    return any(word.lower() in _SECRET_NAME_WORDS for word in _NAME_WORD_RE.findall(name))
 
 
 def is_secret_query_key(key: str) -> bool:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ._common import start_db
+from ._common import orm_records_statement, start_db
 
 
 def patch_pymysql(client: Any) -> None:
@@ -18,6 +18,8 @@ def patch_pymysql(client: Any) -> None:
         return
 
     def traced(self: Any, query: Any, args: Any = None) -> Any:
+        if orm_records_statement():
+            return orig(self, query, args)
         end = start_db(client, "mysql", statement=str(query))
         try:
             r = orig(self, query, args)

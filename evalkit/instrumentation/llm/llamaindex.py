@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from ..._version import SDK_VERSION
 from ...core.client import _new_span_id, _now_iso
-from ...core.context import current_span_ctx, get_or_create_ambient_trace_id
+from ...core.context import _llm_call_owner, current_span_ctx, get_or_create_ambient_trace_id
 from ...core.types import TraceEnvelope
 from ._bodies import _dump, _safe_body
 
@@ -123,6 +123,7 @@ class _Tracker:
     def __init__(self, client: "EvalKitClient") -> None:
         self.client = client
         self._spans: Dict[str, Dict[str, Any]] = {}
+        self._pending: List[str] = []
         self._lock = Lock()
 
     def on_span_enter(self, id_: str, parent_id: Optional[str], instance: Any = None) -> None:
@@ -163,6 +164,7 @@ class _Tracker:
                 provider = _provider_from_class_name(cls_name)
 
             self._spans[id_] = {
+                "key": id_,
                 "parent_id": parent_id,
                 "span_id": _new_span_id(),
                 "parent_span_id": parent_span_id,
@@ -184,25 +186,97 @@ class _Tracker:
 
     def on_span_exit(self, id_: str) -> None:
         with self._lock:
-            rec = self._spans.pop(id_, None)
-        if rec is None or not rec.get("span_type"):
+            rec = self._spans.get(id_)
+            if rec is None:
+                return
+            # A streamed chat leaves its span as soon as the generator is handed back; the request
+            # itself, and LlamaIndex's end event, come while the caller reads it. The span is sent
+            # when the provider's record of that request or the end event arrives.
+            streaming = rec.get("model_call") and not rec.get("ended") and not rec.get("absorbed")
+            if streaming:
+                rec["exited"] = True
+                self._pending.append(id_)
+                while len(self._pending) > _MAX_PENDING_STREAMS:
+                    self._spans.pop(self._pending.pop(0), None)
+                return
+            self._spans.pop(id_, None)
+        self._release_model_call(rec)
+        if not rec.get("span_type"):
             return
         try:
             self._emit(rec, "OK")
         except Exception as exc:
             _log.debug("[evalkit] llama_index span exit failed: %s", exc)
 
+    def _finish_stream(self, rec: Dict[str, Any], span_key: Optional[str]) -> None:
+        with self._lock:
+            if rec.get("emitted") or not rec.get("exited"):
+                return
+            if span_key is not None:
+                self._spans.pop(span_key, None)
+                if span_key in self._pending:
+                    self._pending.remove(span_key)
+        self._release_model_call(rec)
+        try:
+            self._emit(rec, "OK")
+        except Exception as exc:
+            _log.debug("[evalkit] llama_index stream end failed: %s", exc)
+
     def on_span_drop(self, id_: str, err: Any) -> None:
         with self._lock:
             rec = self._spans.pop(id_, None)
-        if rec is None or not rec.get("span_type"):
+        if rec is None:
+            return
+        self._release_model_call(rec)
+        if not rec.get("span_type"):
             return
         try:
             self._emit(rec, "ERROR", status_message=str(err) if err else None)
         except Exception as exc:
             _log.debug("[evalkit] llama_index span drop failed: %s", exc)
 
+    def _own_model_call(self, rec: Dict[str, Any]) -> None:
+        """While this LLM span runs, take the SDK's record of the provider request it makes.
+
+        The provider's own instrumentation (the OpenAI or Anthropic patch) records the request with
+        its exact tokens, cache counts and timing; LlamaIndex reports the same call again. The call
+        goes out once, as the provider's span with this span's framework attributes and place in
+        the tree.
+        """
+        def absorb(envelope: TraceEnvelope) -> bool:
+            with self._lock:
+                if rec.get("absorbed") is not None or rec.get("emitted"):
+                    return False
+                rec["absorbed"] = envelope
+                exited = rec.get("exited")
+            if exited:
+                self._finish_stream(rec, rec.get("key"))
+            return True
+
+        rec["model_call"] = True
+        try:
+            rec["owner_token"] = _llm_call_owner.set(absorb)
+        except Exception:
+            pass
+
+    def _release_model_call(self, rec: Dict[str, Any]) -> None:
+        token = rec.pop("owner_token", None)
+        if token is None:
+            return
+        try:
+            _llm_call_owner.reset(token)
+        except Exception:
+            # Ended in another context than the one it started in; the owner left there refuses
+            # every envelope once this span is emitted.
+            pass
+
     def _emit(self, rec: Dict[str, Any], status: str, status_message: Optional[str] = None) -> None:
+        with self._lock:
+            rec["emitted"] = True
+            absorbed = rec.get("absorbed")
+        if absorbed is not None:
+            self._emit_provider_call(rec, absorbed, status, status_message)
+            return
         end_iso = _now_iso()
         latency = int(time.time() * 1000 - rec["start_ms"])
         attrs = {**self.client._meta_attrs(), **rec["attrs"]}
@@ -235,6 +309,21 @@ class _Tracker:
             sdk_version=SDK_VERSION,
         ))
 
+    def _emit_provider_call(
+        self, rec: Dict[str, Any], envelope: TraceEnvelope, status: str, status_message: Optional[str],
+    ) -> None:
+        attrs = dict(envelope.attributes or {})
+        for key, value in rec["attrs"].items():
+            if key == "evalkit.framework" or key.startswith("llama_index."):
+                attrs.setdefault(key, value)
+        envelope.attributes = attrs
+        if rec.get("parent_span_id") and rec.get("trace_id") == envelope.trace_id:
+            envelope.parent_span_id = rec["parent_span_id"]
+        if status == "ERROR" and envelope.status != "ERROR":
+            envelope.status = "ERROR"
+            envelope.status_message = status_message or envelope.status_message
+        self.client.enqueue(envelope)
+
     def on_event(self, event: Any) -> None:
         try:
             name = event.class_name()
@@ -248,6 +337,10 @@ class _Tracker:
                 handler(self, event)
             except Exception as exc:
                 _log.debug("[evalkit] llama_index event handling failed (%s): %s", name, exc)
+            rec = self._spans.get(getattr(event, "span_id", None) or "")
+            done = rec is not None and rec.get("ended") and rec.get("exited") and not rec.get("emitted")
+        if done:
+            self._finish_stream(rec, rec.get("key"))
 
     def _on_llm_chat_start(self, event: Any) -> None:
         rec = self._spans.get(event.span_id)
@@ -256,6 +349,7 @@ class _Tracker:
         model = _model_from_dict(getattr(event, "model_dict", None))
         rec["span_type"] = "llm_call"
         rec["operation"] = "chat"
+        self._own_model_call(rec)
         if model:
             rec["model"] = model
         rec["prompt"] = _messages_to_prompt(getattr(event, "messages", None))
@@ -267,6 +361,7 @@ class _Tracker:
         rec = self._spans.get(event.span_id)
         if rec is None:
             return
+        rec["ended"] = True
         resp = getattr(event, "response", None)
         if resp is None:
             return
@@ -288,6 +383,7 @@ class _Tracker:
         model = _model_from_dict(getattr(event, "model_dict", None))
         rec["span_type"] = "llm_call"
         rec["operation"] = "complete"
+        self._own_model_call(rec)
         if model:
             rec["model"] = model
         rec["prompt"] = _truncate(getattr(event, "prompt", "") or "")
@@ -302,6 +398,7 @@ class _Tracker:
         rec = self._spans.get(event.span_id)
         if rec is None:
             return
+        rec["ended"] = True
         resp = getattr(event, "response", None)
         if resp is None:
             return
@@ -406,6 +503,10 @@ class _Tracker:
 
     _EVENT_HANDLERS: Dict[str, Any] = {}
 
+
+# Streamed chats whose span was left before their request ended; a stream the caller abandons with
+# no request recorded never ends, so only this many are kept waiting.
+_MAX_PENDING_STREAMS = 256
 
 _Tracker._EVENT_HANDLERS = {
     "LLMChatStartEvent": _Tracker._on_llm_chat_start,

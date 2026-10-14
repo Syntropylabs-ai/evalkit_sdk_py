@@ -721,6 +721,84 @@ class ORespResult:
         self.id = "resp_test"
 
 
+def responses_sse(text_parts=("Order 1001 ", "shipped."), tool=None, end="response.completed", cut_after=None,
+                  reasoning=None):
+    """The server-sent events of one OpenAI Responses stream, as the API writes them.
+
+    `tool` is (name, arguments) for a function call after the message. `reasoning` is a summary
+    streamed before the message, as a reasoning model sends it. `end` is the closing event:
+    response.completed, response.failed or error. `cut_after` stops after that many events, as a
+    stream that is cut off does.
+    """
+    base = {"id": "resp_local", "object": "response", "created_at": 0, "model": "gpt-4o-mini-2024-07-18",
+            "status": "in_progress", "output": [], "parallel_tool_calls": True, "tool_choice": "auto",
+            "tools": [], "error": None, "incomplete_details": None, "instructions": None, "metadata": {},
+            "temperature": 1.0, "top_p": 1.0, "text": {"format": {"type": "text"}}, "usage": None}
+    text = "".join(text_parts)
+    message = {"id": "msg_local", "type": "message", "status": "in_progress", "role": "assistant", "content": []}
+    done_message = {**message, "status": "completed",
+                    "content": [{"type": "output_text", "text": text, "annotations": []}]}
+    where = {"item_id": "msg_local", "output_index": 0, "content_index": 0}
+    events = [
+        {"type": "response.created", "response": base},
+        {"type": "response.in_progress", "response": base},
+        {"type": "response.output_item.added", "output_index": 0, "item": message},
+        {"type": "response.content_part.added", **where, "part": {"type": "output_text", "text": "", "annotations": []}},
+        *({"type": "response.output_text.delta", **where, "delta": part, "logprobs": []} for part in text_parts),
+        {"type": "response.output_text.done", **where, "text": text, "logprobs": []},
+        {"type": "response.content_part.done", **where, "part": done_message["content"][0]},
+        {"type": "response.output_item.done", "output_index": 0, "item": done_message},
+    ]
+    output = [done_message]
+    if reasoning:
+        item = {"id": "rs_local", "type": "reasoning", "summary": []}
+        done_item = {**item, "summary": [{"type": "summary_text", "text": reasoning}]}
+        where_rs = {"item_id": "rs_local", "output_index": 0, "summary_index": 0}
+        events[2:2] = [
+            {"type": "response.output_item.added", "output_index": 0, "item": item},
+            {"type": "response.reasoning_summary_part.added", **where_rs, "part": {"type": "summary_text", "text": ""}},
+            {"type": "response.reasoning_summary_text.delta", **where_rs, "delta": reasoning},
+            {"type": "response.reasoning_summary_text.done", **where_rs, "text": reasoning},
+            {"type": "response.reasoning_summary_part.done", **where_rs, "part": done_item["summary"][0]},
+            {"type": "response.output_item.done", "output_index": 0, "item": done_item},
+        ]
+        for event in events[8:]:
+            if "output_index" in event:
+                event["output_index"] = 1
+        output.insert(0, done_item)
+    if tool:
+        name, arguments = tool
+        call = {"id": "fc_local", "type": "function_call", "call_id": "call_local", "name": name,
+                "arguments": "", "status": "in_progress"}
+        half = len(arguments) // 2
+        done_call = {**call, "arguments": arguments, "status": "completed"}
+        events += [
+            {"type": "response.output_item.added", "output_index": len(output), "item": call},
+            {"type": "response.function_call_arguments.delta", "item_id": "fc_local", "output_index": len(output),
+             "delta": arguments[:half]},
+            {"type": "response.function_call_arguments.delta", "item_id": "fc_local", "output_index": len(output),
+             "delta": arguments[half:]},
+            {"type": "response.function_call_arguments.done", "item_id": "fc_local", "output_index": len(output),
+             "arguments": arguments},
+            {"type": "response.output_item.done", "output_index": len(output), "item": done_call},
+        ]
+        output.append(done_call)
+    usage = {"input_tokens": 21, "input_tokens_details": {"cached_tokens": 4}, "output_tokens": 7,
+             "output_tokens_details": {"reasoning_tokens": 2}, "total_tokens": 28}
+    if end == "response.completed":
+        events.append({"type": end, "response": {**base, "status": "completed", "output": output, "usage": usage}})
+    elif end == "response.failed":
+        events.append({"type": end, "response": {**base, "status": "failed", "output": output, "usage": usage,
+                                                 "error": {"code": "server_error", "message": "the model crashed"}}})
+    elif end == "error":
+        events.append({"type": "error", "code": "server_error", "message": "stream broke", "param": None})
+    if cut_after is not None:
+        events = events[:cut_after]
+    for number, event in enumerate(events):
+        event["sequence_number"] = number
+    return "".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events)
+
+
 class LLMUsage:
     def __init__(self, pin=7, pout=12):
         self.prompt_tokens = pin

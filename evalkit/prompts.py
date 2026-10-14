@@ -19,6 +19,16 @@ _cache: Dict[Tuple[str, Optional[str], Optional[int]], Tuple[float, "Prompt"]] =
 _cache_lock = threading.Lock()
 
 
+def _reset_lock_after_fork() -> None:
+    # A lock another thread held at the fork stays held in the child.
+    global _cache_lock
+    _cache_lock = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_lock_after_fork)
+
+
 def _render_value(value: Any) -> str:
     if isinstance(value, str):
         return value

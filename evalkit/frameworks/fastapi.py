@@ -8,6 +8,8 @@ from ..core.context import SpanContext, _current_span, reset_identity, set_ident
 from ..core.otel_provider import claim_framework_server_span, release_framework_server_span
 from ..utils.headers import parse_traceparent, sanitize_headers
 from ._identity import user_id_of
+from ._lifespan import flush_before_shutdown_reply
+from ._probe import answer_probe_untraced, is_probe
 
 _BODY_MAX = 10 * 1024 * 1024
 
@@ -100,10 +102,36 @@ class EvalKitMiddleware:
         import evalkit as _ek
         return _ek._get_instance()
 
+    async def _lifespan(self, scope: Any, receive: Callable, send: Callable) -> None:
+        # The server ends the worker soon after the app reports its shutdown complete, and uvicorn
+        # then re-raises the signal that stopped it, which ends the process without atexit. The
+        # queue, with what the app's own shutdown handlers recorded, goes out before that report.
+        try:
+            send = flush_before_shutdown_reply(send, lambda: [self._get_client()])
+        except Exception:
+            pass
+        await self._app(scope, receive, send)
+
+    async def _answer_probe(self, scope: Any, receive: Callable, send: Callable) -> None:
+        # A framework that traces requests itself opened the probe's server span before this
+        # middleware ran; claimed and never handed back, it is dropped at export with its inner spans.
+        try:
+            if _current_span.get() is None:
+                claim_framework_server_span()
+        except Exception:
+            pass
+        await answer_probe_untraced(self._app, scope, receive, send)
+
     async def __call__(self, scope: Any, receive: Callable, send: Callable) -> None:
         global _BODY_MAX
+        if scope["type"] == "lifespan":
+            await self._lifespan(scope, receive, send)
+            return
         if scope["type"] not in ("http",):
             await self._app(scope, receive, send)
+            return
+        if is_probe(scope.get("path")):
+            await self._answer_probe(scope, receive, send)
             return
 
         try:

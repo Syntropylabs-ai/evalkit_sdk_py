@@ -218,6 +218,11 @@ def init(
     )
     set_capture_sensitive_headers(opts.capture_secrets)
     _instance = EvalKitClient(opts)
+    try:
+        from .core.client import flush_on_termination_signals
+        flush_on_termination_signals(_instance)
+    except Exception:
+        pass
 
     try:
         from .core.otel_provider import setup_otel
@@ -266,8 +271,17 @@ def auto_instrument(
     setup_auto_instrumentation(_get_instance(), logging=logging, requests=requests, httpx=httpx)
 
 
-def flush() -> None:
-    _get_instance().flush()
+def flush() -> bool:
+    """Send what is queued now; whether the receiver took all of it.
+
+    Shutdown hooks, test teardown and exit paths call this whether or not `init()` ran, so before it
+    there is nothing to send and the answer is False; it never raises.
+    """
+    try:
+        instance = _instance
+        return bool(instance.flush()) if instance is not None else False
+    except Exception:
+        return False
 
 
 def current_trace_id() -> str:

@@ -6,8 +6,22 @@ from typing import Any, Callable
 from ..core.client import EvalKitClient
 from ..core.context import _current_span
 from ..utils.headers import parse_traceparent, sanitize_headers
+from ._lifespan import flush_on_lifespan_shutdown, register_client, registered_clients
+from ._probe import answer_probe_untraced, is_probe
 
 _BODY_MAX = 10 * 1024 * 1024
+
+
+def _flush_on_litestar_shutdown(client: "EvalKitClient | None") -> None:
+    # Litestar answers the lifespan scope in its own __call__, before any middleware, so the flush
+    # the worker needs before reporting its shutdown complete is made on the application class.
+    register_client(client)
+    try:
+        from litestar import Litestar
+
+        flush_on_lifespan_shutdown(Litestar, registered_clients)
+    except Exception:
+        pass
 
 
 def create_litestar_middleware(client: "EvalKitClient | None" = None) -> Any:
@@ -15,6 +29,7 @@ def create_litestar_middleware(client: "EvalKitClient | None" = None) -> Any:
         from litestar.middleware.base import AbstractMiddleware
     except ImportError:
         raise RuntimeError("Litestar is not installed. pip install litestar")
+    _flush_on_litestar_shutdown(client)
 
     def _get_client() -> EvalKitClient:
         if client is not None:
@@ -26,6 +41,9 @@ def create_litestar_middleware(client: "EvalKitClient | None" = None) -> Any:
         async def __call__(self, scope: Any, receive: Callable, send: Callable) -> None:
             if scope.get("type") != "http":
                 await self.app(scope, receive, send)
+                return
+            if is_probe(scope.get("path")):
+                await answer_probe_untraced(self.app, scope, receive, send)
                 return
 
             ek = _get_client()

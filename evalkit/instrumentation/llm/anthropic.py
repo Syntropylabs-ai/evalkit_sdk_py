@@ -7,7 +7,14 @@ from ..._version import SDK_VERSION
 from ...core.client import EvalKitClient, _new_span_id, _now_iso
 from ...core.context import SpanContext, _current_span, child_span_ctx, current_span_ctx, get_or_create_ambient_trace_id
 from ...core.types import SpanEvent, TraceEnvelope
-from .._streaming import _StreamState, _SyncStreamTracer, stream_response_attrs, stream_tool_events
+from .._streaming import (
+    _StreamState,
+    record_stream_open_failure,
+    stream_response_attrs,
+    stream_tool_events,
+    trace_sync_stream,
+)
+from .._safe import field, hook_failed
 from .._toolcalls import from_anthropic_blocks
 from ._anthropic_stream import patch_messages_stream
 from ._bodies import _dump, _safe_body
@@ -29,20 +36,24 @@ def patch_anthropic(
     original_create = messages_api.create
 
     def traced_create(*args: Any, **kwargs: Any) -> Any:
-        ctx_parent = parent_ctx or current_span_ctx()
-        trace_id = ctx_parent.trace_id if ctx_parent else get_or_create_ambient_trace_id()
-        span_id = _new_span_id()
-        parent_span_id = ctx_parent.span_id if ctx_parent else None
-        start_ms = time.time() * 1000
-        ts = _now_iso()
+        try:
+            ctx_parent = parent_ctx or current_span_ctx()
+            trace_id = ctx_parent.trace_id if ctx_parent else get_or_create_ambient_trace_id()
+            span_id = _new_span_id()
+            parent_span_id = ctx_parent.span_id if ctx_parent else None
+            start_ms = time.time() * 1000
+            ts = _now_iso()
 
-        model = kwargs.get("model", "unknown")
-        system = kwargs.get("system")
-        messages = kwargs.get("messages", [])
-        temperature = kwargs.get("temperature")
-        max_tokens = kwargs.get("max_tokens")
-        prompt_text = _build_prompt(system, messages)[:_PROMPT_MAX]
-        request_body = _safe_body(_dump(kwargs))
+            model = kwargs.get("model", "unknown")
+            system = kwargs.get("system")
+            messages = kwargs.get("messages", [])
+            temperature = kwargs.get("temperature")
+            max_tokens = kwargs.get("max_tokens")
+            prompt_text = _build_prompt(system, messages)[:_PROMPT_MAX]
+            request_body = _safe_body(_dump(kwargs))
+        except Exception as exc:
+            hook_failed("messages.create", exc)
+            return original_create(*args, **kwargs)
 
         if kwargs.get("stream"):
             state = _StreamState(start_ms)
@@ -86,9 +97,13 @@ def patch_anthropic(
                     environment=client._opts.environment, app_version=client._opts.app_version,
                     sdk_version=SDK_VERSION,
                 ))
-            return _SyncStreamTracer(
-                original_create(*args, **kwargs), on_stream_done,
-                is_anthropic=True, start_ms=start_ms, state=state,
+            try:
+                raw = original_create(*args, **kwargs)
+            except Exception as exc:
+                record_stream_open_failure(on_stream_done, state, exc)
+                raise
+            return trace_sync_stream(
+                raw, on_stream_done, is_anthropic=True, start_ms=start_ms, state=state,
             )
 
         span_ctx = child_span_ctx(trace_id, span_id)
@@ -96,76 +111,82 @@ def patch_anthropic(
         try:
             result = original_create(*args, **kwargs)
         except Exception as e:
-            end_iso = _now_iso()
-            latency = int(time.time() * 1000 - start_ms)
-            client.enqueue(TraceEnvelope(
-                trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                span_type="llm_call", status="ERROR", status_message=str(e),
-                operation="messages.create",
-                service_name=client._opts.service_name, provider="anthropic", model=model,
-                prompt=prompt_text, latency_ms=latency, start_time=ts,
-                end_time=end_iso, created_at=ts,
-                attributes={**client._meta_attrs(), "gen_ai.request.model": model,
-                            **({"gen_ai.request.body": request_body} if request_body else {})},
-                environment=client._opts.environment, app_version=client._opts.app_version,
-                sdk_version=SDK_VERSION,
-            ))
+            try:
+                end_iso = _now_iso()
+                latency = int(time.time() * 1000 - start_ms)
+                client.enqueue(TraceEnvelope(
+                    trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
+                    span_type="llm_call", status="ERROR", status_message=str(e),
+                    operation="messages.create",
+                    service_name=client._opts.service_name, provider="anthropic", model=model,
+                    prompt=prompt_text, latency_ms=latency, start_time=ts,
+                    end_time=end_iso, created_at=ts,
+                    attributes={**client._meta_attrs(), "gen_ai.request.model": model,
+                                **({"gen_ai.request.body": request_body} if request_body else {})},
+                    environment=client._opts.environment, app_version=client._opts.app_version,
+                    sdk_version=SDK_VERSION,
+                ))
+            except Exception as hook_exc:
+                hook_failed("model call", hook_exc)
             raise
         finally:
             _current_span.reset(token)
+        try:
 
-        end_iso = _now_iso()
-        latency = int(time.time() * 1000 - start_ms)
+            end_iso = _now_iso()
+            latency = int(time.time() * 1000 - start_ms)
 
-        text_content = ""
-        thinking_text, has_redacted_thinking = _extract_thinking(getattr(result, "content", []))
-        for block in getattr(result, "content", []):
-            if getattr(block, "type", None) == "text":
-                text_content += getattr(block, "text", "")
-        events: List[SpanEvent] = from_anthropic_blocks(getattr(result, "content", []), end_iso)
+            text_content = ""
+            thinking_text, has_redacted_thinking = _extract_thinking(getattr(result, "content", []))
+            for block in getattr(result, "content", []):
+                if getattr(block, "type", None) == "text":
+                    text_content += getattr(block, "text", "")
+            events: List[SpanEvent] = from_anthropic_blocks(getattr(result, "content", []), end_iso)
 
-        usage = getattr(result, "usage", None)
-        tokens_out = getattr(usage, "output_tokens", 0) or 0
-        cache_read_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
-        cache_creation_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
-        tokens_in = (getattr(usage, "input_tokens", 0) or 0) + cache_read_tokens + cache_creation_tokens
+            usage = getattr(result, "usage", None)
+            tokens_out = getattr(usage, "output_tokens", 0) or 0
+            cache_read_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
+            cache_creation_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
+            tokens_in = (getattr(usage, "input_tokens", 0) or 0) + cache_read_tokens + cache_creation_tokens
 
-        attrs: Dict[str, Any] = {
-            **client._meta_attrs(),
-            "gen_ai.request.model": model,
-            "gen_ai.response.model": getattr(result, "model", model),
-            "gen_ai.response.id": getattr(result, "id", ""),
-        }
-        if temperature is not None:
-            attrs["gen_ai.request.temperature"] = temperature
-        if max_tokens is not None:
-            attrs["gen_ai.request.max_tokens"] = max_tokens
-        stop_reason = getattr(result, "stop_reason", None)
-        if stop_reason:
-            attrs["gen_ai.response.finish_reasons"] = [stop_reason]
-        if thinking_text:
-            attrs["gen_ai.response.thinking"] = thinking_text[:_COMPLETION_MAX]
-        if has_redacted_thinking:
-            attrs["gen_ai.response.has_redacted_thinking"] = True
-        if request_body:
-            attrs["gen_ai.request.body"] = request_body
-        response_body = _safe_body(_dump(result))
-        if response_body:
-            attrs["gen_ai.response.body"] = response_body
+            attrs: Dict[str, Any] = {
+                **client._meta_attrs(),
+                "gen_ai.request.model": model,
+                "gen_ai.response.model": getattr(result, "model", model),
+                "gen_ai.response.id": getattr(result, "id", ""),
+            }
+            if temperature is not None:
+                attrs["gen_ai.request.temperature"] = temperature
+            if max_tokens is not None:
+                attrs["gen_ai.request.max_tokens"] = max_tokens
+            stop_reason = getattr(result, "stop_reason", None)
+            if stop_reason:
+                attrs["gen_ai.response.finish_reasons"] = [stop_reason]
+            if thinking_text:
+                attrs["gen_ai.response.thinking"] = thinking_text[:_COMPLETION_MAX]
+            if has_redacted_thinking:
+                attrs["gen_ai.response.has_redacted_thinking"] = True
+            if request_body:
+                attrs["gen_ai.request.body"] = request_body
+            response_body = _safe_body(_dump(result))
+            if response_body:
+                attrs["gen_ai.response.body"] = response_body
 
-        client.enqueue(TraceEnvelope(
-            trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-            span_type="llm_call", status="OK",
-            operation="messages.create",
-            service_name=client._opts.service_name, provider="anthropic", model=model,
-            prompt=prompt_text, completion=text_content[:_COMPLETION_MAX],
-            tokens_in=tokens_in, tokens_out=tokens_out,
-            cache_read_tokens=cache_read_tokens or None, cache_creation_tokens=cache_creation_tokens or None,
-            latency_ms=latency, start_time=ts, end_time=end_iso, created_at=ts,
-            events=events or None, attributes=attrs,
-            environment=client._opts.environment, app_version=client._opts.app_version,
-            sdk_version=SDK_VERSION,
-        ))
+            client.enqueue(TraceEnvelope(
+                trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
+                span_type="llm_call", status="OK",
+                operation="messages.create",
+                service_name=client._opts.service_name, provider="anthropic", model=model,
+                prompt=prompt_text, completion=text_content[:_COMPLETION_MAX],
+                tokens_in=tokens_in, tokens_out=tokens_out,
+                cache_read_tokens=cache_read_tokens or None, cache_creation_tokens=cache_creation_tokens or None,
+                latency_ms=latency, start_time=ts, end_time=end_iso, created_at=ts,
+                events=events or None, attributes=attrs,
+                environment=client._opts.environment, app_version=client._opts.app_version,
+                sdk_version=SDK_VERSION,
+            ))
+        except Exception as exc:
+            hook_failed("model call", exc)
         return result
 
     traced_create._evalkit = True
@@ -190,9 +211,10 @@ def _build_prompt(system: Optional[str], messages: List[Dict[str, Any]]) -> str:
     parts: List[str] = []
     if system:
         parts.append(f"system: {system}")
-    for m in messages:
-        role = m.get("role", "") if isinstance(m, dict) else getattr(m, "role", "")
-        content = m.get("content", "") if isinstance(m, dict) else getattr(m, "content", "")
+    # Only a list or tuple is read: reading a generator here would leave nothing for the request.
+    for m in (messages if isinstance(messages, (list, tuple)) else ()):
+        role = field(m, "role", "") or ""
+        content = field(m, "content", "")
         if isinstance(content, list):
             content = " ".join(
                 (b.get("text", "") if isinstance(b, dict) else getattr(b, "text", ""))

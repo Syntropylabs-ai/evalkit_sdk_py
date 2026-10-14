@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import time
+from contextvars import ContextVar
 from typing import Any, Callable, Dict, Optional
 
 from ..._version import SDK_VERSION
@@ -10,6 +11,73 @@ from ...core.context import _current_span, current_span_ctx, get_or_create_ambie
 from ...core.types import TraceEnvelope
 
 _STMT_MAX = 2048
+
+# SQLAlchemy's execution context for the statement it is running on this thread or task, set by
+# watch_sqlalchemy_statements around each cursor execute.
+_orm_execution: ContextVar[Any] = ContextVar("evalkit_orm_execution", default=None)
+
+
+def orm_records_statement() -> bool:
+    """Whether the statement a driver is about to run is already recorded one level up.
+
+    SQLAlchemy's OpenTelemetry instrumentation (which init() registers when it creates the tracer
+    provider) and patch_sqlalchemy_engine each record a span per statement, so a driver span for
+    the same cursor call would show every query twice.
+    """
+    context = _orm_execution.get()
+    if context is None:
+        return False
+    try:
+        if getattr(context, "_otel_span", None) is not None:
+            return True
+        connection = getattr(context, "root_connection", None)
+        engine = getattr(connection, "engine", None) or getattr(context, "engine", None)
+        return bool(getattr(engine, "_evalkit_instrumented", False)) and current_span_ctx() is not None
+    except Exception:
+        return False
+
+
+def _release_orm_execution(context: Any) -> None:
+    token = getattr(context, "_evalkit_orm_token", None)
+    if token is None:
+        return
+    try:
+        _orm_execution.reset(token)
+    except Exception:
+        _orm_execution.set(None)
+
+
+def watch_sqlalchemy_statements() -> bool:
+    """Mark each SQLAlchemy cursor execute so the driver tracers can tell they run under it."""
+    try:
+        from sqlalchemy import event
+        from sqlalchemy.engine import Engine
+    except Exception:
+        return False
+    if getattr(Engine, "_evalkit_watched", False):
+        return True
+
+    def before(conn: Any, cursor: Any, statement: Any, parameters: Any, context: Any, executemany: Any) -> None:
+        try:
+            if context is not None:
+                context._evalkit_orm_token = _orm_execution.set(context)
+        except Exception:
+            pass
+
+    def after(conn: Any, cursor: Any, statement: Any, parameters: Any, context: Any, executemany: Any) -> None:
+        _release_orm_execution(context)
+
+    def on_error(exception_context: Any) -> None:
+        _release_orm_execution(getattr(exception_context, "execution_context", None))
+
+    try:
+        event.listen(Engine, "before_cursor_execute", before)
+        event.listen(Engine, "after_cursor_execute", after)
+        event.listen(Engine, "handle_error", on_error)
+        Engine._evalkit_watched = True
+    except Exception:
+        return False
+    return True
 
 
 def set_stmt_max(limit: Any) -> None:

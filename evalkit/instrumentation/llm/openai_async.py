@@ -8,12 +8,14 @@ from ...core.client import EvalKitClient, _new_span_id, _now_iso
 from ...core.context import SpanContext, _current_span, child_span_ctx, current_span_ctx, get_or_create_ambient_trace_id
 from ...core.types import SpanEvent, TraceEnvelope
 from .._streaming import (
-    _AsyncStreamTracer,
     _StreamState,
+    record_stream_open_failure,
     stream_response_attrs,
     stream_tool_events,
+    trace_async_stream,
     with_stream_usage_warning,
 )
+from .._safe import hook_failed
 from .._toolcalls import from_openai_chat
 from ._bodies import _dump, _safe_body
 from .openai import _messages_to_text
@@ -34,19 +36,23 @@ def patch_async_openai(
     original_create = completions.create
 
     async def traced_create(*args: Any, **kwargs: Any) -> Any:
-        ctx_parent = parent_ctx or current_span_ctx()
-        trace_id = ctx_parent.trace_id if ctx_parent else get_or_create_ambient_trace_id()
-        span_id = _new_span_id()
-        parent_span_id = ctx_parent.span_id if ctx_parent else None
-        start_ms = time.time() * 1000
-        ts = _now_iso()
+        try:
+            ctx_parent = parent_ctx or current_span_ctx()
+            trace_id = ctx_parent.trace_id if ctx_parent else get_or_create_ambient_trace_id()
+            span_id = _new_span_id()
+            parent_span_id = ctx_parent.span_id if ctx_parent else None
+            start_ms = time.time() * 1000
+            ts = _now_iso()
 
-        model = kwargs.get("model", "unknown")
-        messages = kwargs.get("messages", [])
-        temperature = kwargs.get("temperature")
-        max_tokens = kwargs.get("max_tokens")
-        prompt_text = _messages_to_text(messages)[:_PROMPT_MAX]
-        request_body = _safe_body(_dump(kwargs))
+            model = kwargs.get("model", "unknown")
+            messages = kwargs.get("messages", [])
+            temperature = kwargs.get("temperature")
+            max_tokens = kwargs.get("max_tokens")
+            prompt_text = _messages_to_text(messages)[:_PROMPT_MAX]
+            request_body = _safe_body(_dump(kwargs))
+        except Exception as exc:
+            hook_failed("chat.completions.create", exc)
+            return await original_create(*args, **kwargs)
 
         if kwargs.get("stream"):
             state = _StreamState(start_ms)
@@ -91,79 +97,89 @@ def patch_async_openai(
                     sdk_version=SDK_VERSION,
                 ))
             wrapped_done = with_stream_usage_warning(on_stream_done, kwargs)
-            raw = await original_create(*args, **kwargs)
-            return _AsyncStreamTracer(raw, wrapped_done, start_ms=start_ms, state=state)
+            try:
+                raw = await original_create(*args, **kwargs)
+            except Exception as exc:
+                record_stream_open_failure(on_stream_done, state, exc)
+                raise
+            return trace_async_stream(raw, wrapped_done, start_ms=start_ms, state=state)
 
         span_ctx = child_span_ctx(trace_id, span_id)
         token = _current_span.set(span_ctx)
         try:
             result = await original_create(*args, **kwargs)
         except Exception as exc:
-            end_ts = _now_iso()
-            latency = int(time.time() * 1000 - start_ms)
-            client.enqueue(TraceEnvelope(
-                trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                span_type="llm_call", status="ERROR", status_message=str(exc),
-                operation="chat.completions.create",
-                service_name=client._opts.service_name, provider="openai", model=model,
-                prompt=prompt_text, latency_ms=latency, start_time=ts, end_time=end_ts,
-                created_at=ts, attributes={**client._meta_attrs(), "gen_ai.request.model": model,
-                            **({"gen_ai.request.body": request_body} if request_body else {})},
-                environment=client._opts.environment, app_version=client._opts.app_version,
-                sdk_version=SDK_VERSION,
-            ))
+            try:
+                end_ts = _now_iso()
+                latency = int(time.time() * 1000 - start_ms)
+                client.enqueue(TraceEnvelope(
+                    trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
+                    span_type="llm_call", status="ERROR", status_message=str(exc),
+                    operation="chat.completions.create",
+                    service_name=client._opts.service_name, provider="openai", model=model,
+                    prompt=prompt_text, latency_ms=latency, start_time=ts, end_time=end_ts,
+                    created_at=ts, attributes={**client._meta_attrs(), "gen_ai.request.model": model,
+                                **({"gen_ai.request.body": request_body} if request_body else {})},
+                    environment=client._opts.environment, app_version=client._opts.app_version,
+                    sdk_version=SDK_VERSION,
+                ))
+            except Exception as hook_exc:
+                hook_failed("model call", hook_exc)
             raise
         finally:
             _current_span.reset(token)
+        try:
 
-        end_ts = _now_iso()
-        latency = int(time.time() * 1000 - start_ms)
-        choice = result.choices[0] if result.choices else None
-        completion = (choice.message.content or "") if choice else ""
-        usage = result.usage
-        tokens_in = getattr(usage, "prompt_tokens", 0) or 0
-        tokens_out = getattr(usage, "completion_tokens", 0) or 0
-        completion_details = getattr(usage, "completion_tokens_details", None)
-        reasoning_tokens = getattr(completion_details, "reasoning_tokens", 0) or 0
-        prompt_details = getattr(usage, "prompt_tokens_details", None)
-        cache_read_tokens = getattr(prompt_details, "cached_tokens", 0) or 0
+            end_ts = _now_iso()
+            latency = int(time.time() * 1000 - start_ms)
+            choice = result.choices[0] if result.choices else None
+            completion = (choice.message.content or "") if choice else ""
+            usage = result.usage
+            tokens_in = getattr(usage, "prompt_tokens", 0) or 0
+            tokens_out = getattr(usage, "completion_tokens", 0) or 0
+            completion_details = getattr(usage, "completion_tokens_details", None)
+            reasoning_tokens = getattr(completion_details, "reasoning_tokens", 0) or 0
+            prompt_details = getattr(usage, "prompt_tokens_details", None)
+            cache_read_tokens = getattr(prompt_details, "cached_tokens", 0) or 0
 
-        events: List[SpanEvent] = from_openai_chat(result, end_ts)
+            events: List[SpanEvent] = from_openai_chat(result, end_ts)
 
-        attrs: Dict[str, Any] = {
-            **client._meta_attrs(),
-            "gen_ai.request.model": model,
-            "gen_ai.response.model": getattr(result, "model", model),
-            "gen_ai.response.id": getattr(result, "id", ""),
-            "gen_ai.usage.total_tokens": getattr(usage, "total_tokens", 0) or 0,
-        }
-        if temperature is not None:
-            attrs["gen_ai.request.temperature"] = temperature
-        if max_tokens is not None:
-            attrs["gen_ai.request.max_tokens"] = max_tokens
-        if choice and getattr(choice, "finish_reason", None):
-            attrs["gen_ai.response.finish_reasons"] = [choice.finish_reason]
-        if reasoning_tokens:
-            attrs["gen_ai.usage.reasoning_tokens"] = reasoning_tokens
-        if request_body:
-            attrs["gen_ai.request.body"] = request_body
-        response_body = _safe_body(_dump(result))
-        if response_body:
-            attrs["gen_ai.response.body"] = response_body
+            attrs: Dict[str, Any] = {
+                **client._meta_attrs(),
+                "gen_ai.request.model": model,
+                "gen_ai.response.model": getattr(result, "model", model),
+                "gen_ai.response.id": getattr(result, "id", ""),
+                "gen_ai.usage.total_tokens": getattr(usage, "total_tokens", 0) or 0,
+            }
+            if temperature is not None:
+                attrs["gen_ai.request.temperature"] = temperature
+            if max_tokens is not None:
+                attrs["gen_ai.request.max_tokens"] = max_tokens
+            if choice and getattr(choice, "finish_reason", None):
+                attrs["gen_ai.response.finish_reasons"] = [choice.finish_reason]
+            if reasoning_tokens:
+                attrs["gen_ai.usage.reasoning_tokens"] = reasoning_tokens
+            if request_body:
+                attrs["gen_ai.request.body"] = request_body
+            response_body = _safe_body(_dump(result))
+            if response_body:
+                attrs["gen_ai.response.body"] = response_body
 
-        client.enqueue(TraceEnvelope(
-            trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-            span_type="llm_call", status="OK",
-            operation="chat.completions.create",
-            service_name=client._opts.service_name, provider="openai", model=model,
-            prompt=prompt_text, completion=completion[:_COMPLETION_MAX],
-            tokens_in=tokens_in, tokens_out=tokens_out,
-            cache_read_tokens=cache_read_tokens or None,
-            latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
-            events=events or None, attributes=attrs,
-            environment=client._opts.environment, app_version=client._opts.app_version,
-            sdk_version=SDK_VERSION,
-        ))
+            client.enqueue(TraceEnvelope(
+                trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
+                span_type="llm_call", status="OK",
+                operation="chat.completions.create",
+                service_name=client._opts.service_name, provider="openai", model=model,
+                prompt=prompt_text, completion=completion[:_COMPLETION_MAX],
+                tokens_in=tokens_in, tokens_out=tokens_out,
+                cache_read_tokens=cache_read_tokens or None,
+                latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
+                events=events or None, attributes=attrs,
+                environment=client._opts.environment, app_version=client._opts.app_version,
+                sdk_version=SDK_VERSION,
+            ))
+        except Exception as exc:
+            hook_failed("model call", exc)
         return result
 
     traced_create._evalkit = True

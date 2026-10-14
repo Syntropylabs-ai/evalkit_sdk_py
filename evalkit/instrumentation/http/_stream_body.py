@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import threading
 import time
 import weakref
@@ -7,8 +8,18 @@ from typing import Any, Callable, Dict, List, Optional
 
 _MAX_PENDING = 1024
 
-_pending_lock = threading.Lock()
+# Re-entrant, as a body finalised by the garbage collector can finish while this thread holds it.
+_pending_lock = threading.RLock()
 _pending: Dict[int, "_BodyCapture"] = {}
+
+
+def _reset_lock_after_fork() -> None:
+    global _pending_lock
+    _pending_lock = threading.RLock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_lock_after_fork)
 
 
 def _as_bytes(chunk: Any) -> bytes:

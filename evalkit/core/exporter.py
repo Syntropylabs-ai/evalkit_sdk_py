@@ -211,6 +211,12 @@ class _Exporter:
         self._max_request_bytes = MAX_REQUEST_BYTES
         self._max_request_spans = max(1, int(opts.max_export_batch_size or 1))
         self._halted = False
+        # Set while the process is about to end: no export may wait past it.
+        self.exit_deadline: Optional[float] = None
+
+    def after_fork_in_child(self) -> None:
+        # The export thread that held this lock in the parent does not exist in the child.
+        self._gzip_lock = threading.Lock()
 
     @property
     def halted(self) -> bool:
@@ -229,6 +235,8 @@ class _Exporter:
         if not spans:
             return True
         deadline = _clock() + _RETRY_BUDGET_S
+        if self.exit_deadline is not None:
+            deadline = min(deadline, self.exit_deadline)
         ok = True
         for group in _group(spans, self._max_request_bytes, self._max_request_spans):
             if self._disabled:
@@ -327,8 +335,11 @@ class _Exporter:
         retries = 0
         for attempt in range(max_retries + 1):
             retry_after: Optional[str] = None
+            # No single attempt outlives the export's deadline, so a receiver that never answers
+            # cannot hold a flush at exit for the full socket timeout.
+            timeout = min(10.0, max(0.05, deadline - _clock()))
             try:
-                with urllib.request.urlopen(req, timeout=10) as resp:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
                     return resp.status, _text(resp) if self._debug else ""
             except urllib.error.HTTPError as e:
                 if not _retryable(e.code):

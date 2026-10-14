@@ -3,8 +3,9 @@ from __future__ import annotations
 from typing import Any
 
 from ..core.client import EvalKitClient
-from ..core.context import _current_span
+from ..core.context import _current_span, end_suppression, suppress_tracing
 from ..utils.headers import parse_traceparent, sanitize_headers
+from ._probe import is_probe
 
 _BODY_MAX = 10 * 1024 * 1024
 
@@ -29,6 +30,9 @@ def instrument_flask(app: Any, client: EvalKitClient) -> None:
     @app.before_request
     def _evalkit_before() -> None:
         try:
+            if is_probe(flask_request.path):
+                g._ek_probe = suppress_tracing()
+                return
             upstream_trace_id, upstream_span_id = None, None
             tp_header = flask_request.headers.get("traceparent", "")
             if tp_header:
@@ -107,5 +111,11 @@ def instrument_flask(app: Any, client: EvalKitClient) -> None:
                 token = getattr(g, "_ek_token", None)
                 if token is not None:
                     _current_span.reset(token)
+            except Exception:
+                pass
+            try:
+                probe = getattr(g, "_ek_probe", None)
+                if probe is not None:
+                    end_suppression(*probe)
             except Exception:
                 pass

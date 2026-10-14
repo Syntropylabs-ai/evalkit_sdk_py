@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import sys
 from typing import Any, Callable
 
 from ..core.client import EvalKitClient
 from ..core.context import _current_span, reset_identity, set_identity
 from ..utils.headers import parse_traceparent
 from ._identity import user_id_of
+from ._lifespan import answer_lifespan_when_refused, registered_clients
+from ._probe import is_probe, probe_untraced
 
 _BODY_MAX = 10 * 1024 * 1024
 
@@ -59,10 +62,26 @@ def django_route(request: Any) -> "str | None":
     return route if route.startswith("/") else "/" + route
 
 
+def _flush_on_asgi_shutdown() -> None:
+    # Django's ASGI handler refuses the lifespan scope, so under uvicorn nothing of the application
+    # runs once the server starts stopping, and the worker ends without atexit. The handler is
+    # given a lifespan whose shutdown sends the queue. Under WSGI the ASGI handler is usually not
+    # imported at all, and then nothing is changed.
+    module = sys.modules.get("django.core.handlers.asgi")
+    handler = getattr(module, "ASGIHandler", None) if module is not None else None
+    if handler is None:
+        return
+    try:
+        answer_lifespan_when_refused(handler, registered_clients)
+    except Exception:
+        pass
+
+
 class EvalKitDjangoMiddleware:
     def __init__(self, get_response: Callable) -> None:
         self.get_response = get_response
         self._client: "EvalKitClient | None" = None
+        _flush_on_asgi_shutdown()
 
     def _get_client(self) -> EvalKitClient:
         if self._client is None:
@@ -72,6 +91,9 @@ class EvalKitDjangoMiddleware:
 
     def __call__(self, request: Any) -> Any:
         global _BODY_MAX
+        if is_probe(getattr(request, "path", None)):
+            with probe_untraced():
+                return self.get_response(request)
         identity_token = None
         try:
             client = self._get_client()

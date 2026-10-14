@@ -23,6 +23,80 @@ def _start_server():
     return srv
 
 
+class TestHealthCheckFilter(unittest.TestCase):
+    def test_probe_paths_are_skipped_by_whole_segment(self):
+        from evalkit.instrumentation.http._skip import should_skip
+
+        for url in ("http://svc/health", "http://svc/healthz", "http://svc/health/", "http://svc/health/live",
+                    "http://svc/health/ready", "http://svc/readyz", "http://svc/livez",
+                    "http://svc/actuator/health", "http://svc/actuator/health/liveness",
+                    "http://svc/api/v1/healthcheck?verbose=1", "https://svc:8443/HEALTHZ", "/health",
+                    b"http://svc/health", "http://api.example.com/v1/ingest"):
+            with self.subTest(url=url):
+                self.assertTrue(should_skip(url))
+
+    def test_an_apps_own_calls_are_recorded(self):
+        from evalkit.instrumentation.http._skip import should_skip
+
+        for url in ("http://svc/healthcare", "http://svc/api/health-records", "http://svc/healthcare/claims",
+                    "http://svc/patients/7/health/records", "http://svc/v1/orders?next=/health",
+                    "http://svc/wealth", "http://svc/", "http://svc", "not a url", None, 42):
+            with self.subTest(url=url):
+                self.assertFalse(should_skip(url))
+
+    def test_requests_records_a_path_that_only_starts_with_health(self):
+        try:
+            import requests
+        except ImportError:
+            self.skipTest("requests not installed")
+        reset_context()
+        captured = []
+        client = fresh(captured)
+        srv = _start_server()
+        port = srv.server_address[1]
+        try:
+            requests.get(f"http://127.0.0.1:{port}/healthcare")
+            requests.get(f"http://127.0.0.1:{port}/healthz")
+        finally:
+            srv.shutdown()
+        client.flush()
+        urls = [(e.attributes or {}).get("http.url", "") for e in captured if e.span_type == "http_call"]
+        self.assertTrue(any(u.endswith("/healthcare") for u in urls), urls)
+        self.assertFalse(any(u.endswith("/healthz") for u in urls), urls)
+
+
+class TestHttpx2(unittest.TestCase):
+    """httpx2, httpx's successor published as its own package, is traced like httpx."""
+
+    def test_httpx2_calls_are_recorded(self):
+        try:
+            import httpx2
+        except ImportError:
+            self.skipTest("httpx2 not installed")
+        from evalkit.instrumentation.http.httpx import patch_httpx
+
+        reset_context()
+        captured = []
+        client = fresh(captured)
+        self.assertIn("httpx2", patch_httpx(client))
+        srv = _start_server()
+        port = srv.server_address[1]
+        try:
+            self.assertEqual(httpx2.get(f"http://127.0.0.1:{port}/orders").status_code, 200)
+
+            async def run():
+                async with httpx2.AsyncClient() as ac:
+                    return (await ac.get(f"http://127.0.0.1:{port}/orders/async")).status_code
+
+            self.assertEqual(asyncio.run(run()), 200)
+        finally:
+            srv.shutdown()
+        client.flush()
+        urls = [(e.attributes or {}).get("http.url", "") for e in captured if e.span_type == "http_call"]
+        self.assertTrue(any(u.endswith("/orders") for u in urls), urls)
+        self.assertTrue(any(u.endswith("/orders/async") for u in urls), urls)
+
+
 class TestRequestsHTTP(unittest.TestCase):
     def setUp(self):
         reset_context()

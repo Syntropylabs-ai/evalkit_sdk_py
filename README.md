@@ -69,25 +69,41 @@ Spans wait in a queue. A background thread exports them in batches, and the queu
 - Agent frameworks: LangChain and LangGraph (through LangChain callbacks), LiteLLM, LlamaIndex, Google ADK, the Claude Agent SDK, and tool calls from MCP clients.
 - Vector stores: Pinecone, Qdrant, Chroma and Weaviate.
 - Voice: OpenAI audio and Realtime, ElevenLabs, AssemblyAI and Google GenAI Live.
-- HTTP: `requests`, `httpx` and `aiohttp`, with method, URL, status, latency, headers and bodies.
-- Databases: Redis, PyMongo (Motor included), asyncpg, psycopg 3 and PyMySQL, with query text and latency.
+- HTTP: `requests`, `httpx`, `httpx2` and `aiohttp`, with method, URL, status, latency, headers and bodies. Health and readiness probes (`/health`, `/healthz`, `/health/live`, `/readyz`, `/livez`) are left out, matched by whole path segment.
+- Databases: Redis, PyMongo (Motor included), asyncpg, psycopg 3, psycopg2 and PyMySQL, with query text and latency. psycopg2 also records each `connect()` as a `postgresql CONNECT` span, with `db.name`, `server.address` and `server.port`. A statement SQLAlchemy already records (through its OpenTelemetry instrumentation or `patch_sqlalchemy_engine`) is not recorded a second time by the driver underneath.
 - Logging: records from Python's `logging` module. See [Logging](#logging).
 - Your code: every public module-level function in your app's source tree, for application performance monitoring (APM). This is on by default. See [Trace your own code](#trace-your-own-code).
 
-A few cases need a call of their own, or are not covered:
+A few cases need a call of their own:
 
 - The Vertex AI SDK's `GenerativeModel` (from `vertexai`) is not patched automatically. Call `evalkit.patch_vertex_generative_model(model)` on each model.
 - SQLAlchemy is traced by its OpenTelemetry instrumentor when EvalKit creates the tracer provider. See [Spans from other OpenTelemetry instrumentors](#spans-from-other-opentelemetry-instrumentors). Otherwise, call `evalkit.patch_sqlalchemy_engine(engine)` or `evalkit.patch_async_sqlalchemy_engine(async_engine)`.
-- psycopg2 is not instrumented. psycopg 3 is.
-- OpenAI Responses calls made with the async client and `stream=True` are not traced.
 
 ### Logging
 
-`init()` adds a handler to the root logger. Each record that passes the root logger's level becomes a `log` span. The root level is `WARNING` unless your app changes it, so by default only warnings and errors are recorded.
+Each record that reaches the root logger becomes a `log` span, as if EvalKit had a handler there. It has none: `init()` changes no handler, formatter, filter or level, so your log output stays exactly as it was, `logging.basicConfig()` called after `init()` still configures the root logger, and an app with no handlers keeps Python's own output for warnings. The root level is `WARNING` unless your app changes it, so by default only warnings and errors are recorded. A logger with `propagate=False` is not recorded unless you add an `EvalKitLoggingHandler` to it (`evalkit.install_logging_handler(client, logger_name)`, which adds only that handler).
 
 The span's operation is `log.<LEVEL>`, for example `log.ERROR`. Records at `ERROR` or above get status `ERROR`. The span has `log.level`, `log.message`, `log.logger`, `log.filename`, `log.lineno` and `log.funcname`. When the record has exception info, it also has `error.type`, `error.message` and `error.stack`.
 
-`init()` also adds `trace_id` and `span_id` to every record. If the root logger has no stream handler, it adds a console handler with the format `%(asctime)s %(levelname)s [%(trace_id)s] %(name)s: %(message)s`. Otherwise it adds the ids to your stream handlers, and it replaces the formatter of any handler whose format lacks `trace_id`.
+Every record also carries `trace_id` and `span_id`, so a format of your own can show them, for example `%(asctime)s %(levelname)s [%(trace_id)s] %(name)s: %(message)s`. A `trace_id` you pass in `extra=` is kept.
+
+### Forked workers
+
+A process forked after `init()` exports its own spans: gunicorn with `--preload`, `multiprocessing` with the `fork` start method, and Celery's prefork pool. The child starts its own export thread with new locks and an empty queue (what the parent had queued is the parent's to send), so its spans go out while it runs. A `multiprocessing` child, which ends without running `atexit`, also flushes as it ends. A Celery prefork child ends through billiard's own exit path, so send its last batch from a signal handler:
+
+```python
+from celery.signals import worker_process_shutdown
+
+@worker_process_shutdown.connect
+def flush_traces(**_):
+    evalkit.flush()
+```
+
+Workers that import the app themselves (uvicorn `--workers`, the `spawn` and `forkserver` start methods) call `init()` on their own.
+
+### Shutdown
+
+What is queued when the process ends is sent by an `atexit` flush that takes at most 3 seconds, so a receiver that is down never holds up a deploy. uvicorn ends a worker (on `--workers`, `--reload` or a deploy) by re-raising the signal that stopped it, which runs no `atexit`, so the ASGI integrations flush on the lifespan shutdown, before the app reports it complete: `EvalKitMiddleware`, `create_litestar_middleware()` (Litestar answers the lifespan before any middleware, so the flush is made on the `Litestar` class) and `EvalKitDjangoMiddleware` under ASGI (Django's ASGI handler refuses the lifespan, so the SDK answers it for the handler). `init()` also chains SIGTERM and SIGINT: a handler your app installed is called as before, and where the default action would end the process without `atexit`, the queue goes out first and the signal then ends the process as it would have.
 
 ### Claude Agent SDK
 
@@ -103,7 +119,7 @@ Each call becomes an `llm_call` span named `claude_agent_sdk.query`, with provid
 
 EvalKit also receives spans from OpenTelemetry instrumentation. How it does so depends on whether your app already has a tracer provider.
 
-If it has none, `init()` creates one with your `service_name` and makes it the global provider. It then registers every installed OpenTelemetry instrumentor except those on a skip list. The list holds the LLM, web framework, HTTP and database libraries that EvalKit instruments itself. It also holds Replicate, Transformers and psycopg2, which EvalKit has no patches for.
+If it has none, `init()` creates one with your `service_name` and makes it the global provider. It then registers every installed OpenTelemetry instrumentor except those on a skip list. The list holds the LLM, web framework, HTTP and database libraries that EvalKit instruments itself. It also holds Replicate and Transformers, which EvalKit has no patches for.
 
 SQLAlchemy and urllib3 are not on the skip list, and their instrumentors are installed with the SDK, so their spans arrive this way.
 
@@ -138,7 +154,6 @@ All four EvalKit SDKs follow the same four rules, so the number is comparable ac
 
 The Python SDK departs from these rules in a few places:
 
-- An Anthropic `input_json_delta`, which carries tool arguments, stops the clock.
 - An OpenAI refusal delta counts as generated text.
 - The OpenAI-format tracer behind OpenAI, Groq and LiteLLM reads only content and refusal deltas. A reasoning delta does not stop its clock.
 - Ollama thinking text does not stop the clock.
@@ -149,12 +164,13 @@ TTFT is recorded for these streams:
 - OpenAI Chat Completions, sync and async, whether patched automatically or with `patch_openai_client` and `patch_async_openai_client`
 - Anthropic `messages.create(stream=True)`, sync and async, on Vertex too
 - Bedrock `converse_stream` and `invoke_model_with_response_stream`, with `boto3` and `aiobotocore`
+- OpenAI Responses `responses.create(stream=True)` and `responses.stream()`, sync and async
 - Google GenAI `generate_content_stream`, sync and async
 - Google AI (`google.generativeai`) streams
 - Vertex AI `GenerativeModel.generate_content(stream=True)`, once the model is patched
 - Cohere `chat_stream`, Mistral, Groq, LiteLLM and Ollama
 
-TTFT is not recorded for Anthropic's `messages.stream()` helper or for OpenAI Responses streams. A sync Responses stream is always recorded with status `OK`, even when it fails.
+TTFT is not recorded for Anthropic's `messages.stream()` helper.
 
 A stream that fails partway is recorded with status `ERROR` and the provider's error message. The span keeps the partial completion and any usage the provider had already reported. Those tokens were billed whether or not the stream finished, and the partial text is often the only clue to why it stopped.
 
@@ -242,6 +258,8 @@ evalkit.instrument_flask(app)
 ```
 
 Each middleware records one `http_call` span per request, named after the method and path, such as `GET /orders`. It continues an incoming `traceparent` header. It also adds `X-Trace-Id` and `traceparent` headers to the response.
+
+Health and readiness probes (`/health`, `/healthz`, `/health/live`, `/readyz`, `/livez`, matched by whole path segment, so `/healthcare` is recorded) reach the app untraced through every middleware: no request span, no response headers, and nothing the handler records while it answers, such as a database ping, a traced function or a log line. Work the handler starts that runs on after the response, such as a background task or a thread, is traced as usual.
 
 - `EvalKitStarletteMiddleware` is the same class as `EvalKitMiddleware`, exported under a Starlette name.
 - For Litestar, pass the middleware when you create the app: `Litestar(route_handlers=[...], middleware=[create_litestar_middleware()])`.
@@ -959,7 +977,8 @@ evalkit.init(
 `capture_content=False` keeps every metric and drops every payload.
 
 - You keep tokens, cost, latency, TTFT, model, provider, finish reason, status, errors, tool names and call IDs, the span hierarchy, and `db.system`, `db.operation` and row counts.
-- You lose prompts, completions, thinking text, request and response bodies and headers, tool arguments and results, traced-function arguments and return values, SQL text and bound parameters, retriever queries, and log message bodies.
+- You lose prompts, completions, thinking text, refusal text, request and response bodies and headers, tool arguments and results, traced-function arguments and return values, SQL text and bound parameters, retriever queries, and log message bodies.
+- The same holds for content other OpenTelemetry instrumentation puts on its spans, whatever its own content switch says: the GenAI conventions' `gen_ai.input.messages`, `gen_ai.output.messages`, `gen_ai.system_instructions`, `gen_ai.prompt`, `gen_ai.completion` and `gen_ai.retrieval.*` text, flattened message fields such as `gen_ai.prompt.0.content` and `llm.input_messages.0.message.content` (their role, tool name and finish reason stay), `input.value` and `output.value`, keys ending in `.observation.input`, `.trace.output` and the like, and the `content` and `message` of `gen_ai.*.message` and `gen_ai.choice` events.
 
 Stripped spans carry `evalkit.content_captured=false`, so the dashboard can tell "capture is off" apart from "the SDK failed to read the body".
 
@@ -1010,7 +1029,9 @@ The scrubber replaces the value of any object key that matches one of these name
 
 The match is case-insensitive, on the whole key or on a segment delimited by `.`, `_` or `-`. It works recursively through objects and arrays. It also covers attribute values that are JSON strings, which are parsed, scrubbed and serialized again. So `subscriptionKey`, `X-Subscription-Key`, `http.request.api_key` and `credentials.password` are all masked.
 
-`token` matches only as the whole key or the final segment, because it is also a telemetry word. `prompt_token_count`, `gen_ai.server.time_to_first_token_ms`, `input_tokens` and `tokenizer` are metrics, not credentials. Masking them would blank a dashboard column and protect nothing.
+`token` matches only as the whole key or the final segment, because it is also a telemetry word. `prompt_token_count`, `gen_ai.server.time_to_first_token_ms`, `input_tokens` and `tokenizer` are metrics, not credentials, and per-token prices such as `input_cost_per_token`, `input_cost_per_audio_token` and `output_cost_per_reasoning_token` are prices. Masking them would blank a dashboard column and protect nothing. `access_token`, `refresh_token` and `id_token` are masked.
+
+camelCase keys are split at their capitals and matched the same way, so `accessToken`, `authToken` and `secretKey` are masked while `maxTokens`, `inputCostPerAudioToken` and a flag such as `hasToken` are not.
 
 Booleans and numbers under a matching key become `"***"` as well, so the shape of the value gives nothing away.
 
@@ -1096,6 +1117,8 @@ Spans are batched and exported in the background, and the queue is flushed at ex
 ```python
 evalkit.flush()
 ```
+
+It returns whether the receiver took everything that was queued. Before `init()` it returns `False`; it never raises.
 
 ### How spans are exported
 

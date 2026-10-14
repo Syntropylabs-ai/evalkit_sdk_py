@@ -1,23 +1,44 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
 
 from ._google_usage import EMPTY_GOOGLE_USAGE, extract_google_usage, merge_google_usage
+from ._safe import hook_failed
 
 _log = logging.getLogger("evalkit")
 
+# How much of a stream the span keeps: its text (completion, thinking, refusal) and each tool
+# call's arguments. Every chunk still reaches the caller whole; past these sizes the span keeps
+# the start, so a very long reply cannot make the tracer hold an unbounded copy of it. The
+# arguments limit sits above what a tool-call event records, so recorded events are unchanged.
+_TEXT_KEEP = 1024 * 1024
+_ARGS_KEEP = 64 * 1024
+_TOOL_CALLS_KEEP = 256
+
 _MISSING_STREAM_USAGE_MESSAGE = (
-    "a streamed OpenAI chat completion ended without a usage chunk, so this span reports 0 input and 0 output "
-    "tokens and every cost report prices the call at $0 - the OpenAI API only sends the final usage chunk when "
-    "the request sets stream_options={\"include_usage\": True}; add it to your chat.completions.create(...) call "
-    "to get real token counts for streamed calls (logged once per process)"
+    "a streamed OpenAI chat completion ended without a usage chunk, so this span carries no token counts; the "
+    "trace service estimates them from the prompt and completion text and marks the span evalkit.cost_estimated, "
+    "so its tokens and cost are approximate (and stay at 0 when content capture is off, as there is no text to "
+    "estimate from). The OpenAI API sends the usage chunk only when the request sets "
+    "stream_options={\"include_usage\": True}; add it to your chat.completions.create(...) call for exact token "
+    "counts and cost (logged once per process)"
 )
 
 _stream_usage_warn_lock = threading.Lock()
 _stream_usage_warned = False
+
+
+def _reset_lock_after_fork() -> None:
+    global _stream_usage_warn_lock
+    _stream_usage_warn_lock = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_lock_after_fork)
 
 
 def stream_usage_requested(kwargs: Dict[str, Any]) -> bool:
@@ -39,7 +60,11 @@ def _warn_missing_stream_usage() -> None:
 def with_stream_usage_warning(
     on_done: Callable[..., None], kwargs: Dict[str, Any], enabled: bool = True
 ) -> Callable[..., None]:
-    if not enabled or stream_usage_requested(kwargs):
+    try:
+        if not enabled or stream_usage_requested(kwargs):
+            return on_done
+    except Exception as exc:
+        hook_failed("stream usage check", exc)
         return on_done
 
     def wrapped(
@@ -91,7 +116,21 @@ class _StreamState:
         self.response_id = ""
         self.response_model = ""
         self.google_usage = EMPTY_GOOGLE_USAGE
+        self.error_attrs: Dict[str, Any] = {}
+        # A Responses stream: the output items of its final response, and the error a response
+        # that failed reported inside the stream, which raises nothing on the caller's side.
+        self.output_items: List[Any] = []
+        self.failure: Optional[str] = None
         self._tool_index: Dict[Any, Dict[str, Any]] = {}
+        self._kept = {"text": 0, "thinking": 0, "refusal": 0}
+
+    def _keep(self, kind: str, parts: List[str], text: str) -> None:
+        room = _TEXT_KEEP - self._kept[kind]
+        if room <= 0:
+            return
+        piece = text if len(text) <= room else text[:room]
+        parts.append(piece)
+        self._kept[kind] += len(piece)
 
     def _mark_first_token(self) -> None:
         if self.ttft_ms is None and self.start_ms is not None:
@@ -100,12 +139,12 @@ class _StreamState:
     def _add_text(self, text: object) -> None:
         if text:
             self._mark_first_token()
-            self.chunks.append(str(text))
+            self._keep("text", self.chunks, str(text))
 
     def _add_thinking(self, text: object) -> None:
         if text:
             self._mark_first_token()
-            self.thinking_chunks.append(str(text))
+            self._keep("thinking", self.thinking_chunks, str(text))
 
     def _add_finish_reason(self, reason: object) -> None:
         if reason is None or reason == "":
@@ -118,7 +157,8 @@ class _StreamState:
 
     def _new_tool(self) -> Dict[str, Any]:
         entry: Dict[str, Any] = {"id": "", "name": "", "arguments": ""}
-        self.tool_calls.append(entry)
+        if len(self.tool_calls) < _TOOL_CALLS_KEEP:
+            self.tool_calls.append(entry)
         return entry
 
     def _tool(self, key: Any) -> Dict[str, Any]:
@@ -137,7 +177,9 @@ class _StreamState:
         if value is None or value == "":
             return
         if isinstance(value, str) and isinstance(entry["arguments"], str):
-            entry["arguments"] += value
+            room = _ARGS_KEEP - len(entry["arguments"])
+            if room > 0:
+                entry["arguments"] += value[:room]
         else:
             entry["arguments"] = value
 
@@ -167,14 +209,11 @@ class _StreamState:
             choice = choices[0]
             delta = getattr(choice, "delta", None)
             if delta:
-                c = getattr(delta, "content", None)
-                if c:
-                    self._mark_first_token()
-                    self.chunks.append(c)
+                self._add_text(getattr(delta, "content", None))
                 refusal = getattr(delta, "refusal", None)
                 if refusal:
                     self._mark_first_token()
-                    self.refusal_chunks.append(str(refusal))
+                    self._keep("refusal", self.refusal_chunks, str(refusal))
                 self._add_openai_tool_deltas(delta)
             self._add_finish_reason(getattr(choice, "finish_reason", None))
         self.response_id = str(getattr(chunk, "id", "") or self.response_id)
@@ -212,17 +251,14 @@ class _StreamState:
             delta = getattr(event, "delta", None)
             dtype = getattr(delta, "type", None) if delta else None
             if dtype == "text_delta":
-                t = getattr(delta, "text", None)
-                if t:
-                    self._mark_first_token()
-                    self.chunks.append(t)
+                self._add_text(getattr(delta, "text", None))
             elif dtype == "thinking_delta":
-                t = getattr(delta, "thinking", None)
-                if t:
-                    self._mark_first_token()
-                    self.thinking_chunks.append(t)
+                # Thinking is generated text, so it ends the wait for a first token, but it is
+                # recorded as gen_ai.response.thinking and never joins the completion.
+                self._add_thinking(getattr(delta, "thinking", None))
             elif dtype == "input_json_delta":
-                self._mark_first_token()
+                # Tool arguments are not generated text: a reply made only of tool calls has no
+                # time to first token, as in every other provider's stream.
                 entry = self._tool(("block", _num(getattr(event, "index", 0))))
                 self._append_arguments(entry, getattr(delta, "partial_json", None))
         elif etype == "content_block_start":
@@ -403,6 +439,81 @@ class _StreamState:
             self.tokens_out = _num(getattr(usage, "completion_tokens", 0)) or self.tokens_out
 
 
+    def _apply_openai_response(self, response: object, final: bool) -> None:
+        if response is None:
+            return
+        self.response_id = str(getattr(response, "id", "") or self.response_id)
+        self.response_model = str(getattr(response, "model", "") or self.response_model)
+        usage = getattr(response, "usage", None)
+        if usage:
+            (self.tokens_in, self.tokens_out, _total,
+             self.reasoning_tokens, self.cache_read_tokens) = openai_responses_usage(usage)
+        if final:
+            output = getattr(response, "output", None)
+            if output:
+                self.output_items = list(output)[:_TOOL_CALLS_KEEP]
+
+    def _responses_tool(self, event: object) -> Dict[str, Any]:
+        return self._tool(("output", _num(getattr(event, "output_index", 0))))
+
+    def process_openai_responses_event(self, event: object) -> None:
+        etype = getattr(event, "type", None)
+        if etype == "response.output_text.delta":
+            self._add_text(getattr(event, "delta", None))
+        elif etype in ("response.reasoning_summary_text.delta", "response.reasoning_text.delta"):
+            # Reasoning is generated text, so it ends the wait for a first token, but it is
+            # recorded as gen_ai.response.thinking and never joins the completion.
+            self._add_thinking(getattr(event, "delta", None))
+        elif etype == "response.refusal.delta":
+            refusal = getattr(event, "delta", None)
+            if refusal:
+                self._mark_first_token()
+                self._keep("refusal", self.refusal_chunks, str(refusal))
+        elif etype in ("response.output_item.added", "response.output_item.done"):
+            item = getattr(event, "item", None)
+            if getattr(item, "type", None) == "function_call":
+                entry = self._responses_tool(event)
+                call_id = getattr(item, "call_id", None) or getattr(item, "id", None)
+                if call_id:
+                    entry["id"] = str(call_id)
+                name = getattr(item, "name", None)
+                if name:
+                    entry["name"] = str(name)
+                arguments = getattr(item, "arguments", None)
+                if etype == "response.output_item.done" and isinstance(arguments, str) and arguments:
+                    entry["arguments"] = arguments[:_ARGS_KEEP]
+        elif etype == "response.function_call_arguments.delta":
+            # Tool arguments are not generated text, as in the chat stream: no first token here.
+            self._append_arguments(self._responses_tool(event), getattr(event, "delta", None))
+        elif etype == "response.function_call_arguments.done":
+            arguments = getattr(event, "arguments", None)
+            if isinstance(arguments, str) and arguments:
+                self._responses_tool(event)["arguments"] = arguments[:_ARGS_KEEP]
+        elif etype in ("response.created", "response.in_progress"):
+            self._apply_openai_response(getattr(event, "response", None), final=False)
+        elif etype in ("response.completed", "response.incomplete", "response.failed"):
+            response = getattr(event, "response", None)
+            self._apply_openai_response(response, final=True)
+            if etype == "response.failed":
+                error = getattr(response, "error", None)
+                self.failure = str(getattr(error, "message", None) or "the response failed")
+        elif etype == "error":
+            self.failure = str(getattr(event, "message", None) or "the stream reported an error")
+
+
+def openai_responses_usage(usage: object) -> tuple:
+    """(input, output, total, reasoning, cached) tokens of a Responses usage object.
+
+    input_tokens already counts the cached ones, as a chat completion's prompt_tokens does.
+    """
+    tokens_in = _num(getattr(usage, "input_tokens", 0))
+    tokens_out = _num(getattr(usage, "output_tokens", 0))
+    total = _num(getattr(usage, "total_tokens", 0)) or tokens_in + tokens_out
+    reasoning = _num(getattr(getattr(usage, "output_tokens_details", None), "reasoning_tokens", 0))
+    cached = _num(getattr(getattr(usage, "input_tokens_details", None), "cached_tokens", 0))
+    return tokens_in, tokens_out, total, reasoning, cached
+
+
 def stream_tool_events(state: Optional[_StreamState], ts: str) -> list:
     if state is None:
         return []
@@ -429,9 +540,31 @@ def stream_response_attrs(state: Optional[_StreamState]) -> Dict[str, Any]:
             attrs["gen_ai.response.refusal"] = "".join(state.refusal_chunks)
         if any(call.get("server_side") for call in state.tool_calls):
             attrs["gen_ai.response.has_server_side_tool_use"] = True
+        attrs.update(state.error_attrs)
     except Exception:
         pass
     return attrs
+
+
+def record_stream_open_failure(
+    on_done: Callable[..., None], state: _StreamState, error: BaseException,
+) -> None:
+    """Record a streamed call whose request failed before the stream opened.
+
+    A refused connection, a 400 or a 401 raises from the create call itself, so no stream tracer
+    exists to report it. The span goes out through the stream's own recorder, with the model and
+    the request, status ERROR, the error message and the exception's type and stack.
+    """
+    try:
+        from ..core.client import _exc_attrs
+
+        state.error_attrs = _exc_attrs(error)
+    except Exception:
+        pass
+    try:
+        on_done("", 0, 0, "", 0, False, None, 0, 0, error)
+    except Exception:
+        pass
 
 
 ChunkProcessor = Callable[[_StreamState, object], None]
@@ -445,42 +578,83 @@ def _resolve_processor(process: Optional[ChunkProcessor], is_anthropic: bool) ->
     return _StreamState.process_openai_chunk
 
 
-class _SyncStreamTracer:
+class _StreamTracer:
+    """Records a streamed model call while the caller reads the provider's stream through it.
+
+    Each chunk is handed on as soon as it arrives and is never read ahead. The provider's stream
+    stays usable as itself: its attributes and methods are delegated, isinstance sees its class,
+    and reading to the end, an early break, next(), close(), the context manager or garbage
+    collection ends the span exactly once. Failures in recording are logged at debug level and
+    never reach the caller.
+    """
+
     def __init__(
         self, stream: object, on_done: Callable[..., None], *,
         is_anthropic: bool = False, start_ms: Optional[float] = None,
         process: Optional[ChunkProcessor] = None,
         state: Optional[_StreamState] = None,
     ) -> None:
+        self._done = True
         self._stream = stream
         self._on_done = on_done
-        self._done = False
         self._state = state if state is not None else _StreamState(start_ms)
         self._process = _resolve_processor(process, is_anthropic)
+        self._iterator: Any = None
+        self._done = False
+
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:
+        # isinstance(stream, openai.Stream) and the like keep holding for the wrapped stream.
+        try:
+            return type(object.__getattribute__(self, "_stream"))
+        except AttributeError:
+            return type(self)
+
+    def __getattr__(self, name: str) -> object:
+        try:
+            stream = object.__getattribute__(self, "_stream")
+        except AttributeError:
+            raise AttributeError(name) from None
+        return getattr(stream, name)
+
+    def _observe(self, chunk: object) -> None:
+        try:
+            self._process(self._state, chunk)
+        except Exception as exc:
+            hook_failed("stream chunk", exc)
 
     def _finish(self, error: Optional[BaseException] = None) -> None:
-        if not self._done:
-            self._done = True
-            s = self._state
-            try:
-                self._on_done(
-                    "".join(s.chunks), s.tokens_in, s.tokens_out,
-                    "".join(s.thinking_chunks), s.reasoning_tokens, s.has_redacted_thinking,
-                    None if error is not None else s.ttft_ms,
-                    s.cache_read_tokens, s.cache_creation_tokens,
-                    error,
-                )
-            except Exception:
-                pass
+        if self.__dict__.get("_done", True):
+            return
+        self._done = True
+        s = self._state
+        try:
+            self._on_done(
+                "".join(s.chunks), s.tokens_in, s.tokens_out,
+                "".join(s.thinking_chunks), s.reasoning_tokens, s.has_redacted_thinking,
+                None if error is not None else s.ttft_ms,
+                s.cache_read_tokens, s.cache_creation_tokens,
+                error,
+            )
+        except Exception as exc:
+            hook_failed("stream end", exc)
 
+    def __del__(self) -> None:
+        # A stream dropped before it was read to the end, closed or exited is still a call that
+        # was made: it is recorded with what had arrived.
+        try:
+            self._finish()
+        except Exception:
+            pass
+
+
+class _SyncStreamTracer(_StreamTracer):
     def __iter__(self):
+        # A generator, so a for loop that stops early closes it at once and the span ends there.
         error: Optional[BaseException] = None
         try:
             for chunk in self._stream:
-                try:
-                    self._process(self._state, chunk)
-                except Exception:
-                    pass
+                self._observe(chunk)
                 yield chunk
         except GeneratorExit:
             raise
@@ -489,6 +663,26 @@ class _SyncStreamTracer:
             raise
         finally:
             self._finish(error)
+
+    def __next__(self) -> object:
+        if self._iterator is None:
+            self._iterator = iter(self._stream)
+        try:
+            chunk = next(self._iterator)
+        except StopIteration:
+            self._finish()
+            raise
+        except GeneratorExit:
+            raise
+        except BaseException as exc:
+            self._finish(exc)
+            raise
+        self._observe(chunk)
+        return chunk
+
+    def close(self) -> object:
+        self._finish()
+        return self._stream.close()
 
     def __enter__(self) -> "_SyncStreamTracer":
         if hasattr(self._stream, "__enter__"):
@@ -501,46 +695,13 @@ class _SyncStreamTracer:
             return self._stream.__exit__(*args)
         return False
 
-    def __getattr__(self, name: str) -> object:
-        return getattr(self._stream, name)
 
-
-class _AsyncStreamTracer:
-    def __init__(
-        self, stream: object, on_done: Callable[..., None], *,
-        is_anthropic: bool = False, start_ms: Optional[float] = None,
-        process: Optional[ChunkProcessor] = None,
-        state: Optional[_StreamState] = None,
-    ) -> None:
-        self._stream = stream
-        self._on_done = on_done
-        self._done = False
-        self._state = state if state is not None else _StreamState(start_ms)
-        self._process = _resolve_processor(process, is_anthropic)
-
-    def _finish(self, error: Optional[BaseException] = None) -> None:
-        if not self._done:
-            self._done = True
-            s = self._state
-            try:
-                self._on_done(
-                    "".join(s.chunks), s.tokens_in, s.tokens_out,
-                    "".join(s.thinking_chunks), s.reasoning_tokens, s.has_redacted_thinking,
-                    None if error is not None else s.ttft_ms,
-                    s.cache_read_tokens, s.cache_creation_tokens,
-                    error,
-                )
-            except Exception:
-                pass
-
+class _AsyncStreamTracer(_StreamTracer):
     async def __aiter__(self):
         error: Optional[BaseException] = None
         try:
             async for chunk in self._stream:
-                try:
-                    self._process(self._state, chunk)
-                except Exception:
-                    pass
+                self._observe(chunk)
                 yield chunk
         except GeneratorExit:
             raise
@@ -549,6 +710,31 @@ class _AsyncStreamTracer:
             raise
         finally:
             self._finish(error)
+
+    async def __anext__(self) -> object:
+        if self._iterator is None:
+            self._iterator = self._stream.__aiter__()
+        try:
+            chunk = await self._iterator.__anext__()
+        except StopAsyncIteration:
+            self._finish()
+            raise
+        except GeneratorExit:
+            raise
+        except BaseException as exc:
+            self._finish(exc)
+            raise
+        self._observe(chunk)
+        return chunk
+
+    def close(self) -> object:
+        # The provider's close is a coroutine on an async stream; the caller awaits what it returns.
+        self._finish()
+        return self._stream.close()
+
+    def aclose(self) -> object:
+        self._finish()
+        return self._stream.aclose()
 
     async def __aenter__(self) -> "_AsyncStreamTracer":
         if hasattr(self._stream, "__aenter__"):
@@ -561,5 +747,24 @@ class _AsyncStreamTracer:
             return await self._stream.__aexit__(*args)
         return False
 
-    def __getattr__(self, name: str) -> object:
-        return getattr(self._stream, name)
+
+def trace_sync_stream(stream: object, on_done: Callable[..., None], **options: Any) -> object:
+    """The provider's stream behind a tracer, or the object itself when it is not a stream (a raw
+    response from with_raw_response or with_streaming_response) or no tracer could be built."""
+    if not hasattr(type(stream), "__iter__"):
+        return stream
+    try:
+        return _SyncStreamTracer(stream, on_done, **options)
+    except Exception as exc:
+        hook_failed("stream tracer", exc)
+        return stream
+
+
+def trace_async_stream(stream: object, on_done: Callable[..., None], **options: Any) -> object:
+    if not hasattr(type(stream), "__aiter__"):
+        return stream
+    try:
+        return _AsyncStreamTracer(stream, on_done, **options)
+    except Exception as exc:
+        hook_failed("stream tracer", exc)
+        return stream

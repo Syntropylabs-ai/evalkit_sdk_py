@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ._common import start_db
+from ._common import orm_records_statement, start_db
 
 
 def _stmt(query: Any) -> str:
@@ -12,13 +12,14 @@ def _stmt(query: Any) -> str:
         return ""
 
 
-def patch_psycopg(client: Any) -> None:
+def patch_psycopg(client: Any) -> bool:
     try:
         from psycopg import Cursor, AsyncCursor
     except ImportError:
-        return
+        return False
     _wrap_sync(client, Cursor)
     _wrap_async(client, AsyncCursor)
+    return True
 
 
 def _wrap_sync(client: Any, cls: Any) -> None:
@@ -27,6 +28,8 @@ def _wrap_sync(client: Any, cls: Any) -> None:
         return
 
     def traced(self: Any, query: Any, params: Any = None, **kwargs: Any) -> Any:
+        if orm_records_statement():
+            return orig(self, query, params, **kwargs)
         end = start_db(client, "postgresql", statement=_stmt(query))
         try:
             r = orig(self, query, params, **kwargs)

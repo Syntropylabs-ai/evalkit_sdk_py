@@ -69,7 +69,7 @@ class TestStreamUsageWarning(unittest.TestCase):
                          "this test only means something if a stream with no usage chunk really does report 0 "
                          "output tokens")
         self.assertEqual(len(logs.records), 1,
-                         "a streamed OpenAI call with no stream_options reports 0/0 tokens and therefore $0 cost for "
+                         "a streamed OpenAI call with no stream_options reports 0/0 tokens, so its cost is only an estimate, for "
                          "every such call, and silently under-reporting spend is worse than one log line, so exactly "
                          "one warning must fire; got %d" % len(logs.records))
         message = logs.records[0].getMessage()
@@ -77,6 +77,11 @@ class TestStreamUsageWarning(unittest.TestCase):
                       "a warning that does not name stream_options leaves the caller with a symptom and no fix")
         self.assertIn("include_usage", message,
                       "the warning must name the exact field to add, not just the option object")
+        self.assertIn('stream_options={"include_usage": True}', message)
+        self.assertIn("evalkit.cost_estimated", message,
+                      "the trace service estimates the missing tokens and marks the span, so the cost is an "
+                      "estimate, not $0; the warning has to say what actually happens")
+        self.assertNotIn("$0", message)
 
     def test_warning_is_once_per_process(self):
         fc = _install_sync(self.client, [OStreamChunk("Par")])

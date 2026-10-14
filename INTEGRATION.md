@@ -98,7 +98,7 @@ After `init()`, EvalKit instruments every supported library that is installed. L
 - Vector stores: Pinecone, Qdrant, Chroma and Weaviate.
 - Voice: OpenAI audio and Realtime, ElevenLabs, AssemblyAI and Google GenAI Live.
 - HTTP clients: `requests`, `httpx` and `aiohttp`, as `http_call` spans.
-- Databases: Redis, PyMongo (Motor included), asyncpg, psycopg 3 and PyMySQL, as `db_query` spans.
+- Databases: Redis, PyMongo (Motor included), asyncpg, psycopg 3, psycopg2 and PyMySQL, as `db_query` spans.
 - MCP: `mcp.ClientSession.call_tool`, as `tool_call` spans.
 - Logging: records from Python's `logging` module, as `log` spans.
 - Your own functions: public module-level functions in your source tree, as `function_call` spans.
@@ -107,15 +107,13 @@ Each LLM call becomes an `llm_call` span with the model, provider, prompt, compl
 
 EvalKit also adds a W3C `traceparent` header to each outgoing HTTP request. With `requests` and `aiohttp`, it adds the header when you pass the headers as a plain dict or pass none.
 
-A log record becomes a span when it passes the root logger's level. The root level is `WARNING` unless your app changes it, so by default only warnings and errors are recorded. EvalKit also adds the trace ID to every record.
+A log record becomes a span when it reaches the root logger. The root level is `WARNING` unless your app changes it, so by default only warnings and errors are recorded. EvalKit changes no handler, formatter or level, and adds `trace_id` and `span_id` to every record for a format that asks for them.
 
 The source tree is the directory of the file that calls `init()`. Modules imported after `init()` are covered too. Turn this off with `function_tracing=False`.
 
 Trace context carries into `threading.Thread` and `ThreadPoolExecutor`. Work that you hand to a thread stays in its trace.
 
 Some libraries need a call of your own. The Vertex AI SDK's `GenerativeModel` needs `patch_vertex_generative_model(model)`. SQLAlchemy needs `patch_sqlalchemy_engine(engine)`, unless EvalKit creates the tracer provider, in which case its OpenTelemetry instrumentor traces it.
-
-A few calls are not traced at all. psycopg2 is not instrumented, and neither are OpenAI Responses calls made with the async client and `stream=True`.
 
 EvalKit owns the libraries it patches. [How duplicates are handled](#how-duplicates-are-handled) explains what happens to OpenTelemetry spans for the same calls.
 
@@ -444,7 +442,7 @@ When no EvalKit span is active, a new EvalKit span takes the active OpenTelemetr
 
 ### OpenTelemetry spans sent to SyntropyLabs
 
-If your app has no tracer provider, `init()` creates one and makes it the global provider. It then registers every installed OpenTelemetry instrumentor except those on a skip list. The list holds the libraries that EvalKit instruments itself, plus Replicate, Transformers and psycopg2.
+If your app has no tracer provider, `init()` creates one and makes it the global provider. It then registers every installed OpenTelemetry instrumentor except those on a skip list. The list holds the libraries that EvalKit instruments itself, plus Replicate and Transformers.
 
 If your app already has a tracer provider, `init()` adds EvalKit's span processor to it and registers no instrumentors. Either way, each OpenTelemetry span is mapped to an EvalKit span and sent through the same exporter.
 

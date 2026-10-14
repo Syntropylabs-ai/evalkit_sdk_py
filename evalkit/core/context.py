@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field, replace
-from typing import Any, List, Mapping, Optional
+from typing import Any, List, Mapping, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -97,6 +97,50 @@ _current_span: ContextVar[Optional[SpanContext]] = ContextVar(
 )
 
 _in_http_span: ContextVar[bool] = ContextVar("evalkit_in_http_span", default=False)
+
+
+class _Suppression:
+    """Tracing held off while one health probe is answered.
+
+    A probe has no trace of its own, so a span opened while answering it (a database ping, a
+    traced function, a log line) would be a root trace of its own on every poll. A task or thread
+    the handler starts copies the context and shares this object, and it is switched off once the
+    probe is answered, so work that runs on after the response is traced as usual.
+    """
+
+    __slots__ = ("active",)
+
+    def __init__(self) -> None:
+        self.active = True
+
+
+_suppression: ContextVar[Optional[_Suppression]] = ContextVar("evalkit_suppression", default=None)
+
+
+def tracing_suppressed() -> bool:
+    held = _suppression.get()
+    return held is not None and held.active
+
+
+def suppress_tracing() -> Tuple[Token, _Suppression]:
+    held = _Suppression()
+    return _suppression.set(held), held
+
+
+def end_suppression(token: Optional[Token], held: Optional[_Suppression]) -> None:
+    if held is not None:
+        held.active = False
+    if token is not None:
+        try:
+            _suppression.reset(token)
+        except Exception:
+            pass
+
+# Set by a framework integration while one of its model calls runs (LlamaIndex's LLM spans): the
+# SDK's own record of the provider request inside it is handed to that call, which sends the two
+# as one span, instead of being queued as a second llm_call for the same request. Returns whether
+# it took the envelope.
+_llm_call_owner: ContextVar[Optional[Any]] = ContextVar("evalkit_llm_call_owner", default=None)
 
 
 @dataclass

@@ -326,6 +326,55 @@ class SecretKeyTest(unittest.TestCase):
                     "key ending in token can still hold a credential",
                 )
 
+    def test_per_token_prices_of_every_kind_are_not_credentials(self):
+        for key in ("input_cost_per_audio_token", "output_cost_per_audio_token", "output_cost_per_reasoning_token",
+                    "input_cost_per_image_token", "input_cost_per_video_token", "cache_read_input_cost_per_token",
+                    "input_cost_per_cached_token", "price_per_audio_token", "litellm.input_cost_per_audio_token",
+                    "cost_per_1k_token", "inputCostPerAudioToken"):
+            with self.subTest(key):
+                self.assertFalse(
+                    is_secret_key(key),
+                    "a price per token is a number on the cost sheet; masking it blanks the cost the dashboard "
+                    "shows and protects nothing",
+                )
+        for key in ("access_token", "refresh_token", "id_token", "per_user_token", "audio_token", "image_token"):
+            with self.subTest(key):
+                self.assertTrue(is_secret_key(key), "only prices are exempt; other *_token keys stay masked")
+
+    def test_per_token_exemptions_are_the_same_in_both_sdks(self):
+        # Exempt in TypeScript and in Python: prices named by price_per_*, any number of billed kinds
+        # after "per", and the tool, read, write, creation, thinking and character kinds.
+        for key in ("price_per_token", "price_per_1k_token", "output_price_per_audio_token",
+                    "input_cost_per_tool_token", "cost_per_cache_read_token", "input_cost_per_cache_read_token",
+                    "cache_write_cost_per_token", "per_cache_read_token", "per_cache_creation_input_token",
+                    "per_input_audio_token", "per_tool_token", "per_read_token", "per_write_token",
+                    "per_creation_token", "per_thinking_token", "per_character_token",
+                    "input_cost_per_character_token", "time_per_output_token", "priceReadPerToken",
+                    "outputCostPerThinkingToken", "costPerCacheReadToken"):
+            with self.subTest(key):
+                self.assertFalse(is_secret_key(key), "a price or a count per token is not a credential")
+        for key in ("access_token", "refresh_token", "id_token", "per_user_token", "per_session_token",
+                    "per_tenant_token", "accessToken", "perUserToken", "price_token", "tool_token"):
+            with self.subTest(key):
+                self.assertTrue(is_secret_key(key), "a per-something token outside the billed kinds can hold a credential")
+
+    def test_camel_case_credential_keys_are_masked(self):
+        for key in ("accessToken", "authToken", "refreshToken", "idToken", "secretKey", "clientSecret",
+                    "privateKey", "sessionToken", "xApiKey"):
+            with self.subTest(key):
+                self.assertTrue(is_secret_key(key))
+        for key in ("maxTokens", "totalTokens", "inputCostPerAudioToken", "timeToFirstToken", "promptTokenCount",
+                    "cachedTokens", "publicKey", "keyId"):
+            with self.subTest(key):
+                self.assertFalse(is_secret_key(key))
+        self.assertEqual(scrub_value({"accessToken": "ya29.x", "maxTokens": 64}), {"accessToken": "***", "maxTokens": 64})
+
+    def test_a_price_sheet_survives_the_scrubber(self):
+        sheet = {"model": "gpt-4o-audio", "input_cost_per_token": 2.5e-06, "input_cost_per_audio_token": 4e-05,
+                 "output_cost_per_audio_token": 8e-05, "output_cost_per_reasoning_token": 1e-05,
+                 "access_token": "ya29.secret", "refresh_token": "1//secret", "id_token": "eyJ-not-really"}
+        self.assertEqual(scrub_value(sheet), {**sheet, "access_token": "***", "refresh_token": "***", "id_token": "***"})
+
     def test_a_bridged_span_keeps_its_timing_and_usage_numbers(self):
         envelope = TraceEnvelope(
             trace_id="t", span_id="s", span_type="llm_call", created_at="2026-10-11T00:00:00Z",

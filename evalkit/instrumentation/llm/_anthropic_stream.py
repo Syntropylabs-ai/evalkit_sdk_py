@@ -7,6 +7,7 @@ from ..._version import SDK_VERSION
 from ...core.client import EvalKitClient, _new_span_id, _now_iso
 from ...core.context import SpanContext, _current_span, child_span_ctx, current_span_ctx, get_or_create_ambient_trace_id
 from ...core.types import SpanEvent, TraceEnvelope
+from .._safe import hook_failed
 from .._toolcalls import from_anthropic_blocks
 from ._bodies import _dump, _safe_body
 
@@ -47,22 +48,40 @@ def _final_fields(message: Any, end_ts: str) -> Tuple[str, str, bool, List[SpanE
 
 
 class _TracedStreamManager:
+    """The provider's stream manager, recording the call when its stream is entered and exited.
+
+    Entering returns the provider's own MessageStream, so text_stream, get_final_message(),
+    until_done() and the event iteration are untouched; anything else is delegated to the manager.
+    """
+
     def __init__(
         self,
-        invoke: Callable[[], Any],
+        mgr: Any,
         span_ctx: SpanContext,
         emit: Callable[..., None],
     ) -> None:
-        self._invoke = invoke
+        self._mgr = mgr
         self._span_ctx = span_ctx
         self._emit = emit
-        self._mgr: Any = None
         self._underlying: Any = None
+
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:
+        try:
+            return type(object.__getattribute__(self, "_mgr"))
+        except AttributeError:
+            return type(self)
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            mgr = object.__getattribute__(self, "_mgr")
+        except AttributeError:
+            raise AttributeError(name) from None
+        return getattr(mgr, name)
 
     def __enter__(self) -> Any:
         token = _current_span.set(self._span_ctx)
         try:
-            self._mgr = self._invoke()
             self._underlying = self._mgr.__enter__()
         except BaseException as exc:
             self._emit(error=exc)
@@ -78,7 +97,6 @@ class _TracedStreamManager:
     async def __aenter__(self) -> Any:
         token = _current_span.set(self._span_ctx)
         try:
-            self._mgr = self._invoke()
             self._underlying = await self._mgr.__aenter__()
         except BaseException as exc:
             self._emit(error=exc)
@@ -166,17 +184,23 @@ def patch_messages_stream(
         def safe_emit(message: Any = None, error: Optional[BaseException] = None) -> None:
             try:
                 emit(message, error)
-            except Exception:
-                pass
+            except Exception as exc:
+                hook_failed("messages.stream", exc)
 
         return child_span_ctx(trace_id, span_id), safe_emit
 
     def wrap(invoke: Callable[[], Any], kwargs: Dict[str, Any]) -> Any:
         try:
             span_ctx, emit = begin(kwargs)
-        except Exception:
+        except Exception as exc:
+            hook_failed("messages.stream", exc)
             return invoke()
-        return _TracedStreamManager(invoke, span_ctx, emit)
+        try:
+            mgr = invoke()
+        except Exception as exc:
+            emit(error=exc)
+            raise
+        return _TracedStreamManager(mgr, span_ctx, emit)
 
     if class_level:
         def traced_stream(self: Any, *args: Any, **kwargs: Any) -> Any:

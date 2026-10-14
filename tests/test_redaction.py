@@ -307,6 +307,133 @@ class RedactionTest(unittest.TestCase):
         self.assertEqual(self.captured, [])
 
 
+def _foreign_genai_span():
+    """A chat span another OpenTelemetry GenAI instrumentation wrote, with its own content on it."""
+    from opentelemetry.sdk.trace import TracerProvider
+
+    tracer = TracerProvider().get_tracer("some.other.genai.library")
+    span = tracer.start_span("chat gpt-4o", attributes={
+        "gen_ai.operation.name": "chat",
+        "gen_ai.provider.name": "openai",
+        "gen_ai.request.model": "gpt-4o",
+        "gen_ai.usage.input_tokens": 21,
+        "gen_ai.usage.output_tokens": 5,
+        "gen_ai.input.messages": '[{"role":"user","parts":[{"type":"text","content":"my card is 4242 4242 4242 4242"}]}]',
+        "gen_ai.output.messages": '[{"role":"assistant","parts":[{"type":"text","content":"noted your card"}]}]',
+        "gen_ai.system_instructions": "You are a billing agent",
+        "gen_ai.prompt": "legacy prompt text",
+        "gen_ai.completion": "legacy completion text",
+        "gen_ai.prompt.0.role": "user",
+        "gen_ai.prompt.0.content": "indexed prompt text",
+        "gen_ai.completion.0.content": "indexed completion text",
+        "gen_ai.completion.0.finish_reason": "tool_calls",
+        "gen_ai.completion.0.tool_calls.0.name": "charge_card",
+        "gen_ai.completion.0.tool_calls.0.arguments": '{"card":"4242"}',
+        "llm.input_messages.0.message.role": "user",
+        "llm.input_messages.0.message.content": "flattened prompt text",
+        "input.value": "plain input value",
+        "output.value": "plain output value",
+        "acme.observation.input": "prefixed observation input",
+        "acme.trace.output": "prefixed trace output",
+        "acme.entity.input": "prefixed entity input",
+        "gen_ai.tool.name": "charge_card",
+        "gen_ai.request.tools": ["charge_card"],
+        "gen_ai.prompt.name": "billing-v2",
+    })
+    span.add_event("gen_ai.system.message", {"content": "event-borne system text"})
+    span.add_event("gen_ai.user.message", {"content": "event-borne user text"})
+    span.add_event("gen_ai.assistant.message", {"content": "", "tool_calls": '[{"function":{"name":"charge_card","arguments":"{}"}}]'})
+    span.add_event("gen_ai.tool.message", {"content": "charged", "id": "call_1"})
+    span.add_event("gen_ai.choice", {"index": 0, "finish_reason": "stop", "message": '{"content":"noted your card"}'})
+    span.add_event("gen_ai.client.inference.operation.details", {
+        "gen_ai.input.messages": '[{"role":"user","parts":[{"type":"text","content":"details text"}]}]',
+        "gen_ai.output.messages": '[{"role":"assistant","parts":[{"type":"text","content":"details reply"}]}]',
+        "gen_ai.response.finish_reasons": ["stop"],
+    })
+    span.add_event("exception", {"exception.type": "ValueError"})
+    span.end()
+    return span
+
+
+class ForeignContentRedactionTest(unittest.TestCase):
+    """capture_content=False holds for content another instrumentation put on its spans, too."""
+
+    def setUp(self):
+        reset_context()
+        self.captured = []
+        self.client = fresh(self.captured)
+        self._saved = self.client._opts.capture_content
+
+    def tearDown(self):
+        self.client._opts.capture_content = self._saved
+
+    def _bridged(self):
+        from evalkit.core.otel_provider import _readable_to_envelope
+
+        self.client.enqueue(_readable_to_envelope(_foreign_genai_span()))
+        self.client.flush()
+        spans = [e for e in self.captured if e.operation == "chat gpt-4o"]
+        self.assertEqual(len(spans), 1)
+        return spans[0]
+
+    def test_foreign_message_attributes_are_dropped(self):
+        self.client._opts.capture_content = False
+        span = self._bridged()
+        self.assertIsNone(span.prompt)
+        self.assertIsNone(span.completion)
+        for key in (
+            "gen_ai.input.messages", "gen_ai.output.messages", "gen_ai.system_instructions",
+            "gen_ai.prompt", "gen_ai.completion", "gen_ai.prompt.0.content", "gen_ai.completion.0.content",
+            "gen_ai.completion.0.tool_calls.0.arguments", "llm.input_messages.0.message.content",
+            "input.value", "output.value", "acme.observation.input", "acme.trace.output", "acme.entity.input",
+        ):
+            self.assertNotIn(key, span.attributes, key)
+        flat = json.dumps(span.to_dict())
+        for text in ("4242", "noted your card", "billing agent", "indexed prompt", "flattened prompt", "plain input",
+                     "plain output", "prefixed observation", "prefixed trace", "prefixed entity",
+                     "event-borne", "details text", "details reply", "charged", "legacy prompt"):
+            self.assertNotIn(text, flat, text)
+
+    def test_foreign_metadata_and_tool_names_are_kept(self):
+        self.client._opts.capture_content = False
+        span = self._bridged()
+        self.assertEqual(span.model, "gpt-4o")
+        for key, value in (
+            ("gen_ai.request.model", "gpt-4o"), ("gen_ai.usage.input_tokens", 21),
+            ("gen_ai.usage.output_tokens", 5), ("gen_ai.tool.name", "charge_card"),
+            ("gen_ai.prompt.0.role", "user"), ("gen_ai.completion.0.finish_reason", "tool_calls"),
+            ("gen_ai.completion.0.tool_calls.0.name", "charge_card"), ("gen_ai.prompt.name", "billing-v2"),
+            ("llm.input_messages.0.message.role", "user"),
+        ):
+            self.assertEqual(span.attributes.get(key), value, key)
+        self.assertEqual(list(span.attributes["gen_ai.request.tools"]), ["charge_card"])
+        self.assertIs(span.attributes[CONTENT_STRIPPED_ATTRIBUTE], False)
+        events = {e.name: (e.attributes or {}) for e in span.events}
+        self.assertEqual(events["gen_ai.choice"].get("finish_reason"), "stop")
+        self.assertEqual(events["gen_ai.tool.message"].get("id"), "call_1")
+        self.assertEqual(list(events["gen_ai.client.inference.operation.details"]["gen_ai.response.finish_reasons"]), ["stop"])
+        self.assertEqual(events["exception"].get("exception.type"), "ValueError")
+
+    def test_foreign_content_is_kept_when_capture_is_on(self):
+        span = self._bridged()
+        self.assertIn("gen_ai.input.messages", span.attributes)
+        self.assertIn("event-borne user text", span.prompt or "")
+        events = {e.name: (e.attributes or {}) for e in span.events}
+        self.assertEqual(events["gen_ai.user.message"]["content"], "event-borne user text")
+
+    def test_streamed_refusal_text_is_content(self):
+        self.client._opts.capture_content = False
+        envelope = _llm_envelope()
+        envelope.attributes["gen_ai.response.refusal"] = "I can't share card numbers"
+        span = next(e for e in self._emit_one(envelope) if e.span_type == "llm_call")
+        self.assertNotIn("gen_ai.response.refusal", span.attributes)
+
+    def _emit_one(self, envelope):
+        self.client.enqueue(envelope)
+        self.client.flush()
+        return self.captured
+
+
 class RedactionSerializationTest(unittest.TestCase):
     def test_stripped_envelope_still_serializes(self):
         from evalkit.core.redact import strip_content

@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import inspect
 import logging
+import os
 import secrets
 import threading
 import time
+import weakref
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, TypeVar
@@ -20,34 +23,120 @@ from .context import (
     SpanContext,
     _ambient_trace_id,
     _current_span,
+    _llm_call_owner,
     current_agent,
     current_identity,
     current_span_ctx,
     first_attr,
     get_or_create_ambient_trace_id,
+    tracing_suppressed,
 )
 from .exporter import _Exporter
 from .otel_provider import note_sdk_model_call
+from .secrets import is_secret_name, scrub_value
 from .types import EvalKitOptions, TraceEnvelope
+from ..utils.headers import MASK
 
 _log = logging.getLogger("evalkit")
 
 _IO_MAX = 4096
+# The longest the flush before the process ends may take, all of it: a receiver that is down or
+# unreachable must not hold up a deploy, a worker restart or a reload.
+EXIT_FLUSH_BUDGET_S = 3.0
 # Long enough to diagnose a failure from the trace list; a stack trace belongs in exception.stacktrace.
 MAX_STATUS_MESSAGE = 2000
 
 
-def _safe_io(value: Any, limit: int = _IO_MAX) -> str:
+# How much of an object's str() is scrubbed before it is cut to the attribute limit; the tail
+# past the cut is dropped as well, because a secret the cut runs through no longer has the
+# shape it is recognised by.
+_STR_SCAN_MAX = 64 * 1024
+_STR_CUT_MARGIN = 512
+
+
+def _scrubbed_str(value: Any) -> str:
+    text = str(value)
+    if len(text) <= _STR_SCAN_MAX:
+        return scrub_value(text)
+    return scrub_value(text[:_STR_SCAN_MAX])[:-_STR_CUT_MARGIN] + "…"
+
+
+def _safe_io(value: Any, limit: int = _IO_MAX, scrub: bool = True) -> str:
     import json as _json
 
+    # Secrets are masked in the value itself, before it is serialized and cut to the limit:
+    # cut JSON no longer parses, and the export-time scrubber could then only recognise a key by
+    # its shape, so an api_key of any other shape went out as written.
+    if scrub:
+        try:
+            value = scrub_value(value)
+        except Exception:
+            return "<unserializable>"
     try:
-        s = _json.dumps(value, default=str)
+        s = _json.dumps(value, default=_scrubbed_str if scrub else str)
     except Exception:
         try:
-            s = repr(value)
+            s = _scrubbed_str(value) if scrub else repr(value)
         except Exception:
             s = "<unserializable>"
     return s if len(s) <= limit else s[:limit] + "…"
+
+
+# Automatic function tracing and trace_module skip a callable that carries this marker, so a
+# function a decorator already traces is not wrapped, and recorded, a second time. functools.wraps
+# copies it onto any decorator stacked on top of the traced function.
+TRACED_MARKER = "_evalkit_traced"
+
+
+def _mark_traced(wrapper: F) -> F:
+    try:
+        setattr(wrapper, TRACED_MARKER, True)
+    except Exception:
+        pass
+    return wrapper
+
+
+_RECEIVER_NAMES = ("self", "cls")
+
+
+class _IOParams:
+    """The parameter names a traced callable binds its arguments to, read once when it is wrapped.
+
+    Recorded arguments stay a positional list and a keyword map, the shape the console and the
+    trace readers parse, but each value is matched to its parameter so that one named like a
+    credential is withheld wherever the caller put it. A function whose own name says it handles
+    a credential (get_api_key, presented_token) records neither its arguments nor its result.
+    """
+
+    __slots__ = ("secret_positions", "secret_rest", "skip_receiver", "secret_function")
+
+    def __init__(self, fn: Callable[..., Any], name: str) -> None:
+        names: List[str] = []
+        rest: Optional[str] = None
+        try:
+            for param in inspect.signature(fn).parameters.values():
+                if param.kind in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD):
+                    names.append(param.name)
+                elif param.kind is param.VAR_POSITIONAL:
+                    rest = param.name
+        except Exception:
+            # No signature (a builtin, an odd callable): values are still scrubbed by shape and key.
+            pass
+        self.secret_positions = [is_secret_name(n) for n in names]
+        self.secret_rest = bool(rest) and is_secret_name(rest)
+        self.skip_receiver = bool(names) and names[0] in _RECEIVER_NAMES
+        own_name = getattr(fn, "__name__", "") or ""
+        self.secret_function = is_secret_name(own_name) or is_secret_name(name.rsplit(".", 1)[-1])
+
+    def bind(self, args: tuple, kwargs: dict, scrub: bool) -> Tuple[List[Any], Dict[str, Any]]:
+        positional: List[Any] = []
+        for index, value in enumerate(args):
+            if index == 0 and self.skip_receiver:
+                continue
+            secret = self.secret_positions[index] if index < len(self.secret_positions) else self.secret_rest
+            positional.append(MASK if scrub and secret else value)
+        named = {k: MASK if scrub and is_secret_name(str(k)) else v for k, v in kwargs.items()}
+        return positional, named
 
 
 def _now_iso() -> str:
@@ -95,18 +184,113 @@ def _exc_attrs(exc: BaseException) -> Dict[str, Any]:
     return attrs
 
 
+def _restart_in_forked_children(client: "EvalKitClient") -> None:
+    register = getattr(os, "register_at_fork", None)
+    if register is None:
+        return
+    ref = weakref.ref(client)
+
+    def after_in_child() -> None:
+        target = ref()
+        if target is None:
+            return
+        try:
+            target._after_fork_in_child()
+        except Exception:
+            pass
+
+    try:
+        register(after_in_child=after_in_child)
+    except Exception:
+        pass
+
+
+def flush_on_termination_signals(client: "EvalKitClient") -> None:
+    """Send the queue before SIGTERM or SIGINT ends the process by its default action.
+
+    A process killed by a signal's default action runs no atexit handler, so what was queued would
+    be lost. The handler already installed is kept and called: one of the application's own (or the
+    default SIGINT one, which raises KeyboardInterrupt and so still reaches atexit) is called as it
+    was, and only for the default action does the queue go out first, within the exit budget, before
+    the signal is raised again with its default action, so the process ends exactly as it would have.
+    """
+    try:
+        import signal
+    except Exception:
+        return
+    if threading.current_thread() is not threading.main_thread():
+        return
+    for name in ("SIGTERM", "SIGINT"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            previous = signal.getsignal(sig)
+        except Exception:
+            continue
+        if previous in (None, signal.SIG_IGN) or getattr(previous, "_evalkit", False):
+            continue
+
+        def handler(signum: int, frame: Any, _previous: Any = previous) -> Any:
+            if _previous is signal.SIG_DFL:
+                try:
+                    client.flush_before_exit()
+                except Exception:
+                    pass
+                signal.signal(signum, signal.SIG_DFL)
+                signal.raise_signal(signum)
+                return None
+            return _previous(signum, frame)
+
+        handler._evalkit = True  # type: ignore[attr-defined]
+        try:
+            signal.signal(sig, handler)
+        except Exception:
+            pass
+
+
 class EvalKitClient:
     def __init__(self, opts: EvalKitOptions) -> None:
         import atexit
         self._opts = opts
         self._exporter = _Exporter(opts)
         self._queue: List[TraceEnvelope] = []
-        self._lock = threading.Lock()
+        # Re-entrant: a stream or HTTP body finalised by the garbage collector can enqueue its span
+        # from inside a section that already holds the lock, on the same thread.
+        self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._flush_now = threading.Event()
         self._thread = threading.Thread(target=self._flush_loop, daemon=True)
         self._thread.start()
-        atexit.register(self.flush)
+        atexit.register(self.flush_before_exit)
+        _restart_in_forked_children(self)
+
+    def _after_fork_in_child(self) -> None:
+        """Start over in a process forked after init(): gunicorn --preload, multiprocessing's
+        fork start method, Celery's prefork pool.
+
+        A fork copies only the thread that called it, so the export thread is gone in the child,
+        and a lock another thread held at that moment would stay held for good. The child gets new
+        locks, an empty queue (what was queued belongs to the parent, which still exports it), its
+        own export thread, and a flush when the child ends, which a multiprocessing child does
+        without running atexit.
+        """
+        self._lock = threading.RLock()
+        self._queue = []
+        self._stop_event = threading.Event()
+        self._flush_now = threading.Event()
+        try:
+            self._exporter.after_fork_in_child()
+        except Exception:
+            pass
+        self._thread = threading.Thread(target=self._flush_loop, daemon=True)
+        self._thread.start()
+        register_at_shutdown = getattr(threading, "_register_atexit", None)
+        if register_at_shutdown is not None:
+            try:
+                register_at_shutdown(self.flush_before_exit)
+            except Exception:
+                pass
 
     def _meta_attrs(self) -> Dict[str, Any]:
         attrs: Dict[str, Any] = {"evalkit.sdk_version": SDK_VERSION}
@@ -237,6 +421,15 @@ class EvalKitClient:
 
     def enqueue(self, envelope: TraceEnvelope) -> None:
         try:
+            if tracing_suppressed():
+                return
+            owner = _llm_call_owner.get()
+            if owner is not None and envelope.span_type == "llm_call" and envelope.sdk_version:
+                try:
+                    if owner(envelope):
+                        return
+                except Exception:
+                    pass
             if envelope.span_type == "llm_call" and envelope.sdk_version:
                 # Recorded while the framework span around the call is still open, so the bridge can tell
                 # that span is a second record of this request when it exports it.
@@ -277,8 +470,10 @@ class EvalKitClient:
         with self._lock:
             if not self._queue:
                 return True
-            pending = self._queue[:]
-            self._queue.clear()
+            # Swapped rather than copied and cleared, so a span enqueued re-entrantly while the
+            # new list is made lands in the batch being exported, not in a list then cleared.
+            pending = self._queue
+            self._queue = []
         size = max(1, int(self._opts.max_export_batch_size or 1))
         ok = True
         for start in range(0, len(pending), size):
@@ -294,12 +489,12 @@ class EvalKitClient:
                 break
         return ok
 
-    def _flush_bridge(self) -> None:
+    def _flush_bridge(self, timeout_millis: int = 5000) -> None:
         try:
             from .otel_provider import flush_otel
         except Exception:
             return
-        flush_otel()
+        flush_otel(timeout_millis)
 
     def _flush_stream_bodies(self) -> None:
         try:
@@ -315,6 +510,28 @@ class EvalKitClient:
         self._flush_stream_bodies()
         self._flush_bridge()
         return self._drain()
+
+    def flush_before_exit(self, budget_s: float = EXIT_FLUSH_BUDGET_S) -> bool:
+        """Send what is queued as the process ends, within budget_s seconds in all.
+
+        What the receiver has not taken by then is dropped rather than waited for.
+        """
+        deadline = time.monotonic() + max(0.0, budget_s)
+        try:
+            self._exporter.exit_deadline = deadline
+        except Exception:
+            pass
+        try:
+            self._flush_stream_bodies()
+            self._flush_bridge(timeout_millis=max(1, int((deadline - time.monotonic()) * 1000)))
+            return self._drain()
+        except Exception:
+            return False
+        finally:
+            try:
+                self._exporter.exit_deadline = None
+            except Exception:
+                pass
 
     def destroy(self) -> None:
         self._stop_event.set()
@@ -598,6 +815,9 @@ class EvalKitClient:
 
         return end, ctx
 
+    def _records_io(self, capture_io: bool, params: "_IOParams") -> bool:
+        return capture_io and (self._opts.capture_secrets or not params.secret_function)
+
     def trace_function(
         self,
         name: Optional[str] = None,
@@ -607,14 +827,17 @@ class EvalKitClient:
         def decorator(fn: F) -> F:
             span_name = name or fn.__qualname__
             base_attrs = {"evalkit.span_type": "function_call", **(attributes or {})}
+            params = _IOParams(fn, span_name)
 
             def _mk_attrs(args: tuple, kwargs: dict) -> Dict[str, Any]:
                 a = dict(base_attrs)
-                if capture_io:
-                    if args:
-                        a["function.args"] = _safe_io(list(args))
-                    if kwargs:
-                        a["function.kwargs"] = _safe_io(kwargs)
+                if self._records_io(capture_io, params):
+                    scrub = not self._opts.capture_secrets
+                    positional, named = params.bind(args, kwargs, scrub)
+                    if positional:
+                        a["function.args"] = _safe_io(positional, scrub=scrub)
+                    if named:
+                        a["function.kwargs"] = _safe_io(named, scrub=scrub)
                 return a
 
             if asyncio.iscoroutinefunction(fn):
@@ -628,10 +851,6 @@ class EvalKitClient:
                         return await fn(*args, **kwargs)
                     try:
                         result = await fn(*args, **kwargs)
-                        if capture_io and result is not None:
-                            attrs["function.result"] = _safe_io(result)
-                        end("OK")
-                        return result
                     except Exception as exc:
                         try:
                             attrs.update(_exc_attrs(exc))
@@ -639,12 +858,21 @@ class EvalKitClient:
                         except Exception:
                             pass
                         raise
+                    else:
+                        # Recording the result must never turn the call's success into an error.
+                        try:
+                            if result is not None and self._records_io(capture_io, params):
+                                attrs["function.result"] = _safe_io(result, scrub=not self._opts.capture_secrets)
+                            end("OK")
+                        except Exception:
+                            pass
+                        return result
                     finally:
                         try:
                             _current_span.reset(token)
                         except Exception:
                             pass
-                return async_wrapper
+                return _mark_traced(async_wrapper)
             else:
                 @functools.wraps(fn)
                 def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -656,10 +884,6 @@ class EvalKitClient:
                         return fn(*args, **kwargs)
                     try:
                         result = fn(*args, **kwargs)
-                        if capture_io and result is not None:
-                            attrs["function.result"] = _safe_io(result)
-                        end("OK")
-                        return result
                     except Exception as exc:
                         try:
                             attrs.update(_exc_attrs(exc))
@@ -667,12 +891,21 @@ class EvalKitClient:
                         except Exception:
                             pass
                         raise
+                    else:
+                        # Recording the result must never turn the call's success into an error.
+                        try:
+                            if result is not None and self._records_io(capture_io, params):
+                                attrs["function.result"] = _safe_io(result, scrub=not self._opts.capture_secrets)
+                            end("OK")
+                        except Exception:
+                            pass
+                        return result
                     finally:
                         try:
                             _current_span.reset(token)
                         except Exception:
                             pass
-                return sync_wrapper
+                return _mark_traced(sync_wrapper)
 
         return decorator
 
@@ -684,6 +917,7 @@ class EvalKitClient:
     ) -> Callable[[F], F]:
         def decorator(fn: F) -> F:
             tool_name = name or fn.__qualname__
+            params = _IOParams(fn, tool_name)
 
             def _mk_attrs(args: tuple, kwargs: dict) -> Dict[str, Any]:
                 a: Dict[str, Any] = {
@@ -692,13 +926,17 @@ class EvalKitClient:
                     "gen_ai.tool.name": tool_name,
                     **(attributes or {}),
                 }
-                if capture_io:
-                    if args and kwargs:
-                        a["tool.arguments"] = _safe_io({"args": list(args), "kwargs": kwargs})
-                    elif kwargs:
-                        a["tool.arguments"] = _safe_io(kwargs)
-                    elif args:
-                        a["tool.arguments"] = _safe_io(args[0] if len(args) == 1 else list(args))
+                if self._records_io(capture_io, params):
+                    scrub = not self._opts.capture_secrets
+                    positional, named = params.bind(args, kwargs, scrub)
+                    if positional and named:
+                        a["tool.arguments"] = _safe_io({"args": positional, "kwargs": named}, scrub=scrub)
+                    elif named:
+                        a["tool.arguments"] = _safe_io(named, scrub=scrub)
+                    elif positional:
+                        a["tool.arguments"] = _safe_io(
+                            positional[0] if len(positional) == 1 else positional, scrub=scrub,
+                        )
                 return a
 
             if asyncio.iscoroutinefunction(fn):
@@ -712,10 +950,6 @@ class EvalKitClient:
                         return await fn(*args, **kwargs)
                     try:
                         result = await fn(*args, **kwargs)
-                        if capture_io and result is not None:
-                            attrs["tool.result"] = _safe_io(result)
-                        end("OK")
-                        return result
                     except Exception as exc:
                         try:
                             attrs.update(_exc_attrs(exc))
@@ -723,12 +957,21 @@ class EvalKitClient:
                         except Exception:
                             pass
                         raise
+                    else:
+                        # Recording the result must never turn the call's success into an error.
+                        try:
+                            if result is not None and self._records_io(capture_io, params):
+                                attrs["tool.result"] = _safe_io(result, scrub=not self._opts.capture_secrets)
+                            end("OK")
+                        except Exception:
+                            pass
+                        return result
                     finally:
                         try:
                             _current_span.reset(token)
                         except Exception:
                             pass
-                return async_wrapper
+                return _mark_traced(async_wrapper)
             else:
                 @functools.wraps(fn)
                 def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -740,10 +983,6 @@ class EvalKitClient:
                         return fn(*args, **kwargs)
                     try:
                         result = fn(*args, **kwargs)
-                        if capture_io and result is not None:
-                            attrs["tool.result"] = _safe_io(result)
-                        end("OK")
-                        return result
                     except Exception as exc:
                         try:
                             attrs.update(_exc_attrs(exc))
@@ -751,12 +990,21 @@ class EvalKitClient:
                         except Exception:
                             pass
                         raise
+                    else:
+                        # Recording the result must never turn the call's success into an error.
+                        try:
+                            if result is not None and self._records_io(capture_io, params):
+                                attrs["tool.result"] = _safe_io(result, scrub=not self._opts.capture_secrets)
+                            end("OK")
+                        except Exception:
+                            pass
+                        return result
                     finally:
                         try:
                             _current_span.reset(token)
                         except Exception:
                             pass
-                return sync_wrapper
+                return _mark_traced(sync_wrapper)
 
         return decorator
 

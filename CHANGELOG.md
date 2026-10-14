@@ -1,5 +1,161 @@
 # Changelog
 
+## 0.3.5 — 2026-10-14
+
+### Security
+- Function and tool arguments are masked by the parameter they are bound to. `trace_function`,
+  `trace_tool`, `@traced`, `trace_module` and automatic function tracing record `function.args` as
+  a list of positional values, which the scrubber could only search by value shape, so a key
+  passed positionally (`judge_body(model, messages, api_key)`) went out as written unless it
+  looked like `sk-…` or `tk_live_…`. Each value is now matched to its parameter through
+  `inspect.signature`, and one whose parameter is named like a credential (`key`, `api_key`,
+  `secret`, `token`, `password`, `credentials`, `auth`, `cookie`, `dsn`, `jwt`, `bearer`, in snake or
+  camel case) is recorded as `***`, positional or keyword. `max_tokens`, `token_count` and other
+  counts keep their values. A function or tool whose own name reads that way (`get_api_key`,
+  `presented_token`) records neither arguments nor result.
+- Arguments and results are scrubbed before they are serialized and cut to 4096 characters. A
+  longer value used to be cut first, and the cut JSON no longer parsed, so `"api_key": "…"`
+  inside it was found only by the value's shape. An object recorded through its `str()` (a
+  pydantic model, `api_key='…'`) is scrubbed the same way, and the tail of a cut value is
+  dropped with the cut, so no secret is left half-recognised at the end.
+- More shapes are masked everywhere the scrubber runs: PEM private keys (whole, or cut before
+  their `END` line), JSON Web Tokens, Google API keys (`AIza…`), the userinfo of a URL or DSN
+  written into text (`postgres://user:pass@host`), and quoted assignments to a credential name
+  (`password: "…"`, `api_key='…'`). An unquoted `token=abc` in prose and `max_tokens: 5` are left
+  alone.
+
+- `capture_content=False` removes content that other OpenTelemetry instrumentation put on the
+  spans the SDK forwards, whatever that instrumentation's own content switch says:
+  `gen_ai.input.messages`, `gen_ai.output.messages`, `gen_ai.system_instructions`, `gen_ai.prompt`,
+  `gen_ai.completion`, `gen_ai.retrieval.query.text` and `gen_ai.retrieval.documents`, flattened
+  message fields such as `gen_ai.prompt.0.content` and `llm.input_messages.0.message.content`,
+  `input.value` and `output.value`, keys ending in `.observation.input`, `.trace.output`,
+  `.entity.input` and the like, and the `content`, `message` and `tool_calls` of `gen_ai.*` events
+  (`gen_ai.user.message`, `gen_ai.choice`). Model, tokens, cost, timing, roles, finish reasons and
+  tool names stay. A streamed refusal (`gen_ai.response.refusal`) is now content too.
+- camelCase keys are matched like their snake_case spellings: `accessToken`, `authToken`,
+  `refreshToken` and `secretKey` are masked; `maxTokens`, `inputCostPerAudioToken` and flags such as
+  `hasToken` are not.
+
+### Added
+- psycopg2 is traced: each `connect()` as a `postgresql CONNECT` span (with `db.name`,
+  `server.address`, `server.port`, never the DSN), and each cursor's `execute` and `executemany` as
+  a `db_query` span with the statement, operation, table and row count, under the same
+  `capture_content` rules as psycopg 3. Cursors keep their class (`RealDictCursor`, `DictCursor`)
+  and every method; connections made through `psycopg2.pool` are traced too.
+- A process forked after `init()` (gunicorn `--preload`, `multiprocessing` with `fork`, Celery
+  prefork) restarts the export thread with new locks and an empty queue, so its spans are sent while
+  it runs; a `multiprocessing` child also flushes as it ends.
+
+### Fixed
+- A streamed call that fails before its stream opens (a refused connection, a 400 or a 401) is
+  recorded as an `ERROR` model-call span with the model, the prompt, the request settings and the
+  exception's type and stack, for OpenAI and Anthropic `create(stream=True)` (sync and async,
+  patched automatically or by hand), Anthropic on Vertex and LiteLLM. It used to leave no span.
+- A function decorated with `trace_function` or `trace_tool` (also with `capture_io=False`) in the
+  automatically traced source tree is no longer wrapped a second time, which recorded two spans per
+  call and the arguments `capture_io=False` withheld. A decorator stacked on top with
+  `functools.wraps` carries the same mark.
+- An Anthropic reply made only of tool calls has no time to first token: the first
+  `input_json_delta` no longer stops the clock. Text and thinking deltas still do, and thinking stays
+  out of the completion.
+- `init()` no longer changes the application's logging. It used to replace the formatter of the
+  root logger's stream handlers, add a console handler and set the root level to `INFO`, and its
+  handler on the root logger made a later `logging.basicConfig()` do nothing. Records that reach the
+  root logger are still recorded as `log` spans and carry `trace_id` and `span_id`.
+- The health-check filter matches whole path segments (`/health`, `/healthz`, `/health/live`,
+  `/readyz`, `/livez`, `/actuator/health`), so `/healthcare` and `/api/health-records` are recorded.
+  A skipped probe made with `requests` is also left out by urllib3's OpenTelemetry instrumentation.
+- Per-token prices such as `input_cost_per_audio_token` and `output_cost_per_reasoning_token` are no
+  longer masked as credentials; `access_token`, `refresh_token` and `id_token` still are.
+- A key that prices or counts tokens is left unmasked by the same rule as in the TypeScript SDK,
+  so it masks alike from either: `price_per_*` (`price_per_1k_token`), any number of billed kinds
+  after `per` (`per_cache_read_token`, `per_cache_creation_input_token`), and the `tool`, `read`,
+  `write`, `creation` and `thinking` kinds (`input_cost_per_tool_token`), as well as the
+  `per_character_token` already exempt. `per_user_token` and any other per-something token stay
+  masked.
+- The framework integrations no longer record health and readiness probes: `EvalKitMiddleware`
+  (FastAPI and Starlette), `instrument_flask`, `EvalKitDjangoMiddleware` and
+  `create_litestar_middleware()` skip `/health`, `/healthz`, `/health/live`, `/readyz`, `/livez`
+  and the other paths of the whole-segment rule outgoing calls are skipped by, which the
+  TypeScript SDK applies as well; `/healthcare` and `/api/health-records` are recorded. Each poll was
+  a trace of its own. Nothing recorded while the probe is answered is sent either: a database ping,
+  a traced function, a log line, another library's span, or the server span FastAPI's own telemetry
+  opened for the probe. Work the handler starts that runs on after the response, such as a
+  Starlette background task or a thread, is traced as usual. The probe's response is unchanged and
+  carries no `X-Trace-Id`.
+- The warning for a streamed OpenAI call without a usage chunk says what happens: the trace service
+  estimates the tokens and marks the span `evalkit.cost_estimated`. It names
+  `stream_options={"include_usage": True}` for exact counts.
+- OpenTelemetry's psycopg and psycopg2 spans are dropped only when the SDK traces that driver
+  itself; before, they were dropped even when it did not.
+- Instrumentation never breaks the instrumented call: a failure while starting, recording or
+  exporting a span is logged at debug level and the call runs and returns as if untraced, and a
+  provider's exception reaches the caller unchanged. Passing the message object of an earlier reply
+  back in `messages` no longer raises inside the SDK, and `messages` given as a generator is no
+  longer consumed before the request.
+- Stream wrappers behave as the provider's stream: `next()`, `close()`, `isinstance(stream,
+  openai.Stream)` and the raw-response helpers (`with_raw_response`, `with_streaming_response`) work,
+  and a stream dropped before it ends records its span when it is collected. What a span keeps of a
+  stream is capped (1 MiB of text, 64 KiB of arguments per tool call, 256 tool calls).
+- The `requests` and `aiohttp` wrappers add `traceparent` to a copy of the caller's headers instead
+  of the caller's own dict, and pass positional arguments through.
+- `httpx2` clients are traced like `httpx` ones, so a provider client running on httpx2 (OpenAI's
+  `DefaultHttpx2Client`, and newer OpenAI releases by default) records its HTTP request again.
+- A worker stopped by its server no longer loses the spans of its last seconds. The ASGI
+  middleware flushes on lifespan shutdown, before reporting it complete (uvicorn `--workers` and
+  `--reload` end the worker right after, without running `atexit`), and `init()` chains SIGTERM and
+  SIGINT: the handler already installed is called as before, and only where the signal's default
+  action would end the process without `atexit` is the queue sent first.
+- The flush as the process ends takes at most 3 s in all, so an unreachable receiver no longer
+  holds an exit for about 20 s (or about 4 s when the connection is refused). `evalkit.flush()`
+  keeps its full retry budget.
+- A LlamaIndex model call and the provider request it makes are one `llm_call` span: the provider's
+  record, with its exact usage, plus `evalkit.framework` and `llama_index.class`. They were two
+  spans, so the call's tokens and cost were counted twice. A streamed chat is sent once its request
+  ends.
+- A Litestar app, and a Django app served through ASGI, no longer lose the spans of a worker's
+  last seconds either; `on_shutdown=[evalkit.flush]` is no longer needed. Their middleware never
+  sees the lifespan scope: Litestar answers it before any middleware runs, so
+  `create_litestar_middleware()` makes the `Litestar` class flush before it reports the shutdown
+  complete, after the app's own `on_shutdown` hooks. Django's ASGI handler refuses the lifespan,
+  so uvicorn ran it without one; `EvalKitDjangoMiddleware` gives the handler a lifespan that starts
+  at once and flushes at shutdown, and leaves alone a handler that answers the lifespan itself.
+  Under `uvicorn --workers 2`, 3 requests sent just before a SIGTERM left no spans for either and
+  now all arrive, as they do for Litestar under `--reload`. The flush keeps the 3 s exit budget.
+  Flask and Django under gunicorn already sent them through the exit flush.
+- Streamed OpenAI Responses calls on the async client are traced:
+  `AsyncOpenAI().responses.create(stream=True)` and `responses.stream()` record one `llm_call`
+  span, as the sync client does; they left none. Both clients now read a Responses stream through
+  the tracer the chat completion streams use, so the span has the time to first token (text,
+  refusal and reasoning deltas stop the clock, tool arguments do not), the assembled text, the
+  tool calls (from the final response, built-in tools and citations included, or from the argument
+  deltas when the stream was cut off), the usage and the response id and model. A stream that fails
+  to open is an `ERROR` span with the request and the exception; one that fails part way, or whose
+  response ends with `response.failed` or an `error` event, is an `ERROR` span with the text
+  received so far. The caller gets the client's own stream: `isinstance(stream, openai.AsyncStream)`,
+  `next()` and `anext()`, `close()`, `with` and `async with`, `get_final_response()` and
+  `with_raw_response` work. A sync Responses stream used to have no time to first token, was
+  recorded `OK` when it failed and was not an `openai.Stream`.
+- A Responses reply, streamed or not, records its reasoning summary as `gen_ai.response.thinking`,
+  its cached input tokens and `gen_ai.usage.reasoning_tokens`. Reading a Responses request for its
+  span no longer fails the call: an input part whose `text` is `None` raised `TypeError` before
+  the request was sent, and any other failure there now sends the request untraced.
+
+### Changed
+- `evalkit.flush()` returns whether the receiver took everything that was queued, and `False`
+  before `init()`, as the TypeScript SDK's `flush()` does; it never raises. It raised
+  `RuntimeError` before `init()`, so a shutdown hook or test teardown that flushes failed in a
+  process that never initialised the SDK.
+- The receiver of a method (`self`, `cls`) is no longer recorded as the first item of
+  `function.args`; it was the object's default repr.
+- `capture_secrets=True` (`EVALKIT_CAPTURE_SECRETS`) still records arguments and results as given.
+- A statement SQLAlchemy already records (through its OpenTelemetry instrumentation or
+  `patch_sqlalchemy_engine`) is not recorded again by the psycopg 3, psycopg2 or PyMySQL tracer
+  underneath.
+- `install_logging_handler()` only adds its handler; it no longer sets the logger's level or
+  replaces other handlers' formatters.
+
 ## 0.3.4 — 2026-10-12
 
 ### Added

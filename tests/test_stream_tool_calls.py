@@ -398,6 +398,126 @@ class TestAnthropicStreamingToolCalls(StreamToolCallBase):
         self.assertEqual(json.loads(tools[1].attributes[TOOL_ARGS]), {"b": 2})
 
 
+TTFT = "gen_ai.server.time_to_first_token_ms"
+
+
+def _anthropic_async(client, events):
+    from evalkit.instrumentation import auto as _auto
+
+    async def agen():
+        for e in events:
+            yield e
+
+    class FakeAsyncMessages:
+        async def create(self, *a, **k):
+            return agen()
+
+    _auto._patch_anthropic_class_async(client, FakeAsyncMessages)
+    return FakeAsyncMessages()
+
+
+def _explicit_anthropic(client, events):
+    import types as _types
+
+    from evalkit.instrumentation.llm.anthropic import patch_anthropic
+
+    class FakeMessages:
+        def create(self, *a, **k):
+            return iter(events)
+
+    messages = FakeMessages()
+    patch_anthropic(client, _types.SimpleNamespace(messages=messages))
+    return messages
+
+
+class _ThinkingDelta:
+    def __init__(self, thinking, index=0):
+        import types as _types
+
+        self.type = "content_block_delta"
+        self.index = index
+        self.delta = _types.SimpleNamespace(type="thinking_delta", thinking=thinking)
+
+
+class TestAnthropicTimeToFirstToken(StreamToolCallBase):
+    """Only generated text stops the clock; a reply made only of tool calls has no time to first token."""
+
+    def _tool_only(self):
+        return [
+            AStreamMessageStart(input_tokens=30),
+            AStreamBlockStart(0, type="tool_use", name="lookup_order", id="toolu_01"),
+            AStreamJsonDelta(0, '{"order_id"'),
+            AStreamJsonDelta(0, ': "ORD-42"}'),
+            AStreamMessageDelta(output_tokens=12, stop_reason="tool_use"),
+        ]
+
+    def _assert_tool_only(self, span):
+        self.assertNotIn(
+            TTFT, span.attributes,
+            "input_json_delta carries tool arguments, not generated text; a tool-only reply has no first token, "
+            "and recording one would put tool-argument latency into the time-to-first-token percentiles",
+        )
+        self.assertEqual(len(self._tools(span)), 1, "the tool call itself is still recorded")
+        self.assertEqual(span.status, "OK")
+
+    def test_tool_only_reply_has_no_time_to_first_token(self):
+        fm = _anthropic_sync(self.client, self._tool_only())
+        list(fm.create(model="claude-sonnet-4-5", messages=[], stream=True))
+        self._assert_tool_only(self._span())
+
+    def test_tool_only_async_reply_has_no_time_to_first_token(self):
+        fm = _anthropic_async(self.client, self._tool_only())
+
+        async def run():
+            stream = await fm.create(model="claude-sonnet-4-5", messages=[], stream=True)
+            async for _ in stream:
+                pass
+
+        asyncio.run(run())
+        self._assert_tool_only(self._span())
+
+    def test_tool_only_reply_through_the_explicit_patch(self):
+        fm = _explicit_anthropic(self.client, self._tool_only())
+        list(fm.create(model="claude-sonnet-4-5", messages=[], stream=True))
+        self._assert_tool_only(self._span())
+
+    def test_text_after_a_tool_block_still_has_time_to_first_token(self):
+        events = self._tool_only()[:-1] + [
+            AStreamBlockStart(1, type="text"), AStreamTextDelta("Looking it up.", index=1),
+            AStreamMessageDelta(output_tokens=20, stop_reason="end_turn"),
+        ]
+        fm = _anthropic_sync(self.client, events)
+        list(fm.create(model="claude-sonnet-4-5", messages=[], stream=True))
+        span = self._span()
+        self.assertIsInstance(span.attributes.get(TTFT), int)
+        self.assertEqual(span.completion, "Looking it up.")
+
+    def test_thinking_stops_the_clock_but_stays_out_of_the_completion(self):
+        events = [
+            AStreamMessageStart(input_tokens=30),
+            AStreamBlockStart(0, type="thinking"),
+            _ThinkingDelta("The user wants order ORD-42."),
+            AStreamBlockStart(1, type="text"),
+            AStreamTextDelta("Your order shipped.", index=1),
+            AStreamMessageDelta(output_tokens=40, stop_reason="end_turn"),
+        ]
+        fm = _anthropic_sync(self.client, events)
+        list(fm.create(model="claude-sonnet-4-5", messages=[], stream=True))
+        span = self._span()
+        self.assertIsInstance(span.attributes.get(TTFT), int, "thinking text is generated text")
+        self.assertEqual(span.completion, "Your order shipped.")
+        self.assertEqual(span.attributes.get("gen_ai.response.thinking"), "The user wants order ORD-42.")
+
+    def test_openai_tool_only_reply_has_no_time_to_first_token_either(self):
+        fc = _openai_sync(self.client, [
+            OStreamToolChunk(tool_calls=[OStreamToolCall(0, id="call_1", name="lookup_order", arguments="")]),
+            OStreamToolChunk(tool_calls=[OStreamToolCall(0, arguments='{"order_id": "1001"}')]),
+            OStreamToolChunk(finish_reason="tool_calls"),
+        ])
+        list(fc.create(model="gpt-4o-mini", messages=[], stream=True))
+        self.assertNotIn(TTFT, self._span().attributes)
+
+
 class TestAbandonedAndCancelledStreams(StreamToolCallBase):
     def test_a_stream_abandoned_early_still_emits_what_it_saw(self):
         chunks = [
