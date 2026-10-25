@@ -164,7 +164,7 @@ def _patch_sync(ek: "EvalKitClient", Client: Any) -> None:
             end_ts = _now_iso()
             ek.enqueue(TraceEnvelope(
                 trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                span_type="llm_call", status="ERROR", status_message=str(exc),
+                span_type="llm_call", status="ERROR", status_message=str(exc), exception=exc,
                 operation="chat", service_name=ek._opts.service_name, provider="ollama", model=model,
                 prompt=prompt, latency_ms=int(time.time() * 1000 - start_ms), start_time=ts, end_time=end_ts, created_at=ts,
                 attributes={**ek._meta_attrs(), "gen_ai.request.model": model,
@@ -293,7 +293,7 @@ def _patch_async(ek: "EvalKitClient", AsyncClient: Any) -> None:
             end_ts = _now_iso()
             ek.enqueue(TraceEnvelope(
                 trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                span_type="llm_call", status="ERROR", status_message=str(exc),
+                span_type="llm_call", status="ERROR", status_message=str(exc), exception=exc,
                 operation="chat", service_name=ek._opts.service_name, provider="ollama", model=model,
                 prompt=prompt, latency_ms=int(time.time() * 1000 - start_ms), start_time=ts, end_time=end_ts, created_at=ts,
                 attributes={**ek._meta_attrs(), "gen_ai.request.model": model,

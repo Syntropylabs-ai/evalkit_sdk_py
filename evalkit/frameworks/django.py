@@ -4,14 +4,15 @@ import json
 import sys
 from typing import Any, Callable
 
-from ..core.client import EvalKitClient
+from ..core.client import EvalKitClient, release_ambient_trace
 from ..core.context import _current_span, reset_identity, set_identity
 from ..utils.headers import parse_traceparent
+from ._bodies import is_binary, is_event_stream
 from ._identity import user_id_of
 from ._lifespan import answer_lifespan_when_refused, registered_clients
-from ._probe import is_probe, probe_untraced
+from ._probe import is_ignored, probe_untraced
 
-_BODY_MAX = 10 * 1024 * 1024
+_BODY_MAX = 64 * 1024
 
 _SENSITIVE_META = {
     "HTTP_AUTHORIZATION", "HTTP_COOKIE", "HTTP_X_API_KEY",
@@ -47,6 +48,29 @@ def _sanitize_response_headers(response: Any) -> dict:
     return out
 
 
+def _request_body(request: Any) -> Any:
+    """The request body, when the request says it is small enough to keep and is not an upload.
+
+    ``request.body`` reads the whole body into memory and keeps it there, so it is read only under the
+    limit: an upload, or a body of unknown length, is left for the view to stream.
+    """
+    meta = getattr(request, "META", None) or {}
+    try:
+        length = int(meta.get("CONTENT_LENGTH") or 0)
+    except (TypeError, ValueError):
+        return None
+    if length <= 0 or length > _BODY_MAX or is_binary(meta.get("CONTENT_TYPE")):
+        return None
+    raw = request.body[:_BODY_MAX]
+    try:
+        return json.loads(raw)
+    except Exception:
+        try:
+            return raw.decode("utf-8", errors="replace") or None
+        except Exception:
+            return None
+
+
 def django_route(request: Any) -> "str | None":
     """The resolved URL pattern (`/orders/<int:order_id>/`), or None when nothing resolved (a 404).
 
@@ -57,6 +81,17 @@ def django_route(request: Any) -> "str | None":
         route = getattr(getattr(request, "resolver_match", None), "route", None)
     except Exception:
         return None
+    if not isinstance(route, str) or not route:
+        return None
+    return route if route.startswith("/") else "/" + route
+
+
+def _route_before_resolving(request: Any) -> "str | None":
+    """The URL pattern a request will resolve to, for a callable in ignore_routes that reads it: Django
+    resolves the URL only after the middleware has let the request in."""
+    from django.urls import resolve
+
+    route = getattr(resolve(getattr(request, "path_info", None) or request.path), "route", None)
     if not isinstance(route, str) or not route:
         return None
     return route if route.startswith("/") else "/" + route
@@ -91,10 +126,17 @@ class EvalKitDjangoMiddleware:
 
     def __call__(self, request: Any) -> Any:
         global _BODY_MAX
-        if is_probe(getattr(request, "path", None)):
+        if is_ignored(getattr(request, "method", None), getattr(request, "path", None),
+                      resolve_route=lambda: _route_before_resolving(request)):
             with probe_untraced():
                 return self.get_response(request)
         identity_token = None
+        try:
+            enabled = getattr(self._get_client(), "enabled", True)
+        except Exception:
+            enabled = True
+        if not enabled:
+            return self.get_response(request)
         try:
             client = self._get_client()
             _BODY_MAX = client._opts.max_body_bytes
@@ -113,13 +155,9 @@ class EvalKitDjangoMiddleware:
             body_json: Any = None
             if method in ("POST", "PUT", "PATCH"):
                 try:
-                    body_json = json.loads(request.body[:_BODY_MAX])
+                    body_json = _request_body(request)
                 except Exception:
-                    try:
-                        body_text = request.body[:_BODY_MAX].decode("utf-8", errors="replace")
-                        body_json = body_text or None
-                    except Exception:
-                        pass
+                    body_json = None
 
             request_user_id = user_id_of(getattr(request, "user", None))
             if request_user_id:
@@ -151,16 +189,23 @@ class EvalKitDjangoMiddleware:
             except Exception:
                 pass
             try:
-                if not getattr(response, "streaming", False):
+                content_type = response.get("Content-Type") if hasattr(response, "get") else None
+                if (not getattr(response, "streaming", False) and not is_event_stream(content_type)
+                        and not is_binary(content_type)):
                     content = getattr(response, "content", b"") or b""
                     if content:
                         resp_body = content[:_BODY_MAX].decode("utf-8", errors="replace") or None
             except Exception:
                 pass
             try:
+                # A view's exception is turned into a 500 response before it reaches here;
+                # process_exception kept it.
+                raised = getattr(request, "_evalkit_exception", None)
                 end("ERROR" if sc >= 400 else "OK", status_code=sc,
                     response_body=resp_body, response_headers=resp_headers,
-                    route=django_route(request))
+                    route=django_route(request),
+                    exception=raised if isinstance(raised, BaseException) else None,
+                    exception_escaped=False)
             except Exception:
                 pass
             try:
@@ -169,9 +214,9 @@ class EvalKitDjangoMiddleware:
             except Exception:
                 pass
             return response
-        except Exception:
+        except BaseException as exc:
             try:
-                end("ERROR", status_code=500, route=django_route(request))
+                end("ERROR", status_code=500, route=django_route(request), exception=exc)
             except Exception:
                 pass
             raise
@@ -182,6 +227,16 @@ class EvalKitDjangoMiddleware:
                 pass
             if identity_token is not None:
                 reset_identity(identity_token)
+            release_ambient_trace(trace_id)
+            try:
+                request._evalkit_exception = None
+            except Exception:
+                pass
 
     def process_exception(self, request: Any, exception: Exception) -> None:
-        pass
+        # Kept for the request's span; returning None leaves the exception to Django's own handling.
+        try:
+            request._evalkit_exception = exception
+        except Exception:
+            pass
+        return None

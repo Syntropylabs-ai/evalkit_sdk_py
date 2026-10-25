@@ -170,18 +170,12 @@ def _dump(o: Any) -> Any:
     return o
 
 
-def _safe_body(obj: Any, limit: int = 16384) -> Optional[str]:
-    if obj is None:
-        return None
-    import json as _json
-    try:
-        s = _json.dumps(obj, default=str)
-    except Exception:
-        try:
-            s = str(obj)
-        except Exception:
-            return None
-    return s if len(s) <= limit else s[:limit] + "…"
+def _safe_body(obj: Any, limit: Optional[int] = None) -> Optional[str]:
+    # The shared body writer: kept whole here, cut at the per-value limit (start and end kept) when the
+    # span is queued, so a long conversation keeps its newest turns.
+    from ._bodies import _safe_body as _shared_safe_body
+
+    return _shared_safe_body(obj, limit)
 
 
 def _request_body(contents: Any, config: Any) -> Optional[str]:
@@ -218,6 +212,7 @@ def _build_envelope(
     attrs: Optional[Dict[str, Any]] = None,
     request_body: Optional[str] = None,
     response_body: Optional[str] = None,
+    exception: Optional[BaseException] = None,
 ) -> TraceEnvelope:
     base_attrs: Dict[str, Any] = {
         **client._meta_attrs(),
@@ -259,6 +254,7 @@ def _build_envelope(
         session_id=session_id,
         device_id=device_id or client._opts.device_id,
         sdk_version=SDK_VERSION,
+        exception=exception,
     )
 
 
@@ -289,7 +285,7 @@ def _patch_sync_models(ek: EvalKitClient, gm: Any) -> None:
                     model=model, prompt=prompt, completion="", tokens_in=0, tokens_out=0,
                     latency=latency, ts=ts, end_ts=end_ts,
                     session_id=session_id, device_id=device_id,
-                    status="ERROR", status_message=str(exc),
+                    status="ERROR", status_message=str(exc), exception=exc,
                 ))
                 raise
             finally:
@@ -340,7 +336,7 @@ def _patch_sync_models(ek: EvalKitClient, gm: Any) -> None:
                         model=model, prompt=prompt, completion="", tokens_in=0, tokens_out=0,
                         latency=int(time.time() * 1000 - start_ms), ts=ts, end_ts=end_ts,
                         session_id=session_id, device_id=device_id,
-                        status="ERROR", status_message=str(exc), attrs={"gen_ai.streaming": True},
+                        status="ERROR", status_message=str(exc), exception=exc, attrs={"gen_ai.streaming": True},
                     ))
                     raise
 
@@ -432,7 +428,7 @@ def _patch_async_models(ek: EvalKitClient, gm: Any) -> None:
                     model=model, prompt=prompt, completion="", tokens_in=0, tokens_out=0,
                     latency=latency, ts=ts, end_ts=end_ts,
                     session_id=session_id, device_id=device_id,
-                    status="ERROR", status_message=str(exc),
+                    status="ERROR", status_message=str(exc), exception=exc,
                 ))
                 raise
             finally:
@@ -483,7 +479,7 @@ def _patch_async_models(ek: EvalKitClient, gm: Any) -> None:
                         model=model, prompt=prompt, completion="", tokens_in=0, tokens_out=0,
                         latency=int(time.time() * 1000 - start_ms), ts=ts, end_ts=end_ts,
                         session_id=session_id, device_id=device_id,
-                        status="ERROR", status_message=str(exc), attrs={"gen_ai.streaming": True},
+                        status="ERROR", status_message=str(exc), exception=exc, attrs={"gen_ai.streaming": True},
                     ))
                     raise
 

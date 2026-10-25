@@ -62,15 +62,25 @@ evalkit.init(
     debug=False,                                    # verbose exporter logging
     max_export_batch_size=512,                      # flush trigger
     scheduled_delay_ms=5000,                        # background flush interval
-    max_queue_size=4096,                            # ring buffer cap (oldest dropped when full)
-    max_body_bytes=10 * 1024 * 1024,               # cap on captured HTTP req/resp bodies
+    max_queue_size=4096,                            # queue cap (oldest non-model-call span dropped when full)
+    max_queue_bytes=32 * 1024 * 1024,               # about how many bytes the queue may hold
+    max_body_bytes=64 * 1024,                       # cap on captured HTTP req/resp bodies
+    max_value_bytes=None,                           # per-value cap, 16 MiB (head and tail kept)
     environment=None,                               # e.g. "production" / "staging"
     app_version=None,                               # e.g. "1.4.2"
     device_id=None,
     function_tracing=True,                          # auto-trace your own functions at import time
     trace_packages=None,                            # extra top-level packages to function-trace
+    function_rate_limit=100,                        # spans a second per traced function (0: all)
+    log_level=None,                                 # WARNING, or EVALKIT_LOG_LEVEL
+    log_rate_limit=50,                              # log spans a second
+    sample_rate=None,                               # share of traces kept, or OTEL_TRACES_SAMPLER
+    capture_unhandled=False,                        # record uncaught exceptions
+    in_app_include=None, in_app_exclude=None,       # module prefixes that are / are not your code
 )
 ```
+
+`init()` never raises. An invalid option makes the SDK a no-op with one warning naming the problem, and `EVALKIT_DISABLED=true` or `OTEL_SDK_DISABLED=true` turns it off entirely. The README covers every option under [Configuration](README.md#configuration).
 
 `base_url` is where spans go. The SDK posts them to `{base_url}/v1/ingest`, with your key in the `X-Subscription-Key` header.
 
@@ -461,8 +471,10 @@ The README has the details under [Spans from other OpenTelemetry instrumentors](
 A background daemon thread exports spans in batches, and the queue is flushed when the program exits. To export the queue synchronously, for example at the end of a short-lived script or a serverless handler, call `flush()`:
 
 ```python
-evalkit.flush()
+evalkit.flush()              # waits at most 5 seconds; flush(timeout=...) to change it
 ```
+
+It never raises. `evalkit.stats()` reports what is queued and dropped, failed exports, the last error and the circuit breaker's state.
 
 ## Troubleshooting
 
@@ -470,7 +482,7 @@ evalkit.flush()
 
 Check that `init()` runs before your clients and your app are created, and that `subscription_key` is valid. Set `debug=True` to log each export, retry and auth failure.
 
-After 3 consecutive 401 or 403 responses, the exporter stops for the rest of the process. A bad key never recovers on its own, so fix the key and restart.
+After 3 consecutive 401 or 403 responses, the exporter stops for the rest of the process, and says so in a warning. A bad key never recovers on its own, so fix the key and restart. `evalkit.stats()["last_error"]` holds the last export error, and a receiver that stays down opens a circuit breaker (`circuit_state` `open`) that drops spans instead of retrying into it.
 
 ### Duplicate spans
 

@@ -11,9 +11,6 @@ from .._safe import hook_failed
 from .._toolcalls import from_anthropic_blocks
 from ._bodies import _dump, _safe_body
 
-_PROMPT_MAX = 32768
-_COMPLETION_MAX = 32768
-
 
 def _snapshot(stream: Any) -> Any:
     try:
@@ -134,7 +131,7 @@ def patch_messages_stream(
         model = kwargs.get("model", "unknown")
         temperature = kwargs.get("temperature")
         max_tokens = kwargs.get("max_tokens")
-        prompt_text = _build_prompt(kwargs.get("system"), kwargs.get("messages") or [])[:_PROMPT_MAX]
+        prompt_text = _build_prompt(kwargs.get("system"), kwargs.get("messages") or [])
         request_body = _safe_body(_dump(kwargs))
 
         def emit(message: Any = None, error: Optional[BaseException] = None) -> None:
@@ -160,7 +157,7 @@ def patch_messages_stream(
             if max_tokens is not None:
                 attrs["gen_ai.request.max_tokens"] = max_tokens
             if thinking:
-                attrs["gen_ai.response.thinking"] = thinking[:_COMPLETION_MAX]
+                attrs["gen_ai.response.thinking"] = thinking
             if has_redacted:
                 attrs["gen_ai.response.has_redacted_thinking"] = True
 
@@ -168,10 +165,10 @@ def patch_messages_stream(
                 trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                 span_type="llm_call",
                 status="ERROR" if error is not None else "OK",
-                status_message=str(error) if error is not None else None,
+                status_message=str(error) if error is not None else None, exception=error,
                 operation="messages.stream",
                 service_name=client._opts.service_name, provider=provider, model=model,
-                prompt=prompt_text, completion=completion[:_COMPLETION_MAX],
+                prompt=prompt_text, completion=completion,
                 tokens_in=tokens_in, tokens_out=tokens_out,
                 cache_read_tokens=cache_read or None, cache_creation_tokens=cache_creation or None,
                 latency_ms=int(time.time() * 1000 - start_ms),

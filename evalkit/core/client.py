@@ -31,10 +31,18 @@ from .context import (
     get_or_create_ambient_trace_id,
     tracing_suppressed,
 )
-from .exporter import _Exporter
+from .bounded import RateLimiter
+from .errors import FINGERPRINT_ATTR, apply_exception, exc_attributes
+from .exporter import _MAX_SPAN_BYTES, _Exporter
+from .health import DISABLED, PROBE_SPANS, ExportHealth
+from .ignore import ignored_callable
+from .limits import cap_envelope_values, estimate_envelope_bytes, fit_envelope
 from .otel_provider import note_sdk_model_call
+from .sampling import Sampler
 from .secrets import is_secret_name, scrub_value
+from .serialize import bounded_json
 from .types import EvalKitOptions, TraceEnvelope
+from .untraced import UNTRACED_MARKER
 from ..utils.headers import MASK
 
 _log = logging.getLogger("evalkit")
@@ -62,30 +70,32 @@ def _scrubbed_str(value: Any) -> str:
 
 
 def _safe_io(value: Any, limit: int = _IO_MAX, scrub: bool = True) -> str:
-    import json as _json
+    """A recorded argument or result as JSON, at most ``limit`` characters and ``…``.
 
-    # Secrets are masked in the value itself, before it is serialized and cut to the limit:
-    # cut JSON no longer parses, and the export-time scrubber could then only recognise a key by
-    # its shape, so an api_key of any other shape went out as written.
-    if scrub:
-        try:
-            value = scrub_value(value)
-        except Exception:
-            return "<unserializable>"
+    The writer stops at the limit instead of serializing the whole value and then cutting it, so a
+    large argument costs the traced call no more than a small one. Secrets are masked as the value is
+    walked, before anything is cut: cut JSON no longer parses, and the export-time scrubber could then
+    only recognise a key by its shape, so an api_key of any other shape would go out as written.
+    """
     try:
-        s = _json.dumps(value, default=_scrubbed_str if scrub else str)
+        return bounded_json(value, limit, scrub=scrub, fallback=str)
     except Exception:
-        try:
-            s = _scrubbed_str(value) if scrub else repr(value)
-        except Exception:
-            s = "<unserializable>"
-    return s if len(s) <= limit else s[:limit] + "…"
+        return "<unserializable>"
 
 
 # Automatic function tracing and trace_module skip a callable that carries this marker, so a
 # function a decorator already traces is not wrapped, and recorded, a second time. functools.wraps
 # copies it onto any decorator stacked on top of the traced function.
 TRACED_MARKER = "_evalkit_traced"
+
+
+def _left_untraced(fn: Any) -> bool:
+    """Whether function tracing leaves ``fn`` as it is: it is wrapped in ``evalkit.untraced``, or its
+    qualified name matches ignore_functions. Either wins over an explicit decorator."""
+    try:
+        return bool(getattr(fn, UNTRACED_MARKER, False)) or ignored_callable(fn)
+    except Exception:
+        return False
 
 
 def _mark_traced(wrapper: F) -> F:
@@ -166,22 +176,62 @@ def _stamp_agent(attrs: Dict[str, Any], agent_name: Optional[str]) -> None:
 
 
 def _exc_attrs(exc: BaseException) -> Dict[str, Any]:
-    import traceback as _tb
-    attrs = {
-        "exception.type": type(exc).__qualname__,
-        "exception.message": str(exc),
-        "exception.stacktrace": _tb.format_exc(),
-    }
+    """The span attributes recording ``exc``, for a call site that can only hand attributes on.
+
+    A span given the exception itself (``TraceEnvelope(exception=...)`` or ``end(exception=...)``) also
+    carries the ``exception`` event; see ``evalkit.core.errors``.
+    """
     try:
-        frames = _tb.extract_tb(exc.__traceback__)
-        frame = next((f for f in reversed(frames)
-                      if "site-packages" not in f.filename and "/evalkit/" not in f.filename), None) \
-            or (frames[-1] if frames else None)
-        if frame is not None:
-            attrs["error.source"] = f"{frame.filename}:{frame.lineno}"
+        return exc_attributes(exc)
+    except Exception:
+        return {"exception.type": type(exc).__qualname__}
+
+
+def _is_coroutine_function(fn: Any) -> bool:
+    if inspect.iscoroutinefunction(fn):
+        return True
+    # A function marked the way asyncio.iscoroutinefunction recognises, read without the call that
+    # Python 3.14 deprecates.
+    marker = getattr(asyncio.coroutines, "_is_coroutine", None)
+    return marker is not None and getattr(fn, "_is_coroutine", None) is marker
+
+
+def release_ambient_trace(trace_id: Optional[str]) -> None:
+    """Forget a request's trace id as the context's ambient one once the request is over.
+
+    A WSGI server answers request after request on the same thread, so an id left set would put a
+    span recorded later on that thread, outside any request, into the previous request's trace.
+    """
+    try:
+        if trace_id and _ambient_trace_id.get() == trace_id:
+            _ambient_trace_id.set(None)
     except Exception:
         pass
-    return attrs
+
+
+def _reset_ambient(token: Any, trace_id: str) -> None:
+    try:
+        _ambient_trace_id.reset(token)
+    except Exception:
+        # Ended from another context, or a second time.
+        release_ambient_trace(trace_id)
+
+
+_UNSET: Any = object()
+
+
+class _NullExporter:
+    """The exporter of a client that records nothing."""
+
+    halted = False
+    _disabled = True
+    exit_deadline: Optional[float] = None
+
+    def export(self, envelopes: List[TraceEnvelope]) -> bool:
+        return False
+
+    def after_fork_in_child(self) -> None:
+        pass
 
 
 def _restart_in_forked_children(client: "EvalKitClient") -> None:
@@ -250,20 +300,35 @@ def flush_on_termination_signals(client: "EvalKitClient") -> None:
 
 
 class EvalKitClient:
-    def __init__(self, opts: EvalKitOptions) -> None:
-        import atexit
+    def __init__(self, opts: EvalKitOptions, *, enabled: bool = True) -> None:
         self._opts = opts
-        self._exporter = _Exporter(opts)
+        self._enabled = bool(enabled)
+        self._health = ExportHealth()
+        rate = getattr(opts, "sample_rate", None)
+        self._sampler = Sampler(1.0 if rate is None else float(rate))
         self._queue: List[TraceEnvelope] = []
+        self._queue_bytes = 0
         # Re-entrant: a stream or HTTP body finalised by the garbage collector can enqueue its span
         # from inside a section that already holds the lock, on the same thread.
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._flush_now = threading.Event()
-        self._thread = threading.Thread(target=self._flush_loop, daemon=True)
+        if not self._enabled:
+            # Records nothing: no export thread, no exit hook, nothing patched.
+            self._exporter: Any = _NullExporter()
+            self._thread: Optional[threading.Thread] = None
+            return
+        self._exporter = _Exporter(opts, health=self._health)
+        self._thread = threading.Thread(target=self._flush_loop, daemon=True, name="evalkit-export")
         self._thread.start()
+        import atexit
         atexit.register(self.flush_before_exit)
         _restart_in_forked_children(self)
+
+    @property
+    def enabled(self) -> bool:
+        """Whether this client records spans: False after an invalid configuration or the kill switch."""
+        return self._enabled
 
     def _after_fork_in_child(self) -> None:
         """Start over in a process forked after init(): gunicorn --preload, multiprocessing's
@@ -275,15 +340,22 @@ class EvalKitClient:
         own export thread, and a flush when the child ends, which a multiprocessing child does
         without running atexit.
         """
+        if not self._enabled:
+            return
         self._lock = threading.RLock()
         self._queue = []
+        self._queue_bytes = 0
         self._stop_event = threading.Event()
         self._flush_now = threading.Event()
+        try:
+            self._health.after_fork_in_child()
+        except Exception:
+            pass
         try:
             self._exporter.after_fork_in_child()
         except Exception:
             pass
-        self._thread = threading.Thread(target=self._flush_loop, daemon=True)
+        self._thread = threading.Thread(target=self._flush_loop, daemon=True, name="evalkit-export")
         self._thread.start()
         register_at_shutdown = getattr(threading, "_register_atexit", None)
         if register_at_shutdown is not None:
@@ -419,9 +491,14 @@ class EvalKitClient:
             return envelope
         return apply_mask(mask, envelope)
 
+    def _accepting(self) -> bool:
+        if getattr(self._exporter, "_disabled", False):
+            return False
+        return self._health.circuit.accepting()
+
     def enqueue(self, envelope: TraceEnvelope) -> None:
         try:
-            if tracing_suppressed():
+            if not self._enabled or tracing_suppressed():
                 return
             owner = _llm_call_owner.get()
             if owner is not None and envelope.span_type == "llm_call" and envelope.sdk_version:
@@ -434,6 +511,9 @@ class EvalKitClient:
                 # Recorded while the framework span around the call is still open, so the bridge can tell
                 # that span is a second record of this request when it exports it.
                 note_sdk_model_call(envelope.span_id, envelope.parent_span_id)
+            if not self._sampler.keeps_everything and not self._sampler.keeps(envelope):
+                self._health.count("dropped_sampled")
+                return
             self._apply_identity(envelope)
             self._apply_simulation(envelope)
             self._apply_prompt(envelope)
@@ -441,20 +521,71 @@ class EvalKitClient:
                 self._maybe_emit_tool_spans(envelope)
             except Exception:
                 pass
+            exc = envelope.exception
+            if isinstance(exc, BaseException):
+                # Let go of the exception (and the frames its traceback holds) before the span waits.
+                envelope.exception = None
+                apply_exception(
+                    envelope, exc, escaped=envelope.exception_escaped is not False, timestamp=envelope.end_time,
+                )
+            elif exc is not None:
+                envelope.exception = None
+            if not self._accepting():
+                self._health.count(
+                    "dropped_export_failed" if getattr(self._exporter, "_disabled", False) else "dropped_circuit_open"
+                )
+                return
             redacted = self._redact(envelope)
             if redacted is None:
                 return
             envelope = redacted
-            full = False
-            with self._lock:
-                if len(self._queue) >= self._opts.max_queue_size:
-                    self._queue.pop(0)
-                self._queue.append(envelope)
-                full = len(self._queue) >= self._opts.max_export_batch_size
-            if full:
-                self._flush_now.set()
+            self._queue_span(envelope, self._fit(envelope))
         except Exception as exc:
             _log.debug("enqueue failed: %s", exc)
+
+    def _fit(self, envelope: TraceEnvelope) -> Optional[int]:
+        """Cut the span's values to the per-value limit and the span to the span limit; its size after."""
+        try:
+            cap_envelope_values(envelope, int(self._opts.max_value_bytes or 0))
+            return fit_envelope(envelope, _MAX_SPAN_BYTES)
+        except Exception as exc:
+            _log.debug("fitting a span failed: %s", exc)
+            return None
+
+    def _queue_span(self, envelope: TraceEnvelope, size: Optional[int] = None) -> None:
+        if size is None:
+            size = estimate_envelope_bytes(envelope)
+        try:
+            envelope._ek_size = size  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        max_spans = max(1, int(self._opts.max_queue_size or 1))
+        max_bytes = int(getattr(self._opts, "max_queue_bytes", 0) or 0)
+        full = False
+        with self._lock:
+            queue = self._queue
+            while queue and (len(queue) >= max_spans or (max_bytes > 0 and self._queue_bytes + size > max_bytes)):
+                reason = "dropped_queue_full" if len(queue) >= max_spans else "dropped_bytes_budget"
+                index = self._victim(queue, envelope)
+                self._health.count(reason)
+                if index < 0:
+                    return
+                dropped = queue.pop(index)
+                self._queue_bytes = max(0, self._queue_bytes - int(getattr(dropped, "_ek_size", 0) or 0))
+            queue.append(envelope)
+            self._queue_bytes += size
+            full = len(queue) >= self._opts.max_export_batch_size
+        if full:
+            self._flush_now.set()
+
+    @staticmethod
+    def _victim(queue: List[TraceEnvelope], incoming: TraceEnvelope) -> int:
+        """Which span gives way when the queue is full: the oldest that is not a model call; the incoming
+        span, when it is not one either; else the oldest model call. -1 names the incoming span."""
+        for index, queued in enumerate(queue):
+            if queued.span_type != "llm_call":
+                return index
+        return -1 if incoming.span_type != "llm_call" else 0
 
     def _flush_loop(self) -> None:
         interval = self._opts.scheduled_delay_ms / 1000
@@ -466,6 +597,26 @@ class EvalKitClient:
             except Exception as exc:
                 _log.debug("flush error: %s", exc)
 
+    def _export(self, batch: List[TraceEnvelope]) -> bool:
+        exporter = self._exporter
+        try:
+            exporter.last_sent = None
+        except Exception:
+            pass
+        try:
+            ok = bool(exporter.export(batch))
+        except Exception as exc:
+            _log.debug("export raised: %s", exc)
+            ok = False
+        sent = getattr(exporter, "last_sent", None)
+        if not isinstance(sent, int):
+            sent = len(batch) if ok else 0
+        if sent:
+            self._health.export_succeeded(sent)
+        if len(batch) > sent:
+            self._health.count("dropped_export_failed", len(batch) - sent)
+        return ok
+
     def _drain(self) -> bool:
         with self._lock:
             if not self._queue:
@@ -474,19 +625,47 @@ class EvalKitClient:
             # new list is made lands in the batch being exported, not in a list then cleared.
             pending = self._queue
             self._queue = []
+            self._queue_bytes = 0
+        if getattr(self._exporter, "_disabled", False):
+            self._health.count("dropped_export_failed", len(pending))
+            return False
+        circuit = self._health.circuit
+        if not circuit.accepting():
+            # Queued just before the circuit opened: sending it now would retry into the receiver
+            # the cool-down keeps the process away from.
+            self._health.count("dropped_circuit_open", len(pending))
+            return False
         size = max(1, int(self._opts.max_export_batch_size or 1))
+        batches: List[List[TraceEnvelope]] = []
+        start = 0
+        if circuit.probing:
+            # One small batch tells whether the receiver is back before the rest is sent into it.
+            probe = min(size, PROBE_SPANS)
+            batches.append(pending[:probe])
+            start = probe
+        batches.extend(pending[i:i + size] for i in range(start, len(pending), size))
         ok = True
-        for start in range(0, len(pending), size):
-            if self._exporter.export(pending[start:start + size]):
+        halted = False
+        sent_batches = 0
+        for index, batch in enumerate(batches):
+            if not batch:
+                continue
+            sent_batches += 1
+            if self._export(batch):
                 continue
             ok = False
             # Behind a receiver that does not answer, or refuses the key, every later batch would meet
             # the same failure, and a flush at exit would wait out the retries of each one.
             if getattr(self._exporter, "halted", False):
-                left = len(pending) - start - size
-                if left > 0:
-                    _log.warning("export stopped; dropping the %d queued span(s) after the failed batch", left)
+                halted = True
+                left = sum(len(b) for b in batches[index + 1:])
+                self._health.count("dropped_export_failed", left)
                 break
+        if sent_batches:
+            if halted:
+                circuit.cycle_failed()
+            else:
+                circuit.cycle_succeeded()
         return ok
 
     def _flush_bridge(self, timeout_millis: int = 5000) -> None:
@@ -506,16 +685,39 @@ class EvalKitClient:
         except Exception:
             pass
 
-    def flush(self) -> bool:
-        self._flush_stream_bodies()
-        self._flush_bridge()
-        return self._drain()
+    def flush(self, timeout: Optional[float] = 5.0) -> bool:
+        """Send what is queued now, within ``timeout`` seconds (None: the export's own retry budget).
+
+        Returns whether the receiver took all of it. Never raises: a receiver that is down, a bad
+        base_url or an export that runs out of time only makes the answer False.
+        """
+        if not self._enabled:
+            return True
+        try:
+            deadline = None
+            if timeout is not None:
+                deadline = time.monotonic() + max(0.0, float(timeout))
+            self._flush_stream_bodies()
+            bridge_ms = 5000 if deadline is None else max(1, int((deadline - time.monotonic()) * 1000))
+            self._flush_bridge(timeout_millis=bridge_ms)
+            setter = getattr(self._exporter, "set_call_deadline", None)
+            previous = setter(deadline) if setter is not None else None
+            try:
+                return bool(self._drain())
+            finally:
+                if setter is not None:
+                    setter(previous)
+        except Exception as exc:
+            _log.debug("flush failed: %s", exc)
+            return False
 
     def flush_before_exit(self, budget_s: float = EXIT_FLUSH_BUDGET_S) -> bool:
         """Send what is queued as the process ends, within budget_s seconds in all.
 
         What the receiver has not taken by then is dropped rather than waited for.
         """
+        if not self._enabled:
+            return True
         deadline = time.monotonic() + max(0.0, budget_s)
         try:
             self._exporter.exit_deadline = deadline
@@ -536,9 +738,39 @@ class EvalKitClient:
     def destroy(self) -> None:
         self._stop_event.set()
         self._flush_now.set()
-        self._flush_stream_bodies()
-        self._flush_bridge()
-        self._drain()
+        if not self._enabled:
+            return
+        try:
+            self._flush_stream_bodies()
+            self._flush_bridge()
+            self._drain()
+        except Exception as exc:
+            _log.debug("destroy failed: %s", exc)
+
+    def stats(self) -> Dict[str, Any]:
+        """How recording and exporting are going, for a health check or a debug page."""
+        with self._lock:
+            queued = len(self._queue)
+            queued_bytes = self._queue_bytes
+        snap = self._health.snapshot()
+        state = snap["circuit_state"]
+        if not self._enabled or getattr(self._exporter, "_disabled", False):
+            state = DISABLED
+        return {
+            "queued": queued,
+            "dropped_queue_full": snap["dropped_queue_full"],
+            "dropped_bytes_budget": snap["dropped_bytes_budget"],
+            "dropped_export_failed": snap["dropped_export_failed"],
+            "export_failures": snap["export_failures"],
+            "last_error": snap["last_error"],
+            "circuit_state": state,
+            "queued_bytes": queued_bytes,
+            "dropped_circuit_open": snap["dropped_circuit_open"],
+            "dropped_rate_limited": snap["dropped_rate_limited"],
+            "dropped_sampled": snap["dropped_sampled"],
+            "exported": snap["exported"],
+            "enabled": self._enabled,
+        }
 
     def _resolve_scope(
         self,
@@ -626,6 +858,7 @@ class EvalKitClient:
             prompt: Optional[str] = None,
             completion: Optional[str] = None,
             attributes: Optional[Dict[str, Any]] = None,
+            exception: Optional[BaseException] = None,
         ) -> None:
             # A root is often the only span a trace list shows, so what it was asked,
             # what it answered and why it failed go on it rather than only on a child.
@@ -660,6 +893,7 @@ class EvalKitClient:
                 device_id=resolved_device_id,
                 agent_name=resolved_agent,
                 sdk_version=SDK_VERSION,
+                exception=exception,
             )
             self.enqueue(envelope)
             try:
@@ -691,15 +925,19 @@ class EvalKitClient:
         `span_id` reuses the id of a request span the framework already opened, so what the framework
         records under it stays in this trace. `end(route=...)` names the span by the framework's route
         template (`GET /orders/{order_id}`), which a raw path with ids in it cannot be grouped by.
+        `end(exception=...)` records the exception that failed the request, and `end(request_body=...)`
+        a body read while the request ran. The request's trace id is the ambient one until `end`.
         """
         import json
 
         trace_id = upstream_trace_id or _new_trace_id()
         span_id = span_id or _new_span_id()
-        _ambient_trace_id.set(trace_id)
+        ambient_token = _ambient_trace_id.set(trace_id)
         identity = current_identity()
         start_ms = time.time() * 1000
         start_iso = _now_iso()
+        start_attributes = attributes
+        start_body = request_body
         ctx = SpanContext(
             trace_id=trace_id,
             span_id=span_id,
@@ -716,47 +954,61 @@ class EvalKitClient:
             response_body: Any = None,
             response_headers: Optional[Dict[str, str]] = None,
             route: Optional[str] = None,
+            exception: Optional[BaseException] = None,
+            exception_escaped: Optional[bool] = None,
+            request_body: Any = _UNSET,
+            attributes: Optional[Dict[str, Any]] = None,
         ) -> None:
-            end_iso = _now_iso()
-            latency = int(time.time() * 1000 - start_ms)
-            attrs: Dict[str, Any] = {
-                "http.method": method,
-                "http.url": url,
-            }
-            if route:
-                attrs["http.route"] = route
-            if headers:
-                attrs["http.request.headers"] = json.dumps(headers)
-            if request_body is not None:
-                attrs["http.request.body"] = json.dumps(request_body) if not isinstance(request_body, str) else request_body
-            if status_code is not None:
-                attrs["http.status_code"] = status_code
-            if response_body is not None:
-                attrs["http.response.body"] = json.dumps(response_body) if not isinstance(response_body, str) else response_body
-            if response_headers:
-                attrs["http.response.headers"] = json.dumps(response_headers)
-            attrs.update(self._meta_attrs())
-            if attributes:
-                attrs.update(attributes)
-            envelope = TraceEnvelope(
-                trace_id=trace_id,
-                span_id=span_id,
-                parent_span_id=upstream_span_id,
-                span_kind="SERVER",
-                span_type="http_call",
-                status=status,
-                operation=f"{method} {route}" if route else name,
-                service_name=self._opts.service_name,
-                attributes=attrs,
-                latency_ms=latency,
-                start_time=start_iso,
-                end_time=end_iso,
-                created_at=start_iso,
-                environment=self._opts.environment,
-                app_version=self._opts.app_version,
-                sdk_version=SDK_VERSION,
-            )
-            self.enqueue(envelope)
+            try:
+                end_iso = _now_iso()
+                latency = int(time.time() * 1000 - start_ms)
+                body = start_body if request_body is _UNSET else request_body
+                attrs: Dict[str, Any] = {
+                    "http.method": method,
+                    "http.url": url,
+                }
+                if route:
+                    attrs["http.route"] = route
+                if headers:
+                    attrs["http.request.headers"] = json.dumps(headers)
+                if body is not None:
+                    attrs["http.request.body"] = json.dumps(body) if not isinstance(body, str) else body
+                if status_code is not None:
+                    attrs["http.status_code"] = status_code
+                if response_body is not None:
+                    attrs["http.response.body"] = (
+                        json.dumps(response_body) if not isinstance(response_body, str) else response_body
+                    )
+                if response_headers:
+                    attrs["http.response.headers"] = json.dumps(response_headers)
+                attrs.update(self._meta_attrs())
+                if start_attributes:
+                    attrs.update(start_attributes)
+                if attributes:
+                    attrs.update(attributes)
+                envelope = TraceEnvelope(
+                    trace_id=trace_id,
+                    span_id=span_id,
+                    parent_span_id=upstream_span_id,
+                    span_kind="SERVER",
+                    span_type="http_call",
+                    status=status,
+                    operation=f"{method} {route}" if route else name,
+                    service_name=self._opts.service_name,
+                    attributes=attrs,
+                    latency_ms=latency,
+                    start_time=start_iso,
+                    end_time=end_iso,
+                    created_at=start_iso,
+                    environment=self._opts.environment,
+                    app_version=self._opts.app_version,
+                    sdk_version=SDK_VERSION,
+                    exception=exception,
+                    exception_escaped=exception_escaped,
+                )
+                self.enqueue(envelope)
+            finally:
+                _reset_ambient(ambient_token, trace_id)
 
         return trace_id, end, ctx
 
@@ -765,7 +1017,7 @@ class EvalKitClient:
         name: str,
         attributes: Optional[Dict[str, Any]] = None,
         parent_ctx: Optional[SpanContext] = None,
-    ) -> Tuple[Callable[[str], None], SpanContext]:
+    ) -> Tuple[Callable[..., None], SpanContext]:
         parent = parent_ctx or current_span_ctx()
         trace_id = parent.trace_id if parent else get_or_create_ambient_trace_id()
         span_id = _new_span_id()
@@ -782,7 +1034,7 @@ class EvalKitClient:
             agent_name=agent_name,
         )
 
-        def end(status: str = "OK") -> None:
+        def end(status: str = "OK", *, exception: Optional[BaseException] = None) -> None:
             end_iso = _now_iso()
             latency = int(time.time() * 1000 - start_ms)
             attrs = self._meta_attrs()
@@ -810,6 +1062,7 @@ class EvalKitClient:
                 device_id=device_id,
                 agent_name=agent_name,
                 sdk_version=SDK_VERSION,
+                exception=exception,
             )
             self.enqueue(envelope)
 
@@ -818,13 +1071,212 @@ class EvalKitClient:
     def _records_io(self, capture_io: bool, params: "_IOParams") -> bool:
         return capture_io and (self._opts.capture_secrets or not params.secret_function)
 
+    def _wrap(
+        self,
+        fn: F,
+        span_name: str,
+        mk_attrs: Callable[[tuple, dict], Dict[str, Any]],
+        result_key: str,
+        capture_io: bool,
+        params: "_IOParams",
+        rate_limit: Optional[float],
+        fingerprint: Optional[str],
+    ) -> F:
+        """``fn`` traced: one span per call, or per iteration of a generator, ended however it ends.
+
+        Every way out ends the span exactly once and is passed on as it was: a return, an exception, and
+        also what is not an ``Exception`` (a cancelled task, Ctrl-C, ``sys.exit``), which would otherwise
+        leave the span open for good. A cancelled task is recorded as an error with ``evalkit.cancelled``.
+        Recording never changes what the call returns or raises.
+        """
+        client = self
+        limiter = RateLimiter(rate_limit) if rate_limit else None
+
+        def begin(args: tuple, kwargs: dict) -> Optional[Tuple[Callable[..., None], SpanContext, Dict[str, Any]]]:
+            try:
+                if tracing_suppressed():
+                    # Nothing would be exported; the call runs as it is, and the rate is not spent on it.
+                    return None
+                if limiter is not None and not limiter.allow():
+                    # A function called in a hot loop records the first calls of each second, not all.
+                    client._health.count("dropped_rate_limited")
+                    return None
+                attrs = mk_attrs(args, kwargs)
+                end, ctx = client.start_span(span_name, attrs)
+                return end, ctx, attrs
+            except Exception as exc:
+                _log.debug("starting a span for %s failed: %s", span_name, exc)
+                return None
+
+        def finish_ok(opened: Any, result: Any = None, record_result: bool = True) -> None:
+            # Recording the result must never turn the call's success into an error.
+            try:
+                end, _ctx, attrs = opened
+                if record_result and result is not None and client._records_io(capture_io, params):
+                    attrs[result_key] = _safe_io(result, scrub=not client._opts.capture_secrets)
+                end("OK")
+            except Exception:
+                pass
+
+        def finish_error(opened: Any, exc: BaseException) -> None:
+            try:
+                end, _ctx, attrs = opened
+                if isinstance(exc, GeneratorExit) or (isinstance(exc, SystemExit) and exc.code in (0, None)):
+                    end("OK")
+                    return
+                if fingerprint:
+                    attrs[FINGERPRINT_ATTR] = fingerprint
+                end("ERROR", exception=exc)
+            except Exception:
+                pass
+
+        def enter(opened: Any) -> Any:
+            return _current_span.set(opened[1]) if opened is not None else None
+
+        def leave(token: Any) -> None:
+            if token is not None:
+                try:
+                    _current_span.reset(token)
+                except Exception:
+                    pass
+
+        if _is_coroutine_function(fn):
+            @functools.wraps(fn)
+            async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                opened = begin(args, kwargs)
+                if opened is None:
+                    return await fn(*args, **kwargs)
+                token = enter(opened)
+                try:
+                    result = await fn(*args, **kwargs)
+                except BaseException as exc:
+                    finish_error(opened, exc)
+                    raise
+                else:
+                    finish_ok(opened, result)
+                    return result
+                finally:
+                    leave(token)
+            return _mark_traced(async_wrapper)  # type: ignore[return-value]
+
+        if inspect.isasyncgenfunction(fn):
+            @functools.wraps(fn)
+            async def async_gen_wrapper(*args: Any, **kwargs: Any) -> Any:
+                # Driven step by step rather than with `async for`, so what the consumer sends, throws or
+                # closes reaches the generator, and the span is current only while the generator runs:
+                # set across a yield it would be current in the consumer's code too.
+                opened = begin(args, kwargs)
+                agen = fn(*args, **kwargs)
+                to_send: Any = None
+                to_throw: Optional[BaseException] = None
+                try:
+                    while True:
+                        token = enter(opened)
+                        try:
+                            if to_throw is not None:
+                                thrown, to_throw = to_throw, None
+                                item = await agen.athrow(thrown)
+                            else:
+                                item = await agen.asend(to_send)
+                        finally:
+                            leave(token)
+                        try:
+                            to_send = yield item
+                        except GeneratorExit:
+                            token = enter(opened)
+                            try:
+                                await agen.aclose()
+                            finally:
+                                leave(token)
+                            raise
+                        except BaseException as exc:
+                            to_throw = exc
+                except StopAsyncIteration:
+                    if opened is not None:
+                        finish_ok(opened, record_result=False)
+                    return
+                except GeneratorExit:
+                    if opened is not None:
+                        finish_ok(opened, record_result=False)
+                    raise
+                except BaseException as exc:
+                    if opened is not None:
+                        finish_error(opened, exc)
+                    raise
+            return _mark_traced(async_gen_wrapper)  # type: ignore[return-value]
+
+        if inspect.isgeneratorfunction(fn):
+            @functools.wraps(fn)
+            def gen_wrapper(*args: Any, **kwargs: Any) -> Any:
+                opened = begin(args, kwargs)
+                gen = fn(*args, **kwargs)
+                to_send: Any = None
+                to_throw: Optional[BaseException] = None
+                try:
+                    while True:
+                        token = enter(opened)
+                        try:
+                            if to_throw is not None:
+                                thrown, to_throw = to_throw, None
+                                item = gen.throw(thrown)
+                            else:
+                                item = gen.send(to_send)
+                        finally:
+                            leave(token)
+                        try:
+                            to_send = yield item
+                        except GeneratorExit:
+                            token = enter(opened)
+                            try:
+                                gen.close()
+                            finally:
+                                leave(token)
+                            raise
+                        except BaseException as exc:
+                            to_throw = exc
+                except StopIteration as stop:
+                    if opened is not None:
+                        finish_ok(opened, record_result=False)
+                    return stop.value
+                except GeneratorExit:
+                    if opened is not None:
+                        finish_ok(opened, record_result=False)
+                    raise
+                except BaseException as exc:
+                    if opened is not None:
+                        finish_error(opened, exc)
+                    raise
+            return _mark_traced(gen_wrapper)  # type: ignore[return-value]
+
+        @functools.wraps(fn)
+        def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+            opened = begin(args, kwargs)
+            if opened is None:
+                return fn(*args, **kwargs)
+            token = enter(opened)
+            try:
+                result = fn(*args, **kwargs)
+            except BaseException as exc:
+                finish_error(opened, exc)
+                raise
+            else:
+                finish_ok(opened, result)
+                return result
+            finally:
+                leave(token)
+        return _mark_traced(sync_wrapper)  # type: ignore[return-value]
+
     def trace_function(
         self,
         name: Optional[str] = None,
         attributes: Optional[Dict[str, Any]] = None,
         capture_io: bool = True,
+        *,
+        error_fingerprint: Optional[str] = None,
     ) -> Callable[[F], F]:
         def decorator(fn: F) -> F:
+            if not self._enabled or _left_untraced(fn):
+                return fn
             span_name = name or fn.__qualname__
             base_attrs = {"evalkit.span_type": "function_call", **(attributes or {})}
             params = _IOParams(fn, span_name)
@@ -840,72 +1292,10 @@ class EvalKitClient:
                         a["function.kwargs"] = _safe_io(named, scrub=scrub)
                 return a
 
-            if asyncio.iscoroutinefunction(fn):
-                @functools.wraps(fn)
-                async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
-                    try:
-                        attrs = _mk_attrs(args, kwargs)
-                        end, ctx = self.start_span(span_name, attrs)
-                        token = _current_span.set(ctx)
-                    except Exception:
-                        return await fn(*args, **kwargs)
-                    try:
-                        result = await fn(*args, **kwargs)
-                    except Exception as exc:
-                        try:
-                            attrs.update(_exc_attrs(exc))
-                            end("ERROR")
-                        except Exception:
-                            pass
-                        raise
-                    else:
-                        # Recording the result must never turn the call's success into an error.
-                        try:
-                            if result is not None and self._records_io(capture_io, params):
-                                attrs["function.result"] = _safe_io(result, scrub=not self._opts.capture_secrets)
-                            end("OK")
-                        except Exception:
-                            pass
-                        return result
-                    finally:
-                        try:
-                            _current_span.reset(token)
-                        except Exception:
-                            pass
-                return _mark_traced(async_wrapper)
-            else:
-                @functools.wraps(fn)
-                def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
-                    try:
-                        attrs = _mk_attrs(args, kwargs)
-                        end, ctx = self.start_span(span_name, attrs)
-                        token = _current_span.set(ctx)
-                    except Exception:
-                        return fn(*args, **kwargs)
-                    try:
-                        result = fn(*args, **kwargs)
-                    except Exception as exc:
-                        try:
-                            attrs.update(_exc_attrs(exc))
-                            end("ERROR")
-                        except Exception:
-                            pass
-                        raise
-                    else:
-                        # Recording the result must never turn the call's success into an error.
-                        try:
-                            if result is not None and self._records_io(capture_io, params):
-                                attrs["function.result"] = _safe_io(result, scrub=not self._opts.capture_secrets)
-                            end("OK")
-                        except Exception:
-                            pass
-                        return result
-                    finally:
-                        try:
-                            _current_span.reset(token)
-                        except Exception:
-                            pass
-                return _mark_traced(sync_wrapper)
+            return self._wrap(
+                fn, span_name, _mk_attrs, "function.result", capture_io, params,
+                getattr(self._opts, "function_rate_limit", 0), error_fingerprint,
+            )
 
         return decorator
 
@@ -914,8 +1304,12 @@ class EvalKitClient:
         name: Optional[str] = None,
         attributes: Optional[Dict[str, Any]] = None,
         capture_io: bool = True,
+        *,
+        error_fingerprint: Optional[str] = None,
     ) -> Callable[[F], F]:
         def decorator(fn: F) -> F:
+            if not self._enabled or _left_untraced(fn):
+                return fn
             tool_name = name or fn.__qualname__
             params = _IOParams(fn, tool_name)
 
@@ -939,72 +1333,8 @@ class EvalKitClient:
                         )
                 return a
 
-            if asyncio.iscoroutinefunction(fn):
-                @functools.wraps(fn)
-                async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
-                    try:
-                        attrs = _mk_attrs(args, kwargs)
-                        end, ctx = self.start_span(tool_name, attrs)
-                        token = _current_span.set(ctx)
-                    except Exception:
-                        return await fn(*args, **kwargs)
-                    try:
-                        result = await fn(*args, **kwargs)
-                    except Exception as exc:
-                        try:
-                            attrs.update(_exc_attrs(exc))
-                            end("ERROR")
-                        except Exception:
-                            pass
-                        raise
-                    else:
-                        # Recording the result must never turn the call's success into an error.
-                        try:
-                            if result is not None and self._records_io(capture_io, params):
-                                attrs["tool.result"] = _safe_io(result, scrub=not self._opts.capture_secrets)
-                            end("OK")
-                        except Exception:
-                            pass
-                        return result
-                    finally:
-                        try:
-                            _current_span.reset(token)
-                        except Exception:
-                            pass
-                return _mark_traced(async_wrapper)
-            else:
-                @functools.wraps(fn)
-                def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
-                    try:
-                        attrs = _mk_attrs(args, kwargs)
-                        end, ctx = self.start_span(tool_name, attrs)
-                        token = _current_span.set(ctx)
-                    except Exception:
-                        return fn(*args, **kwargs)
-                    try:
-                        result = fn(*args, **kwargs)
-                    except Exception as exc:
-                        try:
-                            attrs.update(_exc_attrs(exc))
-                            end("ERROR")
-                        except Exception:
-                            pass
-                        raise
-                    else:
-                        # Recording the result must never turn the call's success into an error.
-                        try:
-                            if result is not None and self._records_io(capture_io, params):
-                                attrs["tool.result"] = _safe_io(result, scrub=not self._opts.capture_secrets)
-                            end("OK")
-                        except Exception:
-                            pass
-                        return result
-                    finally:
-                        try:
-                            _current_span.reset(token)
-                        except Exception:
-                            pass
-                return _mark_traced(sync_wrapper)
+            # Tool calls are what an agent's trace is read and scored for, so none is left out by rate.
+            return self._wrap(fn, tool_name, _mk_attrs, "tool.result", capture_io, params, None, error_fingerprint)
 
         return decorator
 

@@ -186,11 +186,31 @@ def strip_content(envelope: TraceEnvelope) -> TraceEnvelope:
     return envelope
 
 
+# A mask hook that fails, fails for every span: its warning is given once, then at most once every
+# five minutes with the count of the spans it dropped since.
+_MASK_WARN_INTERVAL_S = 300.0
+_mask_warning = {"last": None, "dropped": 0}
+
+
+def _warn_mask(message: str, *args: Any) -> None:
+    import time
+
+    state = _mask_warning
+    state["dropped"] += 1
+    now = time.monotonic()
+    last = state["last"]
+    if last is not None and now - last < _MASK_WARN_INTERVAL_S:
+        return
+    dropped, state["dropped"], state["last"] = state["dropped"], 0, now
+    suffix = f" ({dropped} span(s) dropped since the last report)" if last is not None else ""
+    _log.warning(message + suffix, *args)
+
+
 def apply_mask(mask: MaskHook, envelope: TraceEnvelope) -> Optional[TraceEnvelope]:
     try:
         masked = mask(envelope)
     except Exception as exc:
-        _log.warning(
+        _warn_mask(
             "mask hook raised %s: %s — dropping this span, because exporting it would defeat the hook's purpose",
             type(exc).__name__, exc,
         )
@@ -198,7 +218,7 @@ def apply_mask(mask: MaskHook, envelope: TraceEnvelope) -> Optional[TraceEnvelop
     if masked is None:
         return None
     if not isinstance(masked, TraceEnvelope):
-        _log.warning(
+        _warn_mask(
             "mask hook returned %s instead of a TraceEnvelope or None — dropping this span",
             type(masked).__name__,
         )

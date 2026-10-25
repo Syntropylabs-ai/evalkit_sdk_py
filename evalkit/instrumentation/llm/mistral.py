@@ -11,9 +11,6 @@ from .._streaming import _AsyncStreamTracer, _StreamState, _SyncStreamTracer
 from .._toolcalls import from_openai_chat, from_stream_tool_calls
 from ._bodies import _dump, _safe_body
 
-_PROMPT_MAX = 32768
-_COMPLETION_MAX = 32768
-
 
 def _extract_mistral_prompt(messages: Any) -> str:
     parts: List[str] = []
@@ -110,7 +107,7 @@ def _patch_mistral_complete(
         messages = kwargs.get("messages", [])
         temperature = kwargs.get("temperature")
         max_tokens = kwargs.get("max_tokens")
-        prompt_text = _extract_mistral_prompt(messages)[:_PROMPT_MAX]
+        prompt_text = _extract_mistral_prompt(messages)
         request_body = _safe_body(_dump(kwargs))
 
         span_ctx = child_span_ctx(trace_id, span_id)
@@ -122,7 +119,7 @@ def _patch_mistral_complete(
             latency = int(time.time() * 1000 - start_ms)
             client.enqueue(TraceEnvelope(
                 trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                span_type="llm_call", status="ERROR", status_message=str(exc),
+                span_type="llm_call", status="ERROR", status_message=str(exc), exception=exc,
                 operation="chat.complete",
                 service_name=client._opts.service_name, provider="mistral", model=model,
                 prompt=prompt_text, latency_ms=latency, start_time=ts, end_time=end_ts,
@@ -171,7 +168,7 @@ def _patch_mistral_complete(
             span_type="llm_call", status="OK",
             operation="chat.complete",
             service_name=client._opts.service_name, provider="mistral", model=model,
-            prompt=prompt_text, completion=completion[:_COMPLETION_MAX],
+            prompt=prompt_text, completion=completion,
             tokens_in=tokens_in, tokens_out=tokens_out,
             latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
             events=events or None, attributes=attrs,
@@ -205,7 +202,7 @@ def _patch_mistral_complete_async(
         messages = kwargs.get("messages", [])
         temperature = kwargs.get("temperature")
         max_tokens = kwargs.get("max_tokens")
-        prompt_text = _extract_mistral_prompt(messages)[:_PROMPT_MAX]
+        prompt_text = _extract_mistral_prompt(messages)
         request_body = _safe_body(_dump(kwargs))
 
         span_ctx = child_span_ctx(trace_id, span_id)
@@ -217,7 +214,7 @@ def _patch_mistral_complete_async(
             latency = int(time.time() * 1000 - start_ms)
             client.enqueue(TraceEnvelope(
                 trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                span_type="llm_call", status="ERROR", status_message=str(exc),
+                span_type="llm_call", status="ERROR", status_message=str(exc), exception=exc,
                 operation="chat.complete_async",
                 service_name=client._opts.service_name, provider="mistral", model=model,
                 prompt=prompt_text, latency_ms=latency, start_time=ts, end_time=end_ts,
@@ -266,7 +263,7 @@ def _patch_mistral_complete_async(
             span_type="llm_call", status="OK",
             operation="chat.complete_async",
             service_name=client._opts.service_name, provider="mistral", model=model,
-            prompt=prompt_text, completion=completion[:_COMPLETION_MAX],
+            prompt=prompt_text, completion=completion,
             tokens_in=tokens_in, tokens_out=tokens_out,
             latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
             events=events or None, attributes=attrs,
@@ -287,7 +284,7 @@ def _mistral_stream_recorder(
     model = kwargs.get("model", "mistral-small")
     temperature = kwargs.get("temperature")
     max_tokens = kwargs.get("max_tokens")
-    prompt_text = _extract_mistral_prompt(kwargs.get("messages", []))[:_PROMPT_MAX]
+    prompt_text = _extract_mistral_prompt(kwargs.get("messages", []))
     request_body = _safe_body(_dump(kwargs))
 
     def on_stream_done(
@@ -323,10 +320,10 @@ def _mistral_stream_recorder(
             trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
             span_type="llm_call",
             status="ERROR" if error is not None else "OK",
-            status_message=str(error) if error is not None else None,
+            status_message=str(error) if error is not None else None, exception=error,
             operation=operation,
             service_name=client._opts.service_name, provider="mistral", model=model,
-            prompt=prompt_text, completion=completion[:_COMPLETION_MAX],
+            prompt=prompt_text, completion=completion,
             tokens_in=tokens_in, tokens_out=tokens_out,
             latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
             events=events or None, attributes=attrs,

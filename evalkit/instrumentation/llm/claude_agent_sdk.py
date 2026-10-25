@@ -13,9 +13,6 @@ from ._bodies import _dump, _safe_body
 if TYPE_CHECKING:
     from ...core.client import EvalKitClient
 
-_PROMPT_MAX = 32768
-_COMPLETION_MAX = 32768
-
 
 def _get_int(obj: Any, *keys: str) -> int:
     for k in keys:
@@ -123,8 +120,8 @@ async def _traced_gen(
                     service_name=ek._opts.service_name,
                     provider="anthropic",
                     model=model,
-                    prompt=prompt[:_PROMPT_MAX],
-                    completion=completion[:_COMPLETION_MAX],
+                    prompt=prompt,
+                    completion=completion,
                     tokens_in=tokens_in,
                     tokens_out=tokens_out,
                     latency_ms=latency,
@@ -150,12 +147,12 @@ async def _traced_gen(
             parent_span_id=parent_span_id,
             span_type="llm_call",
             status="ERROR",
-            status_message=str(exc),
+            status_message=str(exc), exception=exc,
             operation="claude_agent_sdk.query",
             service_name=ek._opts.service_name,
             provider="anthropic",
             model=model,
-            prompt=prompt[:_PROMPT_MAX],
+            prompt=prompt,
             latency_ms=int(time.time() * 1000 - start_ms),
             start_time=ts,
             end_time=_now_iso(),

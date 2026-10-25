@@ -231,7 +231,8 @@ class _Tracker:
         if not rec.get("span_type"):
             return
         try:
-            self._emit(rec, "ERROR", status_message=str(err) if err else None)
+            self._emit(rec, "ERROR", status_message=str(err) if err else None,
+                       exception=err if isinstance(err, BaseException) else None)
         except Exception as exc:
             _log.debug("[evalkit] llama_index span drop failed: %s", exc)
 
@@ -270,12 +271,15 @@ class _Tracker:
             # every envelope once this span is emitted.
             pass
 
-    def _emit(self, rec: Dict[str, Any], status: str, status_message: Optional[str] = None) -> None:
+    def _emit(
+        self, rec: Dict[str, Any], status: str, status_message: Optional[str] = None,
+        exception: Optional[BaseException] = None,
+    ) -> None:
         with self._lock:
             rec["emitted"] = True
             absorbed = rec.get("absorbed")
         if absorbed is not None:
-            self._emit_provider_call(rec, absorbed, status, status_message)
+            self._emit_provider_call(rec, absorbed, status, status_message, exception)
             return
         end_iso = _now_iso()
         latency = int(time.time() * 1000 - rec["start_ms"])
@@ -307,10 +311,12 @@ class _Tracker:
             session_id=rec.get("session_id"),
             device_id=rec.get("device_id"),
             sdk_version=SDK_VERSION,
+            exception=exception,
         ))
 
     def _emit_provider_call(
         self, rec: Dict[str, Any], envelope: TraceEnvelope, status: str, status_message: Optional[str],
+        exception: Optional[BaseException] = None,
     ) -> None:
         attrs = dict(envelope.attributes or {})
         for key, value in rec["attrs"].items():
@@ -322,6 +328,8 @@ class _Tracker:
         if status == "ERROR" and envelope.status != "ERROR":
             envelope.status = "ERROR"
             envelope.status_message = status_message or envelope.status_message
+        if exception is not None and envelope.exception is None:
+            envelope.exception = exception
         self.client.enqueue(envelope)
 
     def on_event(self, event: Any) -> None:

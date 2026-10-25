@@ -1,5 +1,120 @@
 # Changelog
 
+## 0.3.6 — 2026-10-26
+
+The SDK can no longer crash, hang, slow down or grow without bound in the application it observes, and a
+failed span records its exception by the convention the TypeScript SDK and the receiver share.
+
+### Added
+- `evalkit.stats()`: spans queued and dropped (by queue length, byte budget, failed export, open circuit,
+  rate limit and sampling), failed exports, the last error, and the circuit breaker's state (`closed`,
+  `open`, `half_open` or `disabled`). It never raises, before `init()` included.
+- A circuit breaker on exporting. After 3 export cycles in a row the receiver did not take (no answer,
+  5xx, 429 or a refused key), spans are dropped as they are recorded, which only counts them, for 30
+  seconds, then one batch of at most 16 spans probes the receiver; each failed probe doubles the wait, up
+  to 5 minutes.
+- `flush(timeout=5.0)` on the module and the client: the flush waits at most `timeout` seconds.
+- A kill switch: `EVALKIT_DISABLED=true`, or OpenTelemetry's `OTEL_SDK_DISABLED=true`, makes the SDK a
+  no-op that records, patches and sends nothing.
+- `sample_rate`: the share of traces kept, decided from the trace id as OpenTelemetry's
+  TraceIdRatioBased sampler does, so a trace is kept whole. Without it, `OTEL_TRACES_SAMPLER` and
+  `OTEL_TRACES_SAMPLER_ARG` are read. Model calls, tool calls and failed spans are always kept; the default
+  keeps everything.
+- `max_queue_bytes` (32 MiB): a byte budget on the export queue, past which the oldest spans that are not
+  model calls are dropped first. A full queue (`max_queue_size`) drops by the same rule.
+- `max_value_bytes` (16 MiB): the most one value keeps. A longer prompt, completion, body or attribute
+  keeps its start and its end around a `…[cut N bytes]…` marker, and `evalkit.truncated.<field>` records
+  its size in UTF-8 bytes. `OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT` or `OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT`
+  lowers it.
+- `function_rate_limit` (100 a second for each traced function), `log_level` (`WARNING`, also
+  `EVALKIT_LOG_LEVEL`) and `log_rate_limit` (50 a second).
+- The exception contract. A failed span has status `ERROR` described as `"<type>: <message>"`, `error.type`
+  with the fully qualified class name (`openai.RateLimitError`), one `exception` event with
+  `exception.type`, `exception.message` (2 KiB), `exception.stacktrace` (16 KiB, start and end kept) and
+  `exception.escaped`, and the attributes `evalkit.exception.frames` (up to 64 frames, innermost first,
+  each `{file, line, col, function, module, in_app}`), `evalkit.exception.source` (the innermost frame of
+  the application's own code) and `evalkit.exception.causes` (up to 5 from `__cause__` and `__context__`).
+  The `exception.*` and `error.source` attributes of earlier releases are kept. No local variable or
+  argument is read.
+- `evalkit.set_error_fingerprint()` and `clear_error_fingerprint()`, and `error_fingerprint=` on
+  `trace_function` and `trace_tool`, record `evalkit.exception.fingerprint`.
+- `in_app_include` and `in_app_exclude`: module prefixes that are, or are not, the application's own code
+  in an exception's frames.
+- `capture_unhandled=True` records uncaught exceptions of the main thread, of other threads and of asyncio
+  tasks and callbacks, and hands each to the hook installed before. Off by default.
+- `ignore_routes`: incoming requests answered untraced, the way a health probe is, in the FastAPI,
+  Starlette, Flask, Django and Litestar middleware: no request span, no response trace headers, and
+  nothing the handler records while it answers. A pattern is an exact path (`"/metrics"`), a glob (`*` one
+  segment, `**` any number), a route template (`"GET /v1/orders/:id"`; `{id}` and `<int:id>` too) matched
+  against the path and the framework's route when it is known, an optional leading method, a compiled
+  regex searched in the path, or a callable given a `RouteInfo` (`method`, `path`, `route`). Matching
+  ignores a trailing slash and the query string; paths are case-sensitive, methods are not.
+- `ignore_urls`: outgoing calls made with requests, httpx, aiohttp, or urllib3 through its OpenTelemetry
+  instrumentation, recorded with no span and sent with no `traceparent`. A pattern is a host
+  (`"api.stripe.com"`, `"*.internal.example.com"`), host and path, a full URL with scheme and port, a path
+  on any host, a compiled regex searched in the URL, or a callable given a `UrlInfo`.
+- `ignore_functions`: qualified names (`module.qualname`, `"myapp.cache.*"`) that function tracing leaves
+  unwrapped. An explicit `trace_function` or `trace_tool` on a matching function leaves it unwrapped too:
+  the ignore wins.
+- `evalkit.untraced`: a decorator for sync, async and generator functions, and a `with` / `async with`
+  block, inside which nothing is recorded (model calls, HTTP calls and their `traceparent`, database
+  queries, function and log spans, other instrumentations' spans). It is per thread and per asyncio task,
+  so concurrent requests are unaffected, and works before `init()`.
+- `trace_health_checks=True` traces health and readiness probes, incoming and outgoing, which stay left
+  out by default.
+- `EVALKIT_IGNORE_ROUTES`, `EVALKIT_IGNORE_URLS` and `EVALKIT_IGNORE_FUNCTIONS`: comma-separated patterns
+  added to the options. A pattern that cannot be read is skipped with one warning; `init()` never fails
+  over one. Patterns are compiled once, at `init()`.
+
+### Changed
+- `max_body_bytes` defaults to 64 KiB (it was 10 MiB).
+- Only log records at `WARNING` and up become `log` spans unless `log_level` says otherwise, at most 50 a
+  second; a message keeps at most 8 KiB, start and end; the SDK's own `evalkit` loggers are never recorded.
+- Function arguments and results are written by a serializer that stops at the 4096-character cap, so a
+  large argument is never serialized whole, and secrets are masked as it goes.
+- The model-call wrappers no longer cut prompts, completions, thinking or tool arguments to 32 KiB (8 KiB
+  for the voice integrations), and request and response bodies are no longer cut to their first 2 MiB:
+  every value goes through the one per-value limit, which keeps the newest messages at the end.
+- A span over 8 MiB keeps the start and the end of its longest values instead of having them replaced
+  by a note. Spans are measured and sent in UTF-8 bytes rather than as escaped ASCII.
+- Failed exports log one warning when they start, then at most one every 5 minutes with the counts; a
+  response body in a warning is cut to 200 characters. A refused subscription key is logged clearly at
+  the first refusal and when exporting stops.
+- An invalid `base_url` (not `http://` or `https://`), an empty or malformed key, or a size or rate that is
+  not a positive number makes the SDK a no-op with one warning naming each problem, never the key.
+- Calling `init()` again with other options warns once, naming the options that do not apply.
+- An explicit `patch_*` call that cannot instrument its target logs a warning instead of raising.
+- The status message of a failed model call is `"<type>: <message>"`.
+
+### Fixed
+- An outgoing call made while a health probe is answered no longer sends a `traceparent` naming a span
+  that is never exported, and a span another OpenTelemetry instrumentation starts there hands no context
+  on either.
+- The FastAPI, Starlette and Litestar middleware no longer read the whole request before the app: the
+  body is copied from the messages the app receives, up to the cap, and uploads (multipart,
+  octet-stream, media) are not kept. The response body is kept as a list of chunks with a running length
+  instead of growing one bytes object, and not at all for `text/event-stream` and compressed responses.
+- Flask and Django read the request body only when its `Content-Length` is under the cap and it is not an
+  upload, and a streamed Flask response is no longer drained to record it.
+- A request's trace id no longer stays the ambient trace of the worker thread after the request, which put
+  spans recorded later on a reused WSGI thread into the previous request's trace.
+- The `traceparent` parser follows the W3C rules: lowercase hex only, all-zero ids and version `ff`
+  rejected, and a later version with more fields joined.
+- `trace_function` and `trace_tool` end their span for a cancelled task (status `ERROR`,
+  `evalkit.cancelled=true`), `KeyboardInterrupt` and `SystemExit` as well, and re-raise them; such a call
+  used to leave its span unrecorded. Generator and async generator functions are traced across their
+  iteration, with errors raised while iterating recorded.
+- The stack trace recorded is the exception's own: it was read from the exception being handled, which
+  inside an `except` block can be another one.
+- FastAPI, Flask and Django record the exception that failed the request; mid-stream model errors carry the
+  full exception.
+- An integration that raises anything on import, not only `ImportError`, is skipped without stopping
+  `init()` or the integrations after it.
+- `flush()` no longer raises for a `base_url` that is not a URL.
+- The LangChain callback's run records and the Google ADK tool timers are capped at 10,000 entries that
+  expire after an hour, so runs that never end do not keep theirs.
+- Credential parameters of a URL inside an exception or log message are masked (`?api_key=***`).
+
 ## 0.3.5 — 2026-10-14
 
 ### Security

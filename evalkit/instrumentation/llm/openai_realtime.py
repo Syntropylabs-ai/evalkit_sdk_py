@@ -12,8 +12,6 @@ from ._bodies import _dump, _safe_body
 if TYPE_CHECKING:
     from ...core.client import EvalKitClient
 
-_MAX_TEXT = 8192
-
 
 def _base_attrs(model: str) -> dict:
     return {
@@ -72,11 +70,11 @@ class _ObservedConnection:
             return
         try:
             if isinstance(args, str):
-                args_str = args[:_MAX_TEXT]
+                args_str = args
             else:
-                args_str = json.dumps(args or {})[:_MAX_TEXT]
+                args_str = json.dumps(args or {})
         except Exception:
-            args_str = str(args)[:_MAX_TEXT]
+            args_str = str(args)
         self._tool_events.append(SpanEvent(
             name="gen_ai.tool.call",
             timestamp=_now_iso(),
@@ -156,8 +154,8 @@ class _ObservedConnection:
                 service_name=self._ek._opts.service_name,
                 model=self._base.get("gen_ai.request.model"),
                 provider="openai-realtime",
-                prompt=prompt[:_MAX_TEXT] or None,
-                completion=completion[:_MAX_TEXT] or None,
+                prompt=prompt or None,
+                completion=completion or None,
                 tokens_in=tokens_in,
                 tokens_out=tokens_out,
                 latency_ms=latency_ms,
@@ -275,7 +273,8 @@ class _TracedConnect:
             if self._observed is not None:
                 self._observed._finish()
             elif self._end_session is not None:
-                self._end_session("ERROR" if exc_type else "OK")
+                self._end_session("ERROR" if exc_type else "OK",
+                                  exception=exc if isinstance(exc, BaseException) else None)
         except Exception:
             pass
         return await self._cm.__aexit__(exc_type, exc, tb)

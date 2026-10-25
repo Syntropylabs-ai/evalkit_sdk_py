@@ -67,7 +67,7 @@ def patch_mcp(client: EvalKitClient) -> None:
                 attrs["error.message"] = str(e)
                 client.enqueue(TraceEnvelope(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                    span_type="tool_call", status="ERROR", status_message=str(e),
+                    span_type="tool_call", status="ERROR", status_message=str(e), exception=e,
                     operation=str(name), service_name=client._opts.service_name,
                     attributes=attrs, latency_ms=int(time.time() * 1000 - start_ms),
                     start_time=ts, end_time=_now_iso(), created_at=ts,

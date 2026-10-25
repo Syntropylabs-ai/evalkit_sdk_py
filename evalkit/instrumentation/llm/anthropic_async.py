@@ -20,9 +20,6 @@ from ._anthropic_stream import patch_messages_stream
 from ._bodies import _dump, _safe_body
 from .anthropic import _build_prompt, _extract_thinking
 
-_PROMPT_MAX = 32768
-_COMPLETION_MAX = 32768
-
 
 def patch_async_anthropic(
     client: EvalKitClient,
@@ -50,7 +47,7 @@ def patch_async_anthropic(
             messages = kwargs.get("messages", [])
             temperature = kwargs.get("temperature")
             max_tokens = kwargs.get("max_tokens")
-            prompt_text = _build_prompt(system, messages)[:_PROMPT_MAX]
+            prompt_text = _build_prompt(system, messages)
             request_body = _safe_body(_dump(kwargs))
         except Exception as exc:
             hook_failed("messages.create", exc)
@@ -72,7 +69,7 @@ def patch_async_anthropic(
                 if request_body:
                     stream_attrs["gen_ai.request.body"] = request_body
                 if thinking:
-                    stream_attrs["gen_ai.response.thinking"] = thinking[:_COMPLETION_MAX]
+                    stream_attrs["gen_ai.response.thinking"] = thinking
                 if has_redacted_thinking:
                     stream_attrs["gen_ai.response.has_redacted_thinking"] = True
                 if ttft_ms is not None:
@@ -86,10 +83,10 @@ def patch_async_anthropic(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                     span_type="llm_call",
                     status="ERROR" if error is not None else "OK",
-                    status_message=str(error) if error is not None else None,
+                    status_message=str(error) if error is not None else None, exception=error,
                     operation="messages.create",
                     service_name=client._opts.service_name, provider="anthropic", model=model,
-                    prompt=prompt_text, completion=completion[:_COMPLETION_MAX],
+                    prompt=prompt_text, completion=completion,
                     tokens_in=tokens_in, tokens_out=tokens_out,
                     cache_read_tokens=cache_read_tokens or None, cache_creation_tokens=cache_creation_tokens or None,
                     latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
@@ -117,7 +114,7 @@ def patch_async_anthropic(
                 latency = int(time.time() * 1000 - start_ms)
                 client.enqueue(TraceEnvelope(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                    span_type="llm_call", status="ERROR", status_message=str(exc),
+                    span_type="llm_call", status="ERROR", status_message=str(exc), exception=exc,
                     operation="messages.create",
                     service_name=client._opts.service_name, provider="anthropic", model=model,
                     prompt=prompt_text, latency_ms=latency, start_time=ts, end_time=end_ts,
@@ -164,7 +161,7 @@ def patch_async_anthropic(
             if stop_reason:
                 attrs["gen_ai.response.finish_reasons"] = [stop_reason]
             if thinking_text:
-                attrs["gen_ai.response.thinking"] = thinking_text[:_COMPLETION_MAX]
+                attrs["gen_ai.response.thinking"] = thinking_text
             if has_redacted_thinking:
                 attrs["gen_ai.response.has_redacted_thinking"] = True
             if request_body:
@@ -178,7 +175,7 @@ def patch_async_anthropic(
                 span_type="llm_call", status="OK",
                 operation="messages.create",
                 service_name=client._opts.service_name, provider="anthropic", model=model,
-                prompt=prompt_text, completion=text_content[:_COMPLETION_MAX],
+                prompt=prompt_text, completion=text_content,
                 tokens_in=tokens_in, tokens_out=tokens_out,
                 cache_read_tokens=cache_read_tokens or None, cache_creation_tokens=cache_creation_tokens or None,
                 latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,

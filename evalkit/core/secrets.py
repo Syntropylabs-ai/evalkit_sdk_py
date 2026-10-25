@@ -66,6 +66,18 @@ def _mask_assigned_secret(match: "re.Match[str]") -> str:
     return match.group(0)[: match.start("value") - start] + MASK + quote
 
 
+def _mask_url_query(match: "re.Match[str]") -> str:
+    # A URL written into free text (an exception message, a log line) keeps its path, and its query
+    # loses the values of parameters named like a credential (?api_key=..., &sig=...).
+    url = match.group(0)
+    base, sep, rest = url.partition("?")
+    query, hash_sep, fragment = rest.partition("#")
+    return base + sep + scrub_query(query) + hash_sep + (scrub_query(fragment) if fragment else "")
+
+
+_URL_WITH_QUERY_RE = re.compile(r"\b(?:https?|wss?)://[^\s'\"<>?#]*\?[^\s'\"<>]*", re.IGNORECASE)
+
+
 SECRET_PATTERNS = (
     # A whole PEM private key, or what is left of one when the text was cut inside it.
     (re.compile(
@@ -164,6 +176,25 @@ def scrub_string(value: str) -> str:
     return out
 
 
+# Text written by the application's code about a failure, rather than content: exception and log
+# messages, and stack traces, which quote them. A URL in such text is a request the code made, and a
+# credential in its query string is the one thing in it not worth reading. A URL in a prompt or a
+# completion is the conversation's content and keeps its query.
+MESSAGE_ATTRIBUTES = frozenset({
+    "exception.message",
+    "exception.stacktrace",
+    "error.message",
+    "error.stack",
+    "log.message",
+    "evalkit.exception.causes",
+})
+
+
+def scrub_message(value: str) -> str:
+    """Scrub a failure message: secrets by shape, and credential parameters of any URL in it."""
+    return _URL_WITH_QUERY_RE.sub(_mask_url_query, scrub_string(value))
+
+
 def scrub_query(query: str) -> str:
     parts = []
     for param in query.split("&"):
@@ -241,6 +272,9 @@ def _scrub_attr(name: str, value: Any) -> Any:
             return scrub_url(value)
         if name in QUERY_ATTRIBUTES:
             return scrub_string(scrub_query(value))
+        if name in MESSAGE_ATTRIBUTES:
+            scrubbed = scrub_value(value)
+            return _URL_WITH_QUERY_RE.sub(_mask_url_query, scrubbed) if isinstance(scrubbed, str) else scrubbed
     return scrub_value(value, name in HEADER_ATTRIBUTES)
 
 
@@ -259,7 +293,7 @@ def scrub_secrets(envelope: TraceEnvelope) -> TraceEnvelope:
     if isinstance(envelope.completion, str):
         envelope.completion = scrub_string(envelope.completion)
     if isinstance(envelope.status_message, str):
-        envelope.status_message = scrub_string(envelope.status_message)
+        envelope.status_message = scrub_message(envelope.status_message)
     _scrub_attrs(envelope.attributes)
     for event in (envelope.events or ()):
         _scrub_attrs(getattr(event, "attributes", None))

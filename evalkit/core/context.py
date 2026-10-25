@@ -100,12 +100,14 @@ _in_http_span: ContextVar[bool] = ContextVar("evalkit_in_http_span", default=Fal
 
 
 class _Suppression:
-    """Tracing held off while one health probe is answered.
+    """Tracing held off: while a health probe or a request ignore_routes matches is answered, and
+    inside ``evalkit.untraced``.
 
-    A probe has no trace of its own, so a span opened while answering it (a database ping, a
-    traced function, a log line) would be a root trace of its own on every poll. A task or thread
-    the handler starts copies the context and shares this object, and it is switched off once the
-    probe is answered, so work that runs on after the response is traced as usual.
+    A request left untraced has no trace of its own, so a span opened while answering it (a database
+    ping, a traced function, a log line) would be a root trace of its own on every call. A task or
+    thread the handler starts copies the context and shares this object. A request switches it off
+    once it is answered, so work that runs on after the response is traced as usual; an untraced
+    block leaves it on, so what the block started stays untraced.
     """
 
     __slots__ = ("active",)

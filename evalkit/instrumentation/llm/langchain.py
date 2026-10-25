@@ -8,6 +8,7 @@ from threading import Lock
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from ..._version import SDK_VERSION
+from ...core.bounded import BoundedTTLMap
 from ...core.client import _new_span_id, _now_iso
 from ...core.content import message_content_text
 from ...core.context import _ambient_trace_id, _current_span, current_span_ctx, get_or_create_ambient_trace_id
@@ -153,7 +154,9 @@ def _build_handler(client: "EvalKitClient"):
         raise_error = False
 
         def __init__(self) -> None:
-            self._runs: Dict[str, Dict[str, Any]] = {}
+            # A run whose end callback never comes (a chain cancelled mid-way, a callback manager that
+            # swallowed the error) must not keep its record for the life of the process.
+            self._runs: BoundedTTLMap[str, Dict[str, Any]] = BoundedTTLMap()
             self._lock = Lock()
 
         def _start(
@@ -223,6 +226,7 @@ def _build_handler(client: "EvalKitClient"):
             tokens_out: Optional[int] = None,
             extra_attrs: Optional[Dict[str, Any]] = None,
             events: Optional[List[SpanEvent]] = None,
+            exception: Optional[BaseException] = None,
         ) -> None:
             try:
                 with self._lock:
@@ -262,6 +266,7 @@ def _build_handler(client: "EvalKitClient"):
                     session_id=rec.get("session_id"),
                     device_id=rec.get("device_id"),
                     sdk_version=SDK_VERSION,
+                    exception=exception,
                 ))
             except Exception as exc:
                 _log.debug("[evalkit] langchain end failed: %s", exc)
@@ -281,7 +286,8 @@ def _build_handler(client: "EvalKitClient"):
             self._end(run_id, status="OK")
 
         def on_chain_error(self, error, *, run_id, **kwargs):
-            self._end(run_id, status="ERROR", status_message=str(error))
+            self._end(run_id, status="ERROR", status_message=str(error),
+                      exception=error if isinstance(error, BaseException) else None)
 
         def on_llm_start(self, serialized, prompts, *, run_id, parent_run_id=None, **kwargs):
             model = _model_from(serialized, kwargs)
@@ -321,7 +327,8 @@ def _build_handler(client: "EvalKitClient"):
                       extra_attrs=extra or None)
 
         def on_llm_error(self, error, *, run_id, **kwargs):
-            self._end(run_id, status="ERROR", status_message=str(error))
+            self._end(run_id, status="ERROR", status_message=str(error),
+                      exception=error if isinstance(error, BaseException) else None)
 
         def on_tool_start(self, serialized, input_str, *, run_id, parent_run_id=None, **kwargs):
             name = None
@@ -352,7 +359,8 @@ def _build_handler(client: "EvalKitClient"):
             self._end(run_id, status="OK", extra_attrs={"tool.result": result})
 
         def on_tool_error(self, error, *, run_id, **kwargs):
-            self._end(run_id, status="ERROR", status_message=str(error))
+            self._end(run_id, status="ERROR", status_message=str(error),
+                      exception=error if isinstance(error, BaseException) else None)
 
         def on_retriever_start(self, serialized, query, *, run_id, parent_run_id=None, **kwargs):
             name = None
@@ -370,7 +378,8 @@ def _build_handler(client: "EvalKitClient"):
             self._end(run_id, status="OK", extra_attrs={"retriever.document_count": count})
 
         def on_retriever_error(self, error, *, run_id, **kwargs):
-            self._end(run_id, status="ERROR", status_message=str(error))
+            self._end(run_id, status="ERROR", status_message=str(error),
+                      exception=error if isinstance(error, BaseException) else None)
 
     return EvalKitLangChainHandler()
 

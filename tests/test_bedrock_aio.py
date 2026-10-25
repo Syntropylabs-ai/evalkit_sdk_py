@@ -343,7 +343,7 @@ class BedrockAioTest(unittest.IsolatedAsyncioTestCase):
             })
         span = self._spans()[0]
         self.assertEqual(span.status, "ERROR")
-        self.assertEqual(span.status_message, "throttled")
+        self.assertEqual(span.status_message, "RuntimeError: throttled")
         self.assertEqual(span.attributes["exception.type"], "RuntimeError")
 
     async def test_non_bedrock_service_is_untouched(self):

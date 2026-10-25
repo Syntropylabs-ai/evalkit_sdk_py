@@ -6,7 +6,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional
 
 from ..._version import SDK_VERSION
-from ...core.client import EvalKitClient, _exc_attrs, _new_span_id, _now_iso
+from ...core.client import EvalKitClient, _new_span_id, _now_iso
 from ...core.context import SpanContext, _current_span, child_span_ctx, current_span_ctx, get_or_create_ambient_trace_id
 from ...core.types import SpanEvent, TraceEnvelope
 from .._toolcalls import tool_event
@@ -14,8 +14,6 @@ from ..db._common import start_db
 from . import _bedrock_bodies as _bb
 from ._bodies import _dump, _safe_body
 
-_PROMPT_MAX = 32768
-_COMPLETION_MAX = 32768
 
 _RUNTIME_OPERATIONS = frozenset((
     "Converse", "ConverseStream", "InvokeModel", "InvokeModelWithResponseStream",
@@ -95,7 +93,7 @@ def trace_bedrock_call(
     try:
         result = invoke()
     except Exception as exc:
-        span.emit(status="ERROR", status_message=str(exc), extra=_exc_attrs(exc))
+        span.emit(status="ERROR", status_message=str(exc), exception=exc)
         raise
     finally:
         _current_span.reset(token)
@@ -134,7 +132,7 @@ async def trace_bedrock_call_async(
     try:
         result = await invoke()
     except Exception as exc:
-        span.emit(status="ERROR", status_message=str(exc), extra=_exc_attrs(exc))
+        span.emit(status="ERROR", status_message=str(exc), exception=exc)
         raise
     finally:
         _current_span.reset(token)
@@ -233,7 +231,7 @@ def _plan(operation_name: str, params: Dict[str, Any]) -> _Plan:
         # session even when the app never called set_user.
         plan.attrs["gen_ai.conversation.id"] = session_id
         plan.session_id = session_id
-    plan.prompt = plan.prompt[:_PROMPT_MAX]
+    plan.prompt = plan.prompt
     request_body = _safe_body(_dump(request_dump))
     if request_body:
         plan.attrs["gen_ai.request.body"] = request_body
@@ -272,6 +270,7 @@ class _BedrockSpan:
         response_model: Optional[str] = None,
         extra: Optional[Dict[str, Any]] = None,
         events: Optional[List[SpanEvent]] = None,
+        exception: Optional[BaseException] = None,
     ) -> None:
         plan = self.plan
         end_ts = _now_iso()
@@ -290,14 +289,14 @@ class _BedrockSpan:
             span_type=plan.span_type, status=status, status_message=status_message,
             operation=plan.operation,
             service_name=self.ek._opts.service_name, provider="bedrock", model=plan.model,
-            prompt=plan.prompt, completion=completion[:_COMPLETION_MAX],
+            prompt=plan.prompt, completion=completion,
             tokens_in=tokens_in, tokens_out=tokens_out,
             cache_read_tokens=cache_read or None, cache_creation_tokens=cache_write or None,
             latency_ms=int(time.time() * 1000 - self.start_ms),
             start_time=self.ts, end_time=end_ts, created_at=self.ts,
             events=events or None, attributes=attrs,
             environment=self.ek._opts.environment, app_version=self.ek._opts.app_version,
-            session_id=plan.session_id, sdk_version=SDK_VERSION,
+            session_id=plan.session_id, sdk_version=SDK_VERSION, exception=exception,
         ))
 
     def emit_acc(
@@ -315,7 +314,7 @@ class _BedrockSpan:
             extra["gen_ai.response.finish_reasons"] = acc.finish_reasons
         thinking = acc.thinking()
         if thinking:
-            extra["gen_ai.response.thinking"] = thinking[:_COMPLETION_MAX]
+            extra["gen_ai.response.thinking"] = thinking
         if acc.has_redacted_thinking:
             extra["gen_ai.response.has_redacted_thinking"] = True
         if acc.ttft_ms is not None and exc is None:
@@ -329,7 +328,6 @@ class _BedrockSpan:
         if exc is not None:
             status = "ERROR"
             status_message = str(exc)
-            extra.update(_exc_attrs(exc))
         elif acc.error:
             status = "ERROR"
             status_message = acc.error
@@ -344,7 +342,7 @@ class _BedrockSpan:
             status=status, status_message=status_message, completion=acc.completion(),
             tokens_in=acc.tokens_in + acc.cache_read + acc.cache_write, tokens_out=acc.tokens_out,
             cache_read=acc.cache_read, cache_write=acc.cache_write,
-            response_model=acc.response_model, extra=extra, events=events,
+            response_model=acc.response_model, extra=extra, events=events, exception=exc,
         )
 
 

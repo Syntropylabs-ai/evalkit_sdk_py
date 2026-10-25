@@ -12,8 +12,6 @@ from ._bodies import _dump, _safe_body
 if TYPE_CHECKING:
     from ...core.client import EvalKitClient
 
-_TEXT_MAX = 8192
-
 
 def patch_openai_audio(client: "EvalKitClient") -> None:
     try:
@@ -60,11 +58,11 @@ def _start(ek: "EvalKitClient", operation: str, model: str, prompt: str, req_bod
                 attrs["error.message"] = str(error)
             ek.enqueue(TraceEnvelope(
                 trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                span_type="llm_call", status=status, status_message=str(error) if error is not None else None,
+                span_type="llm_call", status=status, status_message=str(error) if error is not None else None, exception=error,
                 operation=operation, service_name=ek._opts.service_name,
                 provider="openai", model=model,
-                prompt=prompt[:_TEXT_MAX] if prompt else None,
-                completion=completion[:_TEXT_MAX] if completion else None,
+                prompt=prompt if prompt else None,
+                completion=completion if completion else None,
                 tokens_in=tokens_in, tokens_out=tokens_out,
                 attributes=attrs, latency_ms=int(time.time() * 1000 - start_ms),
                 start_time=ts, end_time=_now_iso(), created_at=ts,

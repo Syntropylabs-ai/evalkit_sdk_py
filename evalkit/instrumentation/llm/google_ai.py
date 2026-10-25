@@ -83,7 +83,7 @@ def patch_google_ai(client: EvalKitClient, model: Any) -> None:
                 trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                 span_type="llm_call",
                 status="ERROR" if error is not None else "OK",
-                status_message=str(error) if error is not None else None,
+                status_message=str(error) if error is not None else None, exception=error,
                 operation="generate_content",
                 service_name=client._opts.service_name, provider="google-ai", model=model_name,
                 prompt=prompt_text, completion=completion,
@@ -104,7 +104,7 @@ def patch_google_ai(client: EvalKitClient, model: Any) -> None:
             latency = int(time.time() * 1000 - start_ms)
             client.enqueue(TraceEnvelope(
                 trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                span_type="llm_call", status="ERROR", status_message=str(exc),
+                span_type="llm_call", status="ERROR", status_message=str(exc), exception=exc,
                 operation="generate_content",
                 service_name=client._opts.service_name, provider="google-ai", model=model_name,
                 prompt=prompt_text, latency_ms=latency, start_time=ts, end_time=end_ts,

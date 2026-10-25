@@ -22,6 +22,8 @@ The package is named `syntropylabs-evalkit`, and you import it as `evalkit`. It 
 - [Web frameworks](#web-frameworks)
 - [Trace your own code](#trace-your-own-code)
 - [Manual spans](#manual-spans)
+- [Keeping things out of traces](#keeping-things-out-of-traces)
+- [Errors](#errors)
 - [Identity](#identity)
 - [Offline evaluation](#offline-evaluation)
 - [Evaluation runs](#evaluation-runs)
@@ -81,9 +83,16 @@ A few cases need a call of their own:
 
 ### Logging
 
-Each record that reaches the root logger becomes a `log` span, as if EvalKit had a handler there. It has none: `init()` changes no handler, formatter, filter or level, so your log output stays exactly as it was, `logging.basicConfig()` called after `init()` still configures the root logger, and an app with no handlers keeps Python's own output for warnings. The root level is `WARNING` unless your app changes it, so by default only warnings and errors are recorded. A logger with `propagate=False` is not recorded unless you add an `EvalKitLoggingHandler` to it (`evalkit.install_logging_handler(client, logger_name)`, which adds only that handler).
+Each record at `WARNING` or above that reaches the root logger becomes a `log` span, as if EvalKit had a handler there. It has none: `init()` changes no handler, formatter, filter or level, so your log output stays exactly as it was, `logging.basicConfig()` called after `init()` still configures the root logger, and an app with no handlers keeps Python's own output for warnings. A logger with `propagate=False` is not recorded unless you add an `EvalKitLoggingHandler` to it (`evalkit.install_logging_handler(client, logger_name)`, which adds only that handler).
 
-The span's operation is `log.<LEVEL>`, for example `log.ERROR`. Records at `ERROR` or above get status `ERROR`. The span has `log.level`, `log.message`, `log.logger`, `log.filename`, `log.lineno` and `log.funcname`. When the record has exception info, it also has `error.type`, `error.message` and `error.stack`.
+Recording a log line never costs your app much:
+
+- Only records at `log_level` and up are recorded, `WARNING` by default. Pass `log_level=logging.INFO` (or a name, `"INFO"`) to `init()`, or set `EVALKIT_LOG_LEVEL=INFO`, to record more.
+- At most `log_rate_limit` records a second become spans, 50 by default, so a loop that logs on every pass records the first records of each second. The rest are counted in `evalkit.stats()["dropped_rate_limited"]`.
+- A message longer than 8 KiB keeps its start and its end around a `…[cut N bytes]…` marker, and `evalkit.truncated.log.message` holds its full size in bytes.
+- The SDK's own `evalkit` loggers are never recorded.
+
+The span's operation is `log.<LEVEL>`, for example `log.ERROR`. Records at `ERROR` or above get status `ERROR`. The span has `log.level`, `log.message`, `log.logger`, `log.filename`, `log.lineno` and `log.funcname`. When the record has exception info, it carries the exception as described in [Errors](#errors), with `exception.escaped` false, and also `error.message` and `error.stack`. A warning logged with an exception keeps status `OK`.
 
 Every record also carries `trace_id` and `span_id`, so a format of your own can show them, for example `%(asctime)s %(levelname)s [%(trace_id)s] %(name)s: %(message)s`. A `trace_id` you pass in `extra=` is kept.
 
@@ -104,6 +113,8 @@ Workers that import the app themselves (uvicorn `--workers`, the `spawn` and `fo
 ### Shutdown
 
 What is queued when the process ends is sent by an `atexit` flush that takes at most 3 seconds, so a receiver that is down never holds up a deploy. uvicorn ends a worker (on `--workers`, `--reload` or a deploy) by re-raising the signal that stopped it, which runs no `atexit`, so the ASGI integrations flush on the lifespan shutdown, before the app reports it complete: `EvalKitMiddleware`, `create_litestar_middleware()` (Litestar answers the lifespan before any middleware, so the flush is made on the `Litestar` class) and `EvalKitDjangoMiddleware` under ASGI (Django's ASGI handler refuses the lifespan, so the SDK answers it for the handler). `init()` also chains SIGTERM and SIGINT: a handler your app installed is called as before, and where the default action would end the process without `atexit`, the queue goes out first and the signal then ends the process as it would have.
+
+`evalkit.flush(timeout=5.0)` sends the queue now and waits at most `timeout` seconds; it returns whether the receiver took everything and never raises.
 
 ### Claude Agent SDK
 
@@ -257,9 +268,17 @@ evalkit.instrument_flask(app)
 "evalkit.EvalKitDjangoMiddleware"
 ```
 
-Each middleware records one `http_call` span per request, named after the method and path, such as `GET /orders`. It continues an incoming `traceparent` header. It also adds `X-Trace-Id` and `traceparent` headers to the response.
+Each middleware records one `http_call` span per request, named after the method and path, such as `GET /orders`. It continues an incoming `traceparent` header, read by the W3C Trace Context rules: lowercase hex only, an all-zero id is ignored, and a later version with more fields after the flags is still joined. It also adds `X-Trace-Id` and `traceparent` headers to the response. The request's trace id stops being the ambient one when the request ends, so a span recorded later on the same worker thread, outside any request, starts a trace of its own.
 
-Health and readiness probes (`/health`, `/healthz`, `/health/live`, `/readyz`, `/livez`, matched by whole path segment, so `/healthcare` is recorded) reach the app untraced through every middleware: no request span, no response headers, and nothing the handler records while it answers, such as a database ping, a traced function or a log line. Work the handler starts that runs on after the response, such as a background task or a thread, is traced as usual.
+The request and response bodies are kept up to `max_body_bytes` (64 KiB by default), and never by reading ahead of your app:
+
+- The FastAPI, Starlette and Litestar middleware copy the request body from the messages your app receives, as it receives them, and the response body from the chunks it sends, as a list with a running length that stops at the limit. A body that was cut has `http.request.body.truncated` (or `http.response.body.truncated`) and `.bytes`, its full size.
+- Flask and Django read the request body only when its `Content-Length` is under the limit. A streamed Flask response is never read to record it.
+- Uploads (`multipart/*`, `application/octet-stream`, images, audio, video, archives and PDFs) are not kept, nor are `text/event-stream` responses and compressed responses.
+
+When the app raises, the span records the exception (see [Errors](#errors)): FastAPI, Starlette and Litestar pass on what propagated, Flask the exception its teardown is handed, Django the one its `process_exception` hook receives.
+
+Health and readiness probes (`/health`, `/healthz`, `/health/live`, `/readyz`, `/livez`, matched by whole path segment, so `/healthcare` is recorded) reach the app untraced through every middleware: no request span, no response headers, and nothing the handler records while it answers, such as a database ping, a traced function or a log line. Work the handler starts that runs on after the response, such as a background task or a thread, is traced as usual. `trace_health_checks=True` traces probes like any request, and `ignore_routes` leaves out more routes the same way. See [Keeping things out of traces](#keeping-things-out-of-traces).
 
 - `EvalKitStarletteMiddleware` is the same class as `EvalKitMiddleware`, exported under a Starlette name.
 - For Litestar, pass the middleware when you create the app: `Litestar(route_handlers=[...], middleware=[create_litestar_middleware()])`.
@@ -303,11 +322,14 @@ import myapp
 evalkit.trace_package(myapp)        # → every function across the whole package
 ```
 
-- `trace_function(name=None, attributes=None, capture_io=True)` and `trace_tool(...)` take the same arguments. `trace_tool` records a `tool_call` span, which counts toward the tool metrics.
+- `trace_function(name=None, attributes=None, capture_io=True, *, error_fingerprint=None)` and `trace_tool(...)` take the same arguments. `trace_tool` records a `tool_call` span, which counts toward the tool metrics. `error_fingerprint` groups this function's errors under a name of your own (see [Errors](#errors)).
+- A generator or async generator function is traced across its iteration: the span starts at the first item, ends when the generator finishes, fails or is closed, and is current only while the generator runs. What you send, throw or close passes through to it.
+- Every way out ends the span and is passed on unchanged, including what is not an `Exception`: a cancelled task (status `ERROR` with `evalkit.cancelled=true`), `KeyboardInterrupt` and `SystemExit` (status `OK` for `sys.exit(0)`).
+- `trace_function` records at most `function_rate_limit` spans a second for each function, 100 by default, so a function called in a hot loop costs little; set it to `0` to record every call. The calls left out are counted in `evalkit.stats()["dropped_rate_limited"]`. Tool calls are never left out.
 - `traced` wraps the methods a class defines itself, but not inherited ones, and skips names that start with `__`. Span names default to `ClassName.method`, and `prefix=` replaces the class name.
 - `trace_module(module)` and `trace_package(package)` return the number of functions they wrapped. They skip names that start with `_` unless you pass `include_private=True`. `trace_package` imports every submodule of the package.
 - These functions look up the client when they are applied. Call `init()` before the decorated code is imported.
-- With `capture_io=True`, the default, arguments and return values are recorded as JSON and cut to 4096 characters, with `…` at the end. They are stored in `function.args`, `function.kwargs` and `function.result`, or in `tool.arguments` and `tool.result` for a tool.
+- With `capture_io=True`, the default, arguments and return values are recorded as JSON and cut to 4096 characters, with `…` at the end. The writer stops once it has 4096 characters, so a large argument is never serialized whole, and secrets are masked as it goes. They are stored in `function.args`, `function.kwargs` and `function.result`, or in `tool.arguments` and `tool.result` for a tool.
 
 > A client-side tool that the model calls shows its output only if you wrap it with `trace_tool`. The SDK sees the model's request, not your function's return value. Server-side tools, such as OpenAI's `web_search`, and LangChain tools are traced automatically.
 
@@ -323,17 +345,140 @@ except Exception:
     raise
 ```
 
-`start_span(name, attributes=None, parent_ctx=None)` opens a span under the current span, or under `parent_ctx` when you pass one. It returns an `end` function and the span's context. Call `end(status)` when the work is done. The status defaults to `"OK"`.
+`start_span(name, attributes=None, parent_ctx=None)` opens a span under the current span, or under `parent_ctx` when you pass one. It returns an `end` function and the span's context. Call `end(status)` when the work is done. The status defaults to `"OK"`. `end("ERROR", exception=exc)` records the exception as described in [Errors](#errors).
 
 The status values the SDK defines are `"OK"`, `"ERROR"` and `"UNSET"`. `end()` sends the string exactly as you pass it.
 
 A span from `start_span` does not become the current span. To make the spans opened inside a block its children, wrap the block in `with evalkit.with_trace(ctx):`.
 
-`start_trace(name, attributes=None, session_id=None, device_id=None, user_id=None, agent=None)` opens a root span and makes it current until you call its `end`. It returns `(trace_id, end, ctx)`. Inside another span, it opens a child in that span's trace. Its `end` also takes the keyword arguments `status_message`, `prompt`, `completion` and `attributes`, so the root span can show what was asked, what was answered and why it failed. The status message is cut to 2000 characters.
+`start_trace(name, attributes=None, session_id=None, device_id=None, user_id=None, agent=None)` opens a root span and makes it current until you call its `end`. It returns `(trace_id, end, ctx)`. Inside another span, it opens a child in that span's trace. Its `end` also takes the keyword arguments `status_message`, `prompt`, `completion`, `attributes` and `exception`, so the root span can show what was asked, what was answered and why it failed. The status message is cut to 2000 characters.
 
-`start_http_trace(name, *, method, url, headers=None, request_body=None, attributes=None)` opens an `http_call` span in a new trace. Its `end(status, *, status_code=None, response_body=None, response_headers=None)` records the response.
+`start_http_trace(name, *, method, url, headers=None, request_body=None, attributes=None)` opens an `http_call` span in a new trace. Its `end(status, *, status_code=None, response_body=None, response_headers=None, exception=None, request_body=..., attributes=None)` records the response, and a request body read while the request ran.
 
 `current_trace_id()` returns the id of the current trace. If no trace is active, it creates one.
+
+## Keeping things out of traces
+
+Four ways to keep part of an app out of its traces. Each leaves things out at every layer: no span, no child span, and no `traceparent` header on an outgoing call.
+
+```python
+import re
+import evalkit
+
+evalkit.init(
+    subscription_key="tk_live_...",
+    ignore_routes=["/metrics", "GET /internal/*", "POST /v1/webhooks/:provider", re.compile(r"^/admin/")],
+    ignore_urls=["metadata.google.internal", "*.internal.example.com", "https://s3.amazonaws.com/**"],
+    ignore_functions=["myapp.cache.*", "myapp.utils.slugify"],
+)
+```
+
+### Incoming requests: `ignore_routes`
+
+A request that matches is answered untraced, the way a health probe is, by the FastAPI, Starlette, Flask, Django and Litestar middleware: no request span, no `X-Trace-Id` or `traceparent` response header, and nothing its handler records while it answers, such as spans, traced functions, model calls, database queries, log lines, other OpenTelemetry instrumentations' spans and outgoing calls. Work the handler starts that runs on after the response, such as a background task, is traced as usual.
+
+| Pattern | Matches |
+| --- | --- |
+| `"/metrics"` | That path |
+| `"/internal/*"` | `*` is one path segment: `/internal/jobs`, not `/internal/jobs/7` |
+| `"/static/**"` | `**` is any number of segments, none included: `/static`, `/static/css/site.css` |
+| `"/assets/*.map"` | A `*` inside a segment matches part of it |
+| `"GET /v1/orders/:id"` | A route template. `:id`, `{id}` and `<int:id>` are one segment each. It is matched against the path, and against the framework's route when that is known |
+| `"GET /status"` | A leading method restricts the match to that method, in any case; `*` is any method |
+| `re.compile(r"^/admin/")` | A compiled regex, searched in the path |
+| `lambda info: ...` | A callable given a `RouteInfo` with `method`, `path` and `route`; a true result ignores the request |
+
+Matching ignores a trailing slash, repeated slashes and the query string. Paths are case-sensitive and methods are not. Flask and Litestar have matched the route before the middleware decides, so a pattern can also be written in their template syntax, such as `/reports/<int:report_id>`. FastAPI, Starlette and Django match it later, so for them `info.route` is worked out only when a callable reads it. A callable that raises is read as not matching, with one warning.
+
+### Outgoing calls: `ignore_urls`
+
+A matching call made with requests, httpx (sync and async) or aiohttp records no span and sends no `traceparent`. So does urllib3 used directly, through the OpenTelemetry urllib3 instrumentation the SDK registers.
+
+| Pattern | Matches |
+| --- | --- |
+| `"api.stripe.com"` | Every call to that host, whatever the scheme, port and path |
+| `"*.internal.example.com"` | `*` is one host label, so `jobs.internal.example.com`; `**` is any number of labels |
+| `"localhost:9000"` | That host on that port. Without a port, any port matches |
+| `"https://s3.amazonaws.com/bucket/**"` | Scheme, host and path. The path follows the rules for routes |
+| `"/v1/telemetry/**"` | That path on any host |
+| `re.compile(r"[?&]nocache=1")` | A compiled regex, searched in the full URL |
+| `lambda info: ...` | A callable given a `UrlInfo` with `method`, `url`, `host` and `path` |
+
+Schemes and hosts are matched in any case. When your app runs an OpenTelemetry setup of its own, its HTTP client spans for a matching call are left out of what EvalKit exports; the headers its instrumentations send are its own.
+
+### Functions: `ignore_functions`
+
+Qualified names, `module.qualname`, that function tracing (`function_tracing`, `trace_packages`, `trace_module`) leaves unwrapped. `"myapp.cache.*"` is every function of `myapp.cache`, `"myapp.cache.**"` everything under it, classes and submodules included, and `"myapp.utils.slugify"` one function. A compiled regex searched in the name, or a callable given the name, also works.
+
+An explicit `@evalkit.trace_function()` or `@evalkit.trace_tool()` traces a function whatever function tracing does, unless the function matches `ignore_functions`: then the ignore wins and the function is left unwrapped.
+
+### Untraced blocks: `evalkit.untraced`
+
+```python
+@evalkit.untraced
+def warm_cache():
+    ...
+
+@evalkit.untraced
+async def poll_queue():
+    ...
+
+with evalkit.untraced():
+    run_migrations()
+
+async with evalkit.untraced():
+    await refresh_embeddings()
+```
+
+Nothing inside records a span: model calls, HTTP calls and their `traceparent`, database queries, function spans, log spans and other OpenTelemetry instrumentations' spans are all left out. The decorator works on sync and async functions and on generators, whose steps run untraced while the code consuming them is traced. The scope belongs to the thread or asyncio task that entered it, so a request served at the same time is traced as usual; a task or thread started inside the block stays untraced. Function tracing never wraps a function marked `@evalkit.untraced`. `untraced` works before `init()` and never raises.
+
+### Health probes
+
+Health and readiness probes are left out by default, both incoming (see [Web frameworks](#web-frameworks)) and outgoing. `trace_health_checks=True` traces them like any other request.
+
+### From the environment
+
+`EVALKIT_IGNORE_ROUTES`, `EVALKIT_IGNORE_URLS` and `EVALKIT_IGNORE_FUNCTIONS` take comma-separated patterns, which are added to the ones passed to `init()`:
+
+```bash
+EVALKIT_IGNORE_ROUTES="/metrics,GET /internal/*"
+EVALKIT_IGNORE_URLS="metadata.google.internal,*.internal.example.com"
+EVALKIT_IGNORE_FUNCTIONS="myapp.cache.*"
+```
+
+A pattern that cannot be read, such as a route without a leading `/`, a port that is not a number, or a value that is not a string, a compiled regex or a callable, is skipped with one warning that names it. `init()` never fails over one. The patterns are compiled once, when `init()` runs, and each request, call or function is checked against the list once.
+
+## Errors
+
+A span that failed with an exception records it by OpenTelemetry's exception conventions, the same way from the Python and the TypeScript SDK:
+
+- Status `ERROR`, described as `"<type>: <message>"`, for example `openai.RateLimitError: Rate limit reached`. `error.type` holds the fully qualified class name: the module path without its private parts (`openai._exceptions` reads `openai`) and the class name; a builtin exception by its name alone (`ValueError`).
+- One span event named `exception`, with `exception.type`, `exception.message` (at most 2 KiB), `exception.stacktrace` (at most 16 KiB, its start and its end kept, causes included) and `exception.escaped` (`true` when the exception propagated out of the span).
+- `evalkit.exception.frames`: a JSON list of at most 64 frames, innermost first, each `{"file", "line", "col", "function", "module", "in_app"}` (`col` from Python 3.11, counted from 1).
+- `evalkit.exception.source`: `"file:line"` of the innermost frame of your own code.
+- `evalkit.exception.causes`: a JSON list of up to 5 `{"type", "message", "frames"}`, from what the exception was raised from (`__cause__`) or was raised while handling (`__context__`).
+- `evalkit.exception.fingerprint`, only when you choose one.
+
+The span also keeps `exception.type`, `exception.message`, `exception.stacktrace` and `error.source` as earlier releases wrote them. Nothing of a frame's local variables or of a call's arguments is read, and the exception's text goes through the same secret masking as the rest of the span, which also masks credential parameters (`?api_key=...`) of any URL in an exception or log message.
+
+A frame is your own code (`in_app`) unless it is in the standard library, in `site-packages` or another install directory, frozen, or in EvalKit. Name the modules that are, or are not, yours whatever their path says:
+
+```python
+evalkit.init(..., in_app_include=["mycompany"], in_app_exclude=["mycompany.vendored"])
+```
+
+Errors are grouped by the receiver. To group them yourself, set a fingerprint for the code that runs from here on (scoped like `set_user`, per thread and per asyncio task), or on one function:
+
+```python
+token = evalkit.set_error_fingerprint("checkout-timeout")   # a string, or a list joined with "|"
+...
+evalkit.clear_error_fingerprint(token)
+
+@evalkit.trace_function(error_fingerprint="payments-declined")
+def charge(card): ...
+```
+
+Model calls record the exception the provider raised, including one that ends a stream part way. To also record exceptions nothing in your app caught, pass `capture_unhandled=True` to `init()`. EvalKit then records each uncaught exception of the main thread (`sys.excepthook`), of another thread (`threading.excepthook`) and of an asyncio task or callback (the event loop's exception handler) as an error span, and hands it on to the hook that was installed before, so your own handler, or Python's default output, runs as it did.
 
 ## Identity
 
@@ -1096,8 +1241,16 @@ evalkit.init(
     capture_stream_bodies=None,               # None = env var, else True/False
     mask=None,                                # callable(envelope) -> envelope | None
     export_gzip=None,                         # None = env var, else True/False
+    sample_rate=None,                         # None = OTEL_TRACES_SAMPLER, else 0.0-1.0
+    capture_unhandled=False,                  # record uncaught exceptions
+    ignore_routes=None,                       # incoming requests left untraced
+    ignore_urls=None,                         # outgoing calls left untraced
+    ignore_functions=None,                    # functions function tracing leaves alone
+    trace_health_checks=False,                # True traces health probes too
 )
 ```
+
+`init()` never raises and never stops your app. An invalid option (a `base_url` that is not an `http://` or `https://` URL, an empty key, a negative or non-numeric size) makes the SDK a no-op with one warning that names each problem, and never repeats the key. `EVALKIT_DISABLED=true`, or OpenTelemetry's `OTEL_SDK_DISABLED=true`, does the same without the warning. A no-op SDK records nothing, patches nothing and starts no thread; its decorators return your function unchanged. An integration that fails to install, whatever it raises, is skipped and the others still are. A second `init()` call returns the first client, and warns once when its options differ from the first call's.
 
 `init()` also takes these options:
 
@@ -1105,10 +1258,20 @@ evalkit.init(
 | --- | --- | --- |
 | `max_export_batch_size` | `512` | When this many spans are waiting, the queue is exported at once. No export request carries more spans than this. |
 | `scheduled_delay_ms` | `5000` | How often, in milliseconds, the background thread exports |
-| `max_queue_size` | `4096` | The most spans waiting for export. When the queue is full, the oldest span is dropped. |
-| `max_body_bytes` | 10 MiB | The largest HTTP body recorded per request or response |
+| `max_queue_size` | `4096` | The most spans waiting for export. When the queue is full, the oldest span that is not a model call is dropped. |
+| `max_queue_bytes` | 32 MiB | About how many bytes the spans waiting for export may hold. Over it, the oldest spans that are not model calls are dropped first. |
+| `max_body_bytes` | 64 KiB | The largest HTTP body recorded per request or response |
+| `max_value_bytes` | 16 MiB | The most one value (a prompt, a completion, an attribute) keeps, in UTF-8 bytes. A longer value keeps its start and its end around `…[cut N bytes]…`, and `evalkit.truncated.<field>` holds its full size. `OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT` or `OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT` lowers it. |
+| `function_rate_limit` | `100` | Spans a second each traced function records; `0` records every call |
+| `log_level` | `WARNING` | The lowest level a log record needs to become a `log` span (`EVALKIT_LOG_LEVEL`) |
+| `log_rate_limit` | `50` | Log spans a second |
+| `sample_rate` | `1.0` | The share of traces kept, decided from the trace id as OpenTelemetry's `TraceIdRatioBased` sampler does, so a trace is kept or left out whole. Model calls, tool calls and failed spans are always kept. Without it, `OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG` are read (`traceidratio`, `parentbased_traceidratio`, `always_on`, `always_off`). |
+| `capture_unhandled` | `False` | Record uncaught exceptions. See [Errors](#errors). |
+| `in_app_include`, `in_app_exclude` | `None` | Module prefixes that are, or are not, your own code in an exception's frames |
 | `app_version` | `None` | Recorded on every span as `evalkit.app_version` |
 | `device_id` | `None` | The device id for spans that have none of their own |
+| `ignore_routes`, `ignore_urls`, `ignore_functions` | `None` | Requests, outgoing calls and functions kept out of traces. See [Keeping things out of traces](#keeping-things-out-of-traces). |
+| `trace_health_checks` | `False` | Trace health and readiness probes like any request |
 
 `service_name` defaults to `unknown`. `environment` is recorded on every span as `evalkit.environment`, and every span also carries `evalkit.sdk_version`. With `debug=True`, the exporter logs each export, retry and auth failure at `DEBUG` level on the `evalkit` logger.
 
@@ -1118,19 +1281,32 @@ Spans are batched and exported in the background, and the queue is flushed at ex
 evalkit.flush()
 ```
 
-It returns whether the receiver took everything that was queued. Before `init()` it returns `False`; it never raises.
+It returns whether the receiver took everything that was queued, within `timeout` seconds (5 by default). Before `init()` it returns `False`; it never raises, whatever the receiver or the `base_url` does.
+
+`evalkit.stats()` tells how recording and exporting are going, for a health check or a debug page:
+
+```python
+{"queued": 12, "dropped_queue_full": 0, "dropped_bytes_budget": 0, "dropped_export_failed": 0,
+ "export_failures": 0, "last_error": None, "circuit_state": "closed", "queued_bytes": 48211,
+ "dropped_circuit_open": 0, "dropped_rate_limited": 0, "dropped_sampled": 0, "exported": 5120,
+ "enabled": True}
+```
+
+`circuit_state` is `closed`, `open`, `half_open` or `disabled`.
 
 ### How spans are exported
 
 The SDK sends spans to `{base_url}/v1/ingest` with your key in the `X-Subscription-Key` header. Each request times out after 10 seconds.
 
-- The queue goes out in requests of at most `max_export_batch_size` spans and 4 MiB of JSON. A span larger than 4 MiB goes in a request of its own.
+- The queue goes out in requests of at most `max_export_batch_size` spans and 4 MiB of JSON, measured in UTF-8 bytes (text outside ASCII is sent as UTF-8, not escaped). A span larger than 4 MiB goes in a request of its own.
 - Each request is gzip-compressed and sent with `Content-Encoding: gzip`. To send plain JSON, pass `export_gzip=False` or set `EVALKIT_EXPORT_GZIP=false`. A receiver without compressed ingest answers 415, or 400 because it reads the gzip bytes as JSON. The SDK then sends the same request uncompressed. Unless that is refused with 400 too, every later request goes uncompressed, and the SDK logs one warning.
 - A 413 splits the request in half, and each half is sent again, down to a single span. A span that is still refused is dropped with a warning that names it and gives its size.
 - A 5xx response or a network error is retried up to 3 times, after 0.2, 0.6 and 1.8 seconds. When the retries run out, the rest of the queue being exported is dropped rather than sent into the same failure.
-- Any other 4xx response drops that request's spans with a warning.
-- A 401 or 403 is not retried, and the rest of the queue being exported is dropped. After 3 in a row, the SDK stops exporting for the rest of the process and logs a warning to check your subscription key. A successful export resets the count.
-- A span larger than 8 MiB is trimmed in stages until it fits. First, request and response bodies longer than 1024 characters are replaced by a note. Next, a long prompt and completion are replaced the same way, and the status message is cut to 4096 characters. Then every string attribute is cut to 512 characters. As a last step, the attributes are replaced by a single `trace.truncated` marker, and the events, prompt and completion are removed. A span that still does not fit is dropped.
+- Any other 4xx response drops that request's spans.
+- A 401 or 403 is not retried, and the rest of the queue being exported is dropped. The first refusal logs a warning that the receiver refused the subscription key. After 3 in a row, the SDK stops exporting for the rest of the process and logs a warning saying so. A successful export resets the count.
+- Failed exports never log a line each. The first failure logs one warning; after it, at most one warning every 5 minutes says how many exports failed and how many spans were dropped since the last one. A response body in a warning is cut to 200 characters. `evalkit.stats()` has the counts and the last error.
+- After 3 export cycles in a row that the receiver did not take (no answer, 5xx, 429 or a refused key), a circuit breaker opens: for 30 seconds the SDK drops spans as they are recorded, which only counts them, and sends nothing. Then one small batch of at most 16 spans probes the receiver. If it is taken, exporting resumes; if not, the circuit opens again for twice as long, up to 5 minutes.
+- A span larger than 8 MiB keeps the start and the end of its longest values, each cut around a `…[cut N bytes]…` marker with its full size in `evalkit.truncated.<field>`, until it fits. As a last step, the attributes are replaced by a single `trace.truncated` marker, and the events, prompt and completion are removed. A span that still does not fit is dropped.
 
 ### Environment variables
 
@@ -1146,8 +1322,14 @@ The SDK sends spans to `{base_url}/v1/ingest` with your key in the `X-Subscripti
 | `EVALKIT_FUNCTION_TRACE` | Exactly `false` turns off function tracing. |
 | `EVALKIT_COUNT_FOREIGN_LLM` | `1`, `true` or `yes` keeps the token counts of foreign LLM spans. |
 | `EVALKIT_QUIET` | `1`, `true`, `yes` or `on` stops the evaluation-run link from printing. |
+| `EVALKIT_DISABLED` | `1`, `true`, `yes` or `on` makes the SDK a no-op: nothing is recorded, patched or sent. |
+| `OTEL_SDK_DISABLED` | The same, as OpenTelemetry defines it |
+| `EVALKIT_LOG_LEVEL` | The lowest level a log record needs to become a `log` span, such as `INFO`. See [Logging](#logging). |
+| `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` | The share of traces kept when `sample_rate` is not passed. See [Configuration](#configuration). |
+| `OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT`, `OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT` | The most one value keeps, in bytes, when lower than `max_value_bytes` |
+| `EVALKIT_IGNORE_ROUTES`, `EVALKIT_IGNORE_URLS`, `EVALKIT_IGNORE_FUNCTIONS` | Comma-separated patterns added to `ignore_routes`, `ignore_urls` and `ignore_functions`. See [Keeping things out of traces](#keeping-things-out-of-traces). |
 
-An argument to `init()` or to the function wins over its environment variable. The capture variables and `EVALKIT_EXPORT_GZIP` accept `1`, `true`, `yes` or `on`, and `0`, `false`, `no` or `off`. For any other value, EvalKit logs a warning and keeps the default.
+An argument to `init()` or to the function wins over its environment variable, except for the `EVALKIT_IGNORE_*` lists, which are added to the options. The capture variables and `EVALKIT_EXPORT_GZIP` accept `1`, `true`, `yes` or `on`, and `0`, `false`, `no` or `off`. For any other value, EvalKit logs a warning and keeps the default.
 
 The `evalkit` command also reads `EVALKIT_API_KEY`, `EVALKIT_SUBSCRIPTION_KEY`, `EVALKIT_OTLP_ENDPOINT`, `EVALKIT_CONTENT_CAPTURE` and `EVALKIT_TENANT_ID`. The last four override the values that `evalkit coding install` stored.
 

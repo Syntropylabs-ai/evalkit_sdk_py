@@ -20,9 +20,6 @@ from .._toolcalls import from_openai_chat
 from ._bodies import _dump, _safe_body
 from .openai import _messages_to_text
 
-_PROMPT_MAX = 32768
-_COMPLETION_MAX = 32768
-
 
 def patch_async_openai(
     client: EvalKitClient,
@@ -48,7 +45,7 @@ def patch_async_openai(
             messages = kwargs.get("messages", [])
             temperature = kwargs.get("temperature")
             max_tokens = kwargs.get("max_tokens")
-            prompt_text = _messages_to_text(messages)[:_PROMPT_MAX]
+            prompt_text = _messages_to_text(messages)
             request_body = _safe_body(_dump(kwargs))
         except Exception as exc:
             hook_failed("chat.completions.create", exc)
@@ -84,10 +81,10 @@ def patch_async_openai(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                     span_type="llm_call",
                     status="ERROR" if error is not None else "OK",
-                    status_message=str(error) if error is not None else None,
+                    status_message=str(error) if error is not None else None, exception=error,
                     operation="chat.completions.create",
                     service_name=client._opts.service_name, provider="openai", model=model,
-                    prompt=prompt_text, completion=completion[:_COMPLETION_MAX],
+                    prompt=prompt_text, completion=completion,
                     tokens_in=tokens_in, tokens_out=tokens_out,
                     cache_read_tokens=cache_read_tokens or None, cache_creation_tokens=cache_creation_tokens or None,
                     latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,
@@ -114,7 +111,7 @@ def patch_async_openai(
                 latency = int(time.time() * 1000 - start_ms)
                 client.enqueue(TraceEnvelope(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                    span_type="llm_call", status="ERROR", status_message=str(exc),
+                    span_type="llm_call", status="ERROR", status_message=str(exc), exception=exc,
                     operation="chat.completions.create",
                     service_name=client._opts.service_name, provider="openai", model=model,
                     prompt=prompt_text, latency_ms=latency, start_time=ts, end_time=end_ts,
@@ -170,7 +167,7 @@ def patch_async_openai(
                 span_type="llm_call", status="OK",
                 operation="chat.completions.create",
                 service_name=client._opts.service_name, provider="openai", model=model,
-                prompt=prompt_text, completion=completion[:_COMPLETION_MAX],
+                prompt=prompt_text, completion=completion,
                 tokens_in=tokens_in, tokens_out=tokens_out,
                 cache_read_tokens=cache_read_tokens or None,
                 latency_ms=latency, start_time=ts, end_time=end_ts, created_at=ts,

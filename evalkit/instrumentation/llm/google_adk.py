@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import os
 import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, List
 
 from ..._version import SDK_VERSION
+from ...core.bounded import BoundedTTLMap
 from ...core.client import _new_span_id, _now_iso, _safe_io
 from ...core.context import _current_span, child_span_ctx, current_span_ctx, get_or_create_ambient_trace_id
 from ...core.types import TraceEnvelope
@@ -13,7 +15,12 @@ from ...simulation.types import AgentTurnResult
 if TYPE_CHECKING:
     from ...core.client import EvalKitClient
 
-_tool_call_starts: Dict[int, float] = {}
+# Keyed by the id() of the tool call's context. A call whose after-hook never runs (the tool raised, the
+# run was cancelled) leaves its entry behind, and a later context can reuse the same id, so the map is
+# capped and an entry expires.
+_tool_call_starts: BoundedTTLMap[int, float] = BoundedTTLMap()
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_tool_call_starts.reset_after_fork)
 
 
 def _iso_from_epoch(epoch: float) -> str:
@@ -183,7 +190,7 @@ async def _traced_agent_run(
             parent_span_id=parent_span_id,
             span_type="function_call",
             status="ERROR",
-            status_message=str(exc),
+            status_message=str(exc), exception=exc,
             operation="run_agent",
             service_name=ek._opts.service_name,
             attributes=attrs,

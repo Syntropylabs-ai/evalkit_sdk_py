@@ -24,7 +24,7 @@ class TestEvalKitLogging(unittest.TestCase):
         self.client = fresh(self.captured)
 
     def test_warning_emits_log_span(self):
-        logger = _install_handler(self.client, "evalkit.test.warn")
+        logger = _install_handler(self.client, "app.test.warn")
         tid, end, ctx = self.client.start_trace("req")
         with evalkit.with_trace(ctx):
             logger.warning("something happened")
@@ -38,7 +38,7 @@ class TestEvalKitLogging(unittest.TestCase):
         self.assertEqual(logs[0].trace_id, tid)
 
     def test_error_log_has_error_status(self):
-        logger = _install_handler(self.client, "evalkit.test.error")
+        logger = _install_handler(self.client, "app.test.error")
         logger.error("it broke")
         self.client.flush()
         logs = [
@@ -49,7 +49,7 @@ class TestEvalKitLogging(unittest.TestCase):
         self.assertEqual(logs[0].status, "ERROR")
 
     def test_log_level_in_attributes(self):
-        logger = _install_handler(self.client, "evalkit.test.level")
+        logger = _install_handler(self.client, "app.test.level")
         logger.info("info message")
         logger.warning("warn message")
         self.client.flush()
@@ -63,11 +63,11 @@ class TestEvalKitLogging(unittest.TestCase):
 
     def test_install_logging_handler_export(self):
         tid, end, ctx = self.client.start_trace("logging-req")
-        logger = logging.getLogger("evalkit.test.install")
+        logger = logging.getLogger("app.test.install")
         # The logger's level is the application's to set; install_logging_handler leaves it alone.
         logger.setLevel(logging.INFO)
         with evalkit.with_trace(ctx):
-            evalkit.install_logging_handler(self.client, logger_name="evalkit.test.install")
+            evalkit.install_logging_handler(self.client, logger_name="app.test.install")
             logger.info("via install_logging_handler")
         end("OK")
         self.client.flush()

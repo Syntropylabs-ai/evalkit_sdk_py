@@ -5,15 +5,15 @@ from typing import Any, List, Optional
 
 from ..core.types import SpanEvent
 
-_ARGS_MAX = 32768
 
-
-def _truncate(value: Any, limit: int = _ARGS_MAX) -> str:
+def _truncate(value: Any, limit: Optional[int] = None) -> str:
+    """A tool call's arguments or result as text. Kept whole by default: the client cuts any value
+    over the per-value limit, keeping its start and end, when the span is queued."""
     try:
         text = value if isinstance(value, str) else str(value)
     except Exception:
         return "<unserializable>"
-    return text if len(text) <= limit else text[:limit] + "…"
+    return text if limit is None or len(text) <= limit else text[:limit] + "…"
 
 
 def _to_json(value: Any) -> str:

@@ -387,7 +387,11 @@ class TestDrain(_ReceiverTest):
         with mock.patch("evalkit.core.exporter.time.sleep"), self.assertLogs("evalkit", level="WARNING") as logs:
             self.assertFalse(client._drain())
         self.assertEqual(len(self.receiver.requests), 4, "the later batches would wait out the same retries")
-        self.assertTrue(any("dropping the 7 queued span(s)" in m for m in logs.output), logs.output)
+        self.assertEqual(len(logs.output), 1, "one failing cycle is one warning, not one per batch")
+        stats = client.stats()
+        self.assertEqual(stats["dropped_export_failed"], 12, "the failed batch and the 7 after it are counted")
+        self.assertEqual(stats["export_failures"], 1)
+        self.assertIn("503", stats["last_error"])
 
     def test_draining_continues_past_a_batch_the_receiver_refuses(self):
         self.receiver.respond = lambda r: 400 if r["events"][0]["spanId"] == f"{0:016x}" else 202

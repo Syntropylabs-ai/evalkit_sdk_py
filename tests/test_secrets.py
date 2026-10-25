@@ -168,16 +168,22 @@ URL_CASES = (
         "https://h/p?flag&token=***&&x=1=2",
     ),
     (
-        "a url inside prose is free text, not a url",
+        "a url inside a log or exception message loses its credential parameters",
         "log.message",
-        "See https://example.com/x?token=abc for details",
-        "See https://example.com/x?token=abc for details",
+        "See https://example.com/x?token=abc&page=2 for details",
+        "See https://example.com/x?token=***&page=2 for details",
     ),
     (
-        "prose around a url still gets pattern scrubbing",
+        "prose around a url in a message still gets pattern scrubbing",
         "log.message",
         f"See https://example.com/x?key={LIVE_KEY} for details",
-        "See https://example.com/x?key=tk_live_*** for details",
+        "See https://example.com/x?key=*** for details",
+    ),
+    (
+        "a url in an exception message loses its credential parameters",
+        "exception.message",
+        "GET https://api.example.com/v1/q?api_key=abc123&page=2 failed: 500",
+        "GET https://api.example.com/v1/q?api_key=***&page=2 failed: 500",
     ),
 )
 

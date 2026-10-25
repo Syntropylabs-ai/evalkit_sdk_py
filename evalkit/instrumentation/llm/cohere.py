@@ -138,7 +138,7 @@ def _cohere_recorder(
             trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
             span_type="llm_call",
             status="ERROR" if error is not None else "OK",
-            status_message=str(error) if error is not None else None,
+            status_message=str(error) if error is not None else None, exception=error,
             operation=operation,
             service_name=client._opts.service_name, provider="cohere", model=model,
             prompt=prompt_text, completion=completion,

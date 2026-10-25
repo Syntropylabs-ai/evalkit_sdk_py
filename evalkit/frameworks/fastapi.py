@@ -1,17 +1,17 @@
 from __future__ import annotations
 
-import json
 from typing import Any, Callable
 
-from ..core.client import EvalKitClient
+from ..core.client import EvalKitClient, release_ambient_trace
 from ..core.context import SpanContext, _current_span, reset_identity, set_identity
 from ..core.otel_provider import claim_framework_server_span, release_framework_server_span
 from ..utils.headers import parse_traceparent, sanitize_headers
+from ._bodies import RequestBodyTap, ResponseBodyTap
 from ._identity import user_id_of
 from ._lifespan import flush_before_shutdown_reply
-from ._probe import answer_probe_untraced, is_probe
+from ._probe import answer_probe_untraced, is_ignored
 
-_BODY_MAX = 10 * 1024 * 1024
+_BODY_MAX = 64 * 1024
 
 
 def _matched_template(routes: Any, scope: Any) -> "str | None":
@@ -90,6 +90,21 @@ def route_template(
         return None
 
 
+def _failed_status(exc: BaseException, sent: "int | None") -> "int | None":
+    """The status a failed request is recorded with: what was sent, else the 500 the server answers
+    with, except for a request cancelled because the client went away, which got no answer."""
+    if sent is not None:
+        return sent
+    try:
+        import asyncio
+
+        if isinstance(exc, asyncio.CancelledError):
+            return None
+    except Exception:
+        pass
+    return 500
+
+
 class EvalKitMiddleware:
 
     def __init__(self, app: Any, client: "EvalKitClient | None" = None) -> None:
@@ -112,8 +127,8 @@ class EvalKitMiddleware:
             pass
         await self._app(scope, receive, send)
 
-    async def _answer_probe(self, scope: Any, receive: Callable, send: Callable) -> None:
-        # A framework that traces requests itself opened the probe's server span before this
+    async def _answer_untraced(self, scope: Any, receive: Callable, send: Callable) -> None:
+        # A framework that traces requests itself opened the request's server span before this
         # middleware ran; claimed and never handed back, it is dropped at export with its inner spans.
         try:
             if _current_span.get() is None:
@@ -121,6 +136,18 @@ class EvalKitMiddleware:
         except Exception:
             pass
         await answer_probe_untraced(self._app, scope, receive, send)
+
+    def _route_before_routing(self, scope: Any) -> "str | None":
+        # Starlette matches the route inside the app, after this middleware decides; a callable in
+        # ignore_routes that reads the route has it matched here, once, the way the router will.
+        router = getattr(scope.get("app"), "router", None) or getattr(self._app, "router", None)
+        entry = {
+            "type": "http",
+            "method": scope.get("method", "GET"),
+            "path": scope.get("path", "/"),
+            "root_path": scope.get("root_path") or "",
+        }
+        return _matched_template(getattr(router, "routes", None), entry)
 
     async def __call__(self, scope: Any, receive: Callable, send: Callable) -> None:
         global _BODY_MAX
@@ -130,8 +157,8 @@ class EvalKitMiddleware:
         if scope["type"] not in ("http",):
             await self._app(scope, receive, send)
             return
-        if is_probe(scope.get("path")):
-            await self._answer_probe(scope, receive, send)
+        if is_ignored(scope.get("method"), scope.get("path"), resolve_route=lambda: self._route_before_routing(scope)):
+            await self._answer_untraced(scope, receive, send)
             return
 
         try:
@@ -139,17 +166,20 @@ class EvalKitMiddleware:
         except Exception:
             await self._app(scope, receive, send)
             return
+        if not getattr(client, "enabled", True):
+            await self._app(scope, receive, send)
+            return
         _BODY_MAX = client._opts.max_body_bytes
         method = scope.get("method", "GET")
         path = scope.get("path", "/")
         entry_root_path = scope.get("root_path") or ""
-        query = scope.get("query_string", b"").decode()
+        query = scope.get("query_string", b"").decode("utf-8", "replace")
         server = scope.get("server") or ("localhost", 80)
         url = f"{scope.get('scheme', 'http')}://{server[0]}{path}"
         if query:
             url = f"{url}?{query}"
 
-        raw_headers = {k.decode(): v.decode() for k, v in scope.get("headers", [])}
+        raw_headers = {k.decode("utf-8", "replace"): v.decode("utf-8", "replace") for k, v in scope.get("headers", [])}
         safe_headers = sanitize_headers(raw_headers)
 
         upstream_trace_id, upstream_span_id = None, None
@@ -157,37 +187,10 @@ class EvalKitMiddleware:
         if tp:
             upstream_trace_id, upstream_span_id = parse_traceparent(tp)
 
-        _chunks: list[bytes] = []
-        _msgs: list[Any] = []
-        _total_len = 0
-        while True:
-            _msg = await receive()
-            _msgs.append(_msg)
-            _chunk = _msg.get("body", b"")
-            if _chunk and _total_len < _BODY_MAX:
-                _take = _BODY_MAX - _total_len
-                _chunks.append(_chunk[:_take])
-                _total_len += len(_chunk)
-            if not _msg.get("more_body", False):
-                break
-        total_body = b"".join(_chunks)
-
-        _msg_idx = 0
-
-        async def receive_replay() -> Any:
-            nonlocal _msg_idx
-            if _msg_idx < len(_msgs):
-                m = _msgs[_msg_idx]
-                _msg_idx += 1
-                return m
-            return await receive()
-
-        body_json: Any = None
-        if total_body:
-            try:
-                body_json = json.loads(total_body[:_BODY_MAX].decode("utf-8", errors="replace"))
-            except Exception:
-                body_json = total_body[:_BODY_MAX].decode("utf-8", errors="replace") or None
+        # The body is kept from the messages the app reads, as it reads them: reading it ahead would
+        # hold an upload in memory before the app saw its first byte.
+        request_tap = RequestBodyTap(receive, _BODY_MAX, raw_headers)
+        response_tap = ResponseBodyTap(_BODY_MAX)
 
         identity_token = None
         request_user_id = user_id_of(scope.get("user"))
@@ -209,7 +212,6 @@ class EvalKitMiddleware:
                 method=method,
                 url=url,
                 headers=safe_headers,
-                request_body=body_json,
                 upstream_trace_id=upstream_trace_id,
                 upstream_span_id=upstream_span_id,
                 span_id=claimed_span_id,
@@ -219,23 +221,25 @@ class EvalKitMiddleware:
             release_framework_server_span(claimed)
             if identity_token is not None:
                 reset_identity(identity_token)
-            await self._app(scope, receive_replay, send)
+            await self._app(scope, receive, send)
             return
 
         status_code_holder: list[int] = [200]
+        started: list[bool] = [False]
         response_headers_holder: list[dict] = [{}]
-        response_body_holder: list[bytes] = [b""]
 
         async def send_wrapper(message: Any) -> None:
             try:
                 msg_type = message.get("type")
                 if msg_type == "http.response.start":
+                    started[0] = True
                     status_code_holder[0] = message.get("status", 200)
                     raw_resp_headers = {
-                        k.decode(): v.decode()
+                        k.decode("utf-8", "replace"): v.decode("utf-8", "replace")
                         for k, v in message.get("headers", [])
                     }
                     response_headers_holder[0] = raw_resp_headers
+                    response_tap.start(raw_resp_headers)
                     headers = list(message.get("headers", []))
                     headers.append((b"x-trace-id", trace_id.encode()))
                     headers.append((
@@ -244,35 +248,39 @@ class EvalKitMiddleware:
                     ))
                     message = {**message, "headers": headers}
                 elif msg_type == "http.response.body":
-                    if len(response_body_holder[0]) < _BODY_MAX:
-                        response_body_holder[0] += message.get("body", b"")
+                    response_tap.add(message.get("body", b""))
             except Exception:
                 pass
             await send(message)
 
+        def body_attributes() -> dict:
+            return {**request_tap.attributes(), **response_tap.attributes()}
+
         try:
-            await self._app(scope, receive_replay, send_wrapper)
+            await self._app(scope, request_tap.receive, send_wrapper)
             sc = status_code_holder[0]
-            resp_body: Any = None
-            raw_resp = response_body_holder[0][:_BODY_MAX]
-            if raw_resp:
-                try:
-                    resp_body = json.loads(raw_resp.decode("utf-8", errors="replace"))
-                except Exception:
-                    resp_body = raw_resp.decode("utf-8", errors="replace") or None
             try:
                 end(
                     "ERROR" if sc >= 400 else "OK",
                     status_code=sc,
-                    response_body=resp_body,
+                    response_body=response_tap.value(),
                     response_headers=response_headers_holder[0] or None,
                     route=route_template(scope, entry_root_path, framework_span, path),
+                    request_body=request_tap.value(),
+                    attributes=body_attributes() or None,
                 )
             except Exception:
                 pass
-        except Exception:
+        except BaseException as exc:
             try:
-                end("ERROR", route=route_template(scope, entry_root_path, framework_span, path))
+                end(
+                    "ERROR",
+                    status_code=_failed_status(exc, status_code_holder[0] if started[0] else None),
+                    route=route_template(scope, entry_root_path, framework_span, path),
+                    request_body=request_tap.value(),
+                    attributes=body_attributes() or None,
+                    exception=exc,
+                )
             except Exception:
                 pass
             raise
@@ -283,3 +291,4 @@ class EvalKitMiddleware:
                 pass
             if identity_token is not None:
                 reset_identity(identity_token)
+            release_ambient_trace(trace_id)

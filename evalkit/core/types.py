@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Literal, Optional
 
@@ -58,6 +59,12 @@ class TraceEnvelope:
     simulation_id: Optional[str] = None
     scenario_id: Optional[str] = None
     run_id: Optional[str] = None
+    # The exception that failed this span. Never sent as it is: the client records it by the shared
+    # exception contract (status, an `exception` event, `evalkit.exception.*` attributes) when the span
+    # is queued, and lets go of it then, so no traceback, and none of the frames it holds, outlives that.
+    exception: Optional[BaseException] = field(default=None, repr=False, compare=False)
+    # Whether that exception propagated out of the span (None: it did).
+    exception_escaped: Optional[bool] = field(default=None, repr=False, compare=False)
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {
@@ -141,7 +148,13 @@ class EvalKitOptions:
     max_export_batch_size: int = 512
     scheduled_delay_ms: int = 5000
     max_queue_size: int = 4096
-    max_body_bytes: int = 10 * 1024 * 1024
+    # About how many bytes the spans waiting to be sent may hold; past it the oldest spans that are not
+    # model calls go first.
+    max_queue_bytes: int = 32 * 1024 * 1024
+    # The most of one HTTP request or response body a server or client span keeps.
+    max_body_bytes: int = 64 * 1024
+    # The most of one value (a prompt, a completion, an attribute) a span keeps, in UTF-8 bytes.
+    max_value_bytes: int = 16 * 1024 * 1024
     environment: Optional[str] = None
     app_version: Optional[str] = None
     device_id: Optional[str] = None
@@ -150,6 +163,22 @@ class EvalKitOptions:
     capture_stream_bodies: bool = True
     mask: Optional[Callable[["TraceEnvelope"], Optional["TraceEnvelope"]]] = None
     export_gzip: bool = True
+    # Spans a second each traced function may record; 0 records every call.
+    function_rate_limit: float = 100.0
+    # The lowest level a log record needs to be recorded as a log span, and how many a second may be.
+    log_level: int = logging.WARNING
+    log_rate_limit: float = 50.0
+    # The share of traces kept; model calls, tool calls and failed spans are kept whatever it is.
+    sample_rate: float = 1.0
+    # Module prefixes that are, or are not, the application's own code in an exception's frames.
+    in_app_include: Optional[List[str]] = None
+    in_app_exclude: Optional[List[str]] = None
+    # Requests, outgoing calls and functions kept out of traces, as given; core.ignore compiles them.
+    ignore_routes: Optional[List[Any]] = None
+    ignore_urls: Optional[List[Any]] = None
+    ignore_functions: Optional[List[Any]] = None
+    # Whether health and readiness probes are traced like any request.
+    trace_health_checks: bool = False
 
     @property
     def capture_sensitive_headers(self) -> bool:

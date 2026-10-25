@@ -28,6 +28,8 @@ def fresh(capture: list):
     _CLIENT._exporter.export = lambda batch: (capture.extend(batch), True)[1]
     with _CLIENT._lock:
         _CLIENT._queue.clear()
+        _CLIENT._queue_bytes = 0
+    _CLIENT._health.reset()
     return _CLIENT
 
 

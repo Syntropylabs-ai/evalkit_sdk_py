@@ -13,7 +13,7 @@ from ._stream_body import attach_aiohttp, new_capture
 from ._skip import should_skip as _should_skip
 from .._safe import hook_failed
 
-_BODY_MAX = 10 * 1024 * 1024
+_BODY_MAX = 64 * 1024
 _STREAM_BODIES = True
 
 
@@ -40,7 +40,7 @@ def patch_aiohttp(client: EvalKitClient) -> None:
     ) -> Any:
         try:
             url = str(str_or_url)
-            skip = bool(args) or _should_skip(url) or _in_http_span.get()
+            skip = bool(args) or _should_skip(url, method) or _in_http_span.get()
         except Exception:
             skip = True
         if skip:
@@ -98,7 +98,7 @@ def patch_aiohttp(client: EvalKitClient) -> None:
                     attrs["http.request.body"] = req_body
                 client.enqueue(TraceEnvelope(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                    span_type="http_call", status="ERROR", status_message=str(e),
+                    span_type="http_call", status="ERROR", status_message=str(e), exception=e,
                     span_kind="CLIENT", operation=client_span_name(method),
                     service_name=client._opts.service_name,
                     attributes=attrs, latency_ms=latency, start_time=ts, end_time=end_ts,
@@ -145,7 +145,7 @@ def patch_aiohttp(client: EvalKitClient) -> None:
                         stream_attrs["error.message"] = message
                     client.enqueue(TraceEnvelope(
                         trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                        span_type="http_call", status=status, status_message=message,
+                        span_type="http_call", status=status, status_message=message, exception=error,
                         span_kind="CLIENT", operation=client_span_name(method),
                         service_name=client._opts.service_name,
                         attributes=stream_attrs,

@@ -14,7 +14,7 @@ from ._stream_body import attach_httpx_async, attach_httpx_sync, new_capture
 from ._skip import should_skip as _should_skip
 from .._safe import hook_failed
 
-_BODY_MAX = 10 * 1024 * 1024
+_BODY_MAX = 64 * 1024
 _STREAM_BODIES = True
 
 
@@ -57,7 +57,7 @@ def _emit_streamed_span(
         _emit_http_span(
             client, latency=int(time.time() * 1000 - start_ms), end_ts=_now_iso(),
             error_msg=str(error) if error is not None else None,
-            stream_attrs=capture.attrs(), **span,
+            stream_attrs=capture.attrs(), exception=error, **span,
         )
 
     capture = new_capture(_BODY_MAX, start_ms, emit)
@@ -98,7 +98,7 @@ def _patch_clients(client: EvalKitClient, httpx: Any) -> None:
         def traced_sync_send(self: Any, request: Any, **kwargs: Any) -> Any:
             try:
                 url = str(request.url)
-                skip = _should_skip(url) or _in_http_span.get()
+                skip = _should_skip(url, request.method) or _in_http_span.get()
             except Exception:
                 skip = True
             if skip:
@@ -132,7 +132,7 @@ def _patch_clients(client: EvalKitClient, httpx: Any) -> None:
                     _emit_http_span(
                         client, trace_id, parent_span_id, span_id, method, url, None, str(e),
                         ts, end_ts, int(time.time() * 1000 - start_ms),
-                        req_headers=req_headers, req_body=_req_body(request),
+                        req_headers=req_headers, req_body=_req_body(request), exception=e,
                     )
                 except Exception as hook_exc:
                     hook_failed("httpx", hook_exc)
@@ -169,7 +169,7 @@ def _patch_clients(client: EvalKitClient, httpx: Any) -> None:
         async def traced_async_send(self: Any, request: Any, **kwargs: Any) -> Any:
             try:
                 url = str(request.url)
-                skip = _should_skip(url) or _in_http_span.get()
+                skip = _should_skip(url, request.method) or _in_http_span.get()
             except Exception:
                 skip = True
             if skip:
@@ -203,7 +203,7 @@ def _patch_clients(client: EvalKitClient, httpx: Any) -> None:
                     _emit_http_span(
                         client, trace_id, parent_span_id, span_id, method, url, None, str(e),
                         ts, end_ts, int(time.time() * 1000 - start_ms),
-                        req_headers=req_headers, req_body=_req_body(request),
+                        req_headers=req_headers, req_body=_req_body(request), exception=e,
                     )
                 except Exception as hook_exc:
                     hook_failed("httpx", hook_exc)
@@ -253,6 +253,7 @@ def _emit_http_span(
     resp_body: Optional[str] = None,
     stream_attrs: Optional[Dict[str, Any]] = None,
     time_to_headers_ms: Optional[int] = None,
+    exception: Optional[BaseException] = None,
 ) -> None:
     attrs: Dict[str, Any] = {"http.method": method, "http.url": url, **client._meta_attrs()}
     status = "OK"
@@ -283,4 +284,5 @@ def _emit_http_span(
         attributes=attrs, latency_ms=latency, start_time=start_ts, end_time=end_ts,
         created_at=start_ts, environment=client._opts.environment,
         app_version=client._opts.app_version, sdk_version=SDK_VERSION,
+        exception=exception if isinstance(exception, BaseException) else None,
     ))

@@ -42,11 +42,31 @@ def make_traceparent(trace_id: str, span_id: str) -> str:
     return f"00-{trace_id}-{span_id}-01"
 
 
+_TRACEPARENT_RE = re.compile(
+    r"^[ \t]*([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})(-.*)?[ \t]*$"
+)
+_ZERO_TRACE_ID = "0" * 32
+_ZERO_SPAN_ID = "0" * 16
+
+
 def parse_traceparent(header: str) -> tuple[str | None, str | None]:
-    parts = header.split("-")
-    if len(parts) == 4 and parts[0] == "00" and len(parts[1]) == 32 and len(parts[2]) == 16:
-        return parts[1], parts[2]
-    return None, None
+    """The trace id and parent span id of a W3C traceparent header, or (None, None) when it is invalid.
+
+    By the W3C Trace Context rules: lowercase hex only, an all-zero trace or span id is invalid,
+    version ff is invalid, version 00 has exactly four fields, and a later version may add fields
+    after the flags, which are ignored so that a newer caller still joins the trace.
+    """
+    if not isinstance(header, str) or len(header) > 512:
+        return None, None
+    match = _TRACEPARENT_RE.match(header)
+    if match is None:
+        return None, None
+    version, trace_id, span_id, _flags, rest = match.groups()
+    if version == "ff" or (version == "00" and rest):
+        return None, None
+    if trace_id == _ZERO_TRACE_ID or span_id == _ZERO_SPAN_ID:
+        return None, None
+    return trace_id, span_id
 
 
 def client_span_name(method: str) -> str:

@@ -17,7 +17,13 @@ def _dump(o: Any) -> Any:
     return o
 
 
-def _safe_body(obj: Any, limit: int = 2 * 1024 * 1024) -> Optional[str]:
+def _safe_body(obj: Any, limit: Optional[int] = None) -> Optional[str]:
+    """A request or response body as JSON text.
+
+    Kept whole by default: the client cuts a value over the per-value limit when the span is queued,
+    keeping its start and its end, so a long conversation keeps its newest messages, and records the
+    original size as ``evalkit.truncated.<attribute>``. ``limit`` cuts it the same way here.
+    """
     if obj is None:
         return None
     try:
@@ -27,4 +33,8 @@ def _safe_body(obj: Any, limit: int = 2 * 1024 * 1024) -> Optional[str]:
             s = str(obj)
         except Exception:
             return None
-    return s if len(s) <= limit else s[:limit] + "…"
+    if limit is not None:
+        from ...core.limits import cut_middle
+
+        s = cut_middle(s, limit)[0]
+    return s

@@ -9,6 +9,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 from .content import compact_json, message_content_text, parse_json_text
 from .context import AGENT_NAME_KEYS, SESSION_ID_KEYS, USER_ID_KEYS, first_attr, tracing_suppressed
+from .ignore import has_url_patterns, ignored_url
 from .types import SpanEvent, TraceEnvelope
 
 _log = logging.getLogger("evalkit")
@@ -356,8 +357,9 @@ def capture_start_scope(span: Any) -> None:
             _started_scopes.popitem(last=False)
 
 
-# Spans another instrumentation started while a health probe was answered. They are exported from
-# the processor's own thread, where the probe's context is gone, so they are told apart as they start.
+# Spans another instrumentation started while tracing was held off (a probe, an ignored route, an
+# untraced block), and outgoing calls ignore_urls leaves out. They are exported from the processor's
+# own thread, where the request's context is gone, so they are told apart as they start.
 _suppressed_spans: "OrderedDict[Tuple[int, int], None]" = OrderedDict()
 
 
@@ -366,6 +368,80 @@ def _note_suppressed(span: Any) -> None:
     if key is not None:
         with _scopes_lock:
             _remember(_suppressed_spans, key, None)
+
+
+def _is_suppressed(span: Any) -> bool:
+    if not _suppressed_spans:
+        return False
+    key = _span_key(span)
+    if key is None:
+        return False
+    with _scopes_lock:
+        return key in _suppressed_spans
+
+
+def _ignored_client_span(span: Any) -> bool:
+    """Whether another instrumentation's span is an outgoing call ignore_urls leaves out (urllib3 or
+    urllib used directly, through OpenTelemetry's instrumentation of them)."""
+    if not has_url_patterns():
+        return False
+    try:
+        from opentelemetry.trace import SpanKind
+
+        if getattr(span, "kind", None) != SpanKind.CLIENT:
+            return False
+        attrs = getattr(span, "attributes", None) or {}
+        url = attrs.get("url.full") or attrs.get("http.url")
+        if not isinstance(url, str) or not url:
+            return False
+        return ignored_url(url, attrs.get("http.request.method") or attrs.get("http.method"))
+    except Exception:
+        return False
+
+
+def _quiet_propagator(inner: Any) -> Any:
+    """The global propagator, except that a span EvalKit drops hands no context on.
+
+    Such a span (started while tracing is held off, or an outgoing call ignore_urls leaves out) is never
+    exported, so a traceparent naming it would point the next service at a parent that never arrives.
+    OpenTelemetry's HTTP client instrumentations the SDK registers inject through this propagator.
+    """
+    from opentelemetry import trace
+    from opentelemetry.propagators.textmap import TextMapPropagator, default_getter, default_setter
+
+    class _QuietPropagator(TextMapPropagator):
+        _evalkit_quiet = True
+
+        def __init__(self, wrapped: Any) -> None:
+            self._wrapped = wrapped
+
+        def extract(self, carrier: Any, context: Any = None, getter: Any = default_getter) -> Any:
+            return self._wrapped.extract(carrier, context=context, getter=getter)
+
+        def inject(self, carrier: Any, context: Any = None, setter: Any = default_setter) -> None:
+            try:
+                if _is_suppressed(trace.get_current_span(context)):
+                    return
+            except Exception:
+                pass
+            self._wrapped.inject(carrier, context=context, setter=setter)
+
+        @property
+        def fields(self) -> Any:
+            return self._wrapped.fields
+
+    return _QuietPropagator(inner)
+
+
+def _install_quiet_propagator() -> None:
+    try:
+        from opentelemetry import propagate
+
+        current = propagate.get_global_textmap()
+        if not getattr(current, "_evalkit_quiet", False):
+            propagate.set_global_textmap(_quiet_propagator(current))
+    except Exception as exc:
+        _log.debug("wrapping the propagator failed: %s", exc)
 
 
 def _take_suppressed(span: Any) -> bool:
@@ -430,7 +506,6 @@ _MESSAGE_EVENTS = {
     "gen_ai.tool.message": "tool",
 }
 _DETAILS_EVENT = "gen_ai.client.inference.operation.details"
-_TEXT_MAX = 32768
 
 
 class _FrameworkSpan(NamedTuple):
@@ -529,7 +604,7 @@ def _tool_result_text(raw: Any) -> Optional[str]:
 
 
 def _clip(text: Optional[str]) -> Optional[str]:
-    return text[:_TEXT_MAX] if text else None
+    return text if text else None
 
 
 def _is_duplicate_model_call(span_id: str, parent_span_id: Optional[str], started_inside: Optional[str]) -> bool:
@@ -776,7 +851,7 @@ def setup_otel(client: Any) -> bool:
         class _ScopeCapturingProcessor(BatchSpanProcessor):
             def on_start(self, span: Any, parent_context: Any = None) -> None:
                 try:
-                    if tracing_suppressed():
+                    if tracing_suppressed() or _ignored_client_span(span):
                         _note_suppressed(span)
                     else:
                         capture_start_scope(span)
@@ -817,6 +892,7 @@ def setup_otel(client: Any) -> bool:
             return False
         _processor = processor
         _started = True
+        _install_quiet_propagator()
         _register_all_instrumentors(provider)
         return True
     except Exception as exc:

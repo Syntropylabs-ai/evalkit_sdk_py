@@ -140,7 +140,7 @@ def patch_sqlalchemy(client: EvalKitClient, engine: Any) -> None:
 
         client.enqueue(TraceEnvelope(
             trace_id=parent_ctx.trace_id, span_id=span_id, parent_span_id=parent_ctx.span_id,
-            span_type="db_query", status="ERROR", status_message=str(err),
+            span_type="db_query", status="ERROR", status_message=str(err), exception=err,
             operation="sql query", service_name=client._opts.service_name,
             attributes={"error.message": str(err), **client._meta_attrs()},
             latency_ms=latency, start_time=start_ts, end_time=end_ts, created_at=start_ts,

@@ -12,6 +12,8 @@ import urllib.request
 from datetime import timezone
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
+from .health import ExportHealth, clip
+from .limits import fit_dict
 from .redact import _resolve_flag
 from .types import EvalKitOptions, TraceEnvelope
 
@@ -21,10 +23,13 @@ _log = logging.getLogger("evalkit")
 _AUTH_FAIL_LIMIT = 3
 
 
+# The most one span may take once encoded, in UTF-8 bytes: under the 10 MiB a message may be on the
+# receiver's queue, so a span is never refused for its size after it was sent. A larger span keeps the
+# start and the end of its longest values.
 _MAX_SPAN_BYTES = 8 * 1024 * 1024
 
 # The most JSON one export request carries, measured before compression. A batch of large spans
-# goes out as several requests, so no request comes near the 10 MiB that the proxy in front of the
+# goes out as several requests, so no request comes near the 16 MiB that the proxy in front of the
 # receiver accepts, and a refused request costs only its own spans, not the whole batch.
 MAX_REQUEST_BYTES = 4 * 1024 * 1024
 
@@ -91,47 +96,32 @@ def resolve_export_gzip(explicit: Optional[bool]) -> bool:
     return _resolve_flag(explicit, EXPORT_GZIP_ENV_VARS, True)
 
 
+def _dumps(d: Dict[str, Any]) -> bytes:
+    # UTF-8 rather than ASCII escapes: a character outside ASCII costs its UTF-8 size, not six or
+    # twelve bytes, and what is measured here is what the receiver counts. A lone surrogate, which
+    # UTF-8 cannot carry, is sent as U+FFFD.
+    return json.dumps(d, ensure_ascii=False).encode("utf-8", "replace")
+
+
 def _event_size(d: Dict[str, Any]) -> int:
     try:
-        return len(json.dumps(d))
+        return len(_dumps(d))
     except Exception:
         return _MAX_SPAN_BYTES + 1
 
 
 def _fit_event(d: Dict[str, Any], limit: int = _MAX_SPAN_BYTES) -> Optional[Dict[str, Any]]:
-    if _event_size(d) <= limit:
+    """The span within ``limit`` bytes: its longest values keep their start and their end, each cut
+    recorded as ``evalkit.truncated.<field>``; None when even that cannot make it fit."""
+    size = _event_size(d)
+    for _ in range(6):
+        if size <= limit:
+            return d
+        if not fit_dict(d, size - limit + 1024):
+            break
+        size = _event_size(d)
+    if size <= limit:
         return d
-
-    def note(n: int) -> str:
-        return f"…[dropped {n} bytes — exceeded trace span size limit]"
-
-    attrs = d.get("attributes")
-    if isinstance(attrs, dict):
-        for k in ("http.response.body", "http.request.body", "gen_ai.response.body",
-                  "gen_ai.request.body", "response.body", "request.body"):
-            v = attrs.get(k)
-            if isinstance(v, str) and len(v) > 1024:
-                attrs[k] = note(len(v))
-    if _event_size(d) <= limit:
-        return d
-
-    for k in ("prompt", "completion"):
-        v = d.get(k)
-        if isinstance(v, str) and len(v) > 1024:
-            d[k] = note(len(v))
-    sm = d.get("statusMessage")
-    if isinstance(sm, str) and len(sm) > 4096:
-        d["statusMessage"] = sm[:4096]
-    if _event_size(d) <= limit:
-        return d
-
-    if isinstance(attrs, dict):
-        for k, v in list(attrs.items()):
-            if isinstance(v, str) and len(v) > 512:
-                attrs[k] = v[:512] + "…"
-    if _event_size(d) <= limit:
-        return d
-
     d["attributes"] = {"trace.truncated": True}
     d.pop("events", None)
     d.pop("prompt", None)
@@ -146,19 +136,18 @@ class _Span(NamedTuple):
 
 def _encode(d: Dict[str, Any]) -> Optional[bytes]:
     try:
-        text = json.dumps(d)
+        data: Optional[bytes] = _dumps(d)
     except Exception:
-        text = None
-    if text is None or len(text) > _MAX_SPAN_BYTES:
+        data = None
+    if data is None or len(data) > _MAX_SPAN_BYTES:
         fitted = _fit_event(d)
         if fitted is None:
             return None
         try:
-            text = json.dumps(fitted)
+            data = _dumps(fitted)
         except Exception:
             return None
-    # json.dumps escapes every non-ASCII character, so the length in characters is the length in bytes.
-    return text.encode("ascii")
+    return data
 
 
 def _group(spans: Sequence[_Span], max_bytes: int, max_spans: int) -> List[List[_Span]]:
@@ -200,9 +189,9 @@ def _status_field(text: str) -> Any:
 
 
 class _Exporter:
-    def __init__(self, opts: EvalKitOptions) -> None:
-        self._url = opts.base_url.rstrip("/") + "/v1/ingest"
-        self._key = opts.subscription_key
+    def __init__(self, opts: EvalKitOptions, health: Optional[ExportHealth] = None) -> None:
+        self._url = str(opts.base_url or "").rstrip("/") + "/v1/ingest"
+        self._key = str(opts.subscription_key or "")
         self._debug = opts.debug
         self._auth_failures = 0
         self._disabled = False
@@ -211,88 +200,127 @@ class _Exporter:
         self._max_request_bytes = MAX_REQUEST_BYTES
         self._max_request_spans = max(1, int(opts.max_export_batch_size or 1))
         self._halted = False
+        self.health = health if health is not None else ExportHealth()
+        # How many spans the last export delivered.
+        self.last_sent: Optional[int] = None
         # Set while the process is about to end: no export may wait past it.
         self.exit_deadline: Optional[float] = None
+        # A deadline the calling thread's flush(timeout=...) set for its own export.
+        self._local = threading.local()
 
     def after_fork_in_child(self) -> None:
         # The export thread that held this lock in the parent does not exist in the child.
         self._gzip_lock = threading.Lock()
+        self._local = threading.local()
+
+    def set_call_deadline(self, deadline: Optional[float]) -> Optional[float]:
+        """Bound the exports this thread makes until it is set back; returns the previous deadline."""
+        previous = getattr(self._local, "deadline", None)
+        self._local.deadline = deadline
+        return previous
+
+    @property
+    def disabled(self) -> bool:
+        """The receiver refused the subscription key repeatedly: nothing is sent for the rest of the process."""
+        return self._disabled
 
     @property
     def halted(self) -> bool:
         """The last export stopped before its last request: the receiver did not answer, or refused the key."""
         return self._halted
 
+    def _failed(self, message: str) -> None:
+        try:
+            self.health.export_failed(message, target=self._url, debug=self._debug)
+        except Exception:
+            pass
+
     def export(self, envelopes: List[TraceEnvelope]) -> bool:
         self._halted = False
+        self.last_sent = 0
         if self._disabled:
             return False
         spans: List[_Span] = []
         for e in envelopes:
-            data = _encode(e.to_dict())
+            try:
+                data = _encode(e.to_dict())
+            except Exception:
+                data = None
             if data is not None:
                 spans.append(_Span(data, e.operation or e.span_type))
         if not spans:
+            self.last_sent = len(envelopes)
             return True
         deadline = _clock() + _RETRY_BUDGET_S
         if self.exit_deadline is not None:
             deadline = min(deadline, self.exit_deadline)
+        call_deadline = getattr(self._local, "deadline", None)
+        if call_deadline is not None:
+            deadline = min(deadline, call_deadline)
         ok = True
+        sent = 0
         for group in _group(spans, self._max_request_bytes, self._max_request_spans):
             if self._disabled:
-                return False
-            outcome = self._send(group, deadline)
+                ok = False
+                break
+            outcome, delivered = self._send(group, deadline)
+            sent += delivered
             if outcome == _SENT:
                 continue
             ok = False
             if outcome == _HALT:
                 self._halted = True
                 break
+        # A span too large to encode at all was dropped on purpose; it is not an export failure.
+        self.last_sent = sent + (len(envelopes) - len(spans))
         return ok
 
-    def _send(self, spans: List[_Span], deadline: float) -> str:
-        status, text = self._deliver(_body(spans), deadline)
+    def _send(self, spans: List[_Span], deadline: float) -> Tuple[str, int]:
+        """Send one request's spans; the outcome, and how many of them the receiver took."""
+        status, text, error = self._deliver(_body(spans), deadline)
         if 200 <= status < 300:
             self._auth_failures = 0
             if self._debug:
                 _log.debug("exported %d span(s) — %s", len(spans), _status_field(text))
-            return _SENT
+            return _SENT, len(spans)
         if status == 0 or _retryable(status):
-            return _HALT
+            detail = f"HTTP {status}" if status else (error or "no response")
+            self._failed(f"{detail} after retrying")
+            return _HALT, 0
         if status in (401, 403):
             # One refusal per export, however many requests it takes: a receiver briefly unable to check
             # keys must not use up the auth-failure limit within one large export.
             self._on_auth_failure(status, text)
-            return _HALT
+            return _HALT, 0
         if status == 413:
             if len(spans) > 1:
                 half = len(spans) // 2
-                first = self._send(spans[:half], deadline)
+                first, first_sent = self._send(spans[:half], deadline)
                 if first == _HALT:
-                    return first
-                second = self._send(spans[half:], deadline)
-                return first if second == _SENT else second
-            _log.warning(
-                "dropping span %r (%d bytes): the receiver rejected it as too large (HTTP 413)",
-                spans[0].operation, len(spans[0].data),
+                    return first, first_sent
+                second, second_sent = self._send(spans[half:], deadline)
+                return (first if second == _SENT else second), first_sent + second_sent
+            self._failed(
+                f"dropping span {spans[0].operation!r} ({len(spans[0].data)} bytes): the receiver rejected it "
+                "as too large (HTTP 413)"
             )
-            return _REFUSED
-        _log.warning("export rejected %d: %s", status, text)
-        return _REFUSED
+            return _REFUSED, 0
+        self._failed(f"export rejected {status}: {clip(text)}")
+        return _REFUSED, 0
 
-    def _deliver(self, body: bytes, deadline: float) -> Tuple[int, str]:
+    def _deliver(self, body: bytes, deadline: float) -> Tuple[int, str, Optional[str]]:
         if not self._gzip:
             return self._post(body, compressed=False, deadline=deadline)
-        status, text = self._post(gzip.compress(body, _GZIP_LEVEL), compressed=True, deadline=deadline)
+        status, text, error = self._post(gzip.compress(body, _GZIP_LEVEL), compressed=True, deadline=deadline)
         if status not in (400, 415):
-            return status, text
+            return status, text, error
         # A receiver that predates compressed ingest answers 415, or 400 when it parses the gzip bytes
         # as JSON. The same body sent uncompressed tells that 400 from one about the spans themselves,
         # which the receiver refuses again.
-        plain_status, plain_text = self._post(body, compressed=False, deadline=deadline)
+        plain_status, plain_text, plain_error = self._post(body, compressed=False, deadline=deadline)
         if status == 415 or plain_status != 400:
             self._stop_compressing(status)
-        return plain_status, plain_text
+        return plain_status, plain_text, plain_error
 
     def _stop_compressing(self, status: int) -> None:
         with self._gzip_lock:
@@ -307,21 +335,36 @@ class _Exporter:
 
     def _on_auth_failure(self, code: int, detail: str) -> None:
         self._auth_failures += 1
+        try:
+            self.health.export_failures += 1
+            self.health.last_error = f"HTTP {code}: the receiver refused the subscription key"
+        except Exception:
+            pass
+        reason = clip(detail) or "no detail"
         if self._auth_failures >= _AUTH_FAIL_LIMIT:
             self._disabled = True
             _log.warning(
-                "export rejected %d (%s) — disabling tracing after %d consecutive "
-                "auth failures; check your EvalKit subscription key.",
-                code, detail.strip()[:200], self._auth_failures,
+                "the receiver at %s refused the subscription key %d times in a row (HTTP %d: %s). EvalKit has "
+                "stopped exporting spans for the rest of this process; check the subscription_key passed to "
+                "evalkit.init().",
+                self._url, self._auth_failures, code, reason,
+            )
+        elif self._auth_failures == 1:
+            _log.warning(
+                "the receiver at %s refused the subscription key (HTTP %d: %s). EvalKit stops exporting "
+                "after %d refusals in a row; check the subscription_key passed to evalkit.init().",
+                self._url, code, reason, _AUTH_FAIL_LIMIT,
             )
         elif self._debug:
             _log.debug("export rejected %d (auth failure %d/%d)", code, self._auth_failures, _AUTH_FAIL_LIMIT)
 
-    def _post(self, payload: bytes, *, compressed: bool, deadline: float, max_retries: int = 3) -> Tuple[int, str]:
+    def _post(
+        self, payload: bytes, *, compressed: bool, deadline: float, max_retries: int = 3,
+    ) -> Tuple[int, str, Optional[str]]:
         """POST one body, retrying no answer, 429 and 5xx while the export's budget lasts.
 
-        A Retry-After on 429 or 503 sets the wait. Returns the status and the response text; the status is 0
-        when no response arrived.
+        A Retry-After on 429 or 503 sets the wait. Returns the status, the response text, and what went
+        wrong when no response arrived; the status is 0 then. Never raises.
         """
         headers = {
             "Content-Type": "application/json",
@@ -329,10 +372,13 @@ class _Exporter:
         }
         if compressed:
             headers["Content-Encoding"] = "gzip"
-        req = urllib.request.Request(self._url, data=payload, headers=headers, method="POST")
-        last_err: Optional[Exception] = None
+        try:
+            req = urllib.request.Request(self._url, data=payload, headers=headers, method="POST")
+        except Exception as e:
+            # A base_url that is not a URL: nothing can be sent, and saying so is all there is to do.
+            return 0, "", f"{type(e).__name__}: {e}"
+        last_err: Optional[BaseException] = None
         status = 0
-        retries = 0
         for attempt in range(max_retries + 1):
             retry_after: Optional[str] = None
             # No single attempt outlives the export's deadline, so a receiver that never answers
@@ -340,10 +386,10 @@ class _Exporter:
             timeout = min(10.0, max(0.05, deadline - _clock()))
             try:
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    return resp.status, _text(resp) if self._debug else ""
+                    return resp.status, _text(resp) if self._debug else "", None
             except urllib.error.HTTPError as e:
                 if not _retryable(e.code):
-                    return e.code, _text(e)
+                    return e.code, _text(e), None
                 last_err = e
                 status = e.code
                 if e.code in (429, 503) and e.headers is not None:
@@ -365,6 +411,8 @@ class _Exporter:
                 _log.debug("%s, retry %d/%d in %.1fs", f"HTTP {status}" if status else "network error",
                            attempt + 1, max_retries, wait)
             time.sleep(wait)
-            retries += 1
-        _log.warning("export failed after %d retries: %s", retries, last_err)
-        return status, ""
+        error = None
+        if last_err is not None:
+            reason = getattr(last_err, "reason", None)
+            error = clip(f"{type(last_err).__name__}: {reason if reason is not None else last_err}")
+        return status, "", error

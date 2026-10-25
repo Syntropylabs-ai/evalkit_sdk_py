@@ -151,7 +151,7 @@ def start_db(
             client.enqueue(TraceEnvelope(
                 trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                 span_type="db_query", status=status,
-                status_message=str(error) if error is not None else None,
+                status_message=str(error) if error is not None else None, exception=error,
                 operation=name, service_name=client._opts.service_name,
                 attributes=attrs, latency_ms=int(time.time() * 1000 - start_ms),
                 start_time=ts, end_time=_now_iso(), created_at=ts,

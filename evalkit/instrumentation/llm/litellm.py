@@ -4,7 +4,7 @@ import time
 from typing import TYPE_CHECKING, Any, Optional
 
 from ..._version import SDK_VERSION
-from ...core.client import _exc_attrs, _new_span_id, _now_iso
+from ...core.client import _new_span_id, _now_iso
 from ...core.content import message_content_text
 from ...core.context import (
     _ambient_trace_id,
@@ -139,7 +139,7 @@ def _patch_sync(ek: "EvalKitClient", litellm: Any) -> None:
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                     span_type="llm_call", operation="litellm.completion",
                     status="ERROR" if error is not None else "OK",
-                    status_message=str(error) if error is not None else None,
+                    status_message=str(error) if error is not None else None, exception=error,
                     service_name=ek._opts.service_name, provider="litellm", model=model,
                     prompt=prompt, completion=completion, tokens_in=tin, tokens_out=tout,
                     cache_read_tokens=cache_read_tokens or None, cache_creation_tokens=cache_creation_tokens or None,
@@ -163,10 +163,10 @@ def _patch_sync(ek: "EvalKitClient", litellm: Any) -> None:
             try:
                 ek.enqueue(TraceEnvelope(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                    span_type="llm_call", status="ERROR", status_message=str(exc), operation="litellm.completion",
+                    span_type="llm_call", status="ERROR", status_message=str(exc), exception=exc, operation="litellm.completion",
                     service_name=ek._opts.service_name, provider="litellm", model=model, prompt=prompt,
                     latency_ms=int(time.time() * 1000 - start_ms), start_time=ts, end_time=_now_iso(), created_at=ts,
-                    attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_exc_attrs(exc),
+                    attributes={**ek._meta_attrs(), "gen_ai.request.model": model,
                                 **({"gen_ai.request.body": request_body} if request_body else {})},
                     environment=ek._opts.environment, app_version=ek._opts.app_version, sdk_version=SDK_VERSION,
                 ))
@@ -259,7 +259,7 @@ def _patch_async(ek: "EvalKitClient", litellm: Any) -> None:
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                     span_type="llm_call", operation="litellm.acompletion",
                     status="ERROR" if error is not None else "OK",
-                    status_message=str(error) if error is not None else None,
+                    status_message=str(error) if error is not None else None, exception=error,
                     service_name=ek._opts.service_name, provider="litellm", model=model,
                     prompt=prompt, completion=completion, tokens_in=tin, tokens_out=tout,
                     cache_read_tokens=cache_read_tokens or None, cache_creation_tokens=cache_creation_tokens or None,
@@ -283,10 +283,10 @@ def _patch_async(ek: "EvalKitClient", litellm: Any) -> None:
             try:
                 ek.enqueue(TraceEnvelope(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                    span_type="llm_call", status="ERROR", status_message=str(exc), operation="litellm.acompletion",
+                    span_type="llm_call", status="ERROR", status_message=str(exc), exception=exc, operation="litellm.acompletion",
                     service_name=ek._opts.service_name, provider="litellm", model=model, prompt=prompt,
                     latency_ms=int(time.time() * 1000 - start_ms), start_time=ts, end_time=_now_iso(), created_at=ts,
-                    attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_exc_attrs(exc),
+                    attributes={**ek._meta_attrs(), "gen_ai.request.model": model,
                                 **({"gen_ai.request.body": request_body} if request_body else {})},
                     environment=ek._opts.environment, app_version=ek._opts.app_version, sdk_version=SDK_VERSION,
                 ))

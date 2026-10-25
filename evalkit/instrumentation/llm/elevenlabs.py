@@ -12,8 +12,6 @@ from ._bodies import _safe_body
 if TYPE_CHECKING:
     from ...core.client import EvalKitClient
 
-_TEXT_MAX = 8192
-
 
 def patch_elevenlabs(client: "EvalKitClient") -> None:
     try:
@@ -52,10 +50,10 @@ def _patch_convert(ek: "EvalKitClient", Cls: Any, is_async: bool) -> None:
                     attrs["error.message"] = str(error)
                 ek.enqueue(TraceEnvelope(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                    span_type="llm_call", status=status, status_message=str(error) if error is not None else None,
+                    span_type="llm_call", status=status, status_message=str(error) if error is not None else None, exception=error,
                     operation="audio.speech", service_name=ek._opts.service_name,
                     provider="elevenlabs", model=model,
-                    prompt=text[:_TEXT_MAX] if text else None,
+                    prompt=text if text else None,
                     completion="[audio generated]" if status == "OK" else None,
                     attributes=attrs, latency_ms=int(time.time() * 1000 - start_ms),
                     start_time=ts, end_time=_now_iso(), created_at=ts,

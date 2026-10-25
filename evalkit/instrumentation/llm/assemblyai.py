@@ -12,8 +12,6 @@ from ._bodies import _safe_body
 if TYPE_CHECKING:
     from ...core.client import EvalKitClient
 
-_TEXT_MAX = 8192
-
 
 def patch_assemblyai(client: "EvalKitClient") -> None:
     try:
@@ -59,11 +57,11 @@ def _patch_transcribe(ek: "EvalKitClient", Transcriber: Any) -> None:
                     attrs["error.message"] = str(error)
                 ek.enqueue(TraceEnvelope(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                    span_type="llm_call", status=status, status_message=str(error) if error is not None else None,
+                    span_type="llm_call", status=status, status_message=str(error) if error is not None else None, exception=error,
                     operation="audio.transcription", service_name=ek._opts.service_name,
                     provider="assemblyai", model=model,
                     prompt=f"[{source}]",
-                    completion=completion[:_TEXT_MAX] if completion else None,
+                    completion=completion if completion else None,
                     attributes=attrs, latency_ms=int(time.time() * 1000 - start_ms),
                     start_time=ts, end_time=_now_iso(), created_at=ts,
                     environment=ek._opts.environment, app_version=ek._opts.app_version,

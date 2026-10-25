@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import sys
 from typing import TYPE_CHECKING
 
@@ -15,11 +16,12 @@ from ._streaming import (
 from ._safe import field, hook_failed
 from ._toolcalls import from_anthropic_blocks, from_openai_chat, from_openai_responses
 from .llm.anthropic import _extract_thinking
-from ..core.client import _exc_attrs
 from ..core.content import message_content_text
 
 if TYPE_CHECKING:
     from ..core.client import EvalKitClient
+
+_log = logging.getLogger("evalkit")
 
 
 # The request settings, besides the model and the system prompt, that tell one agent
@@ -86,10 +88,10 @@ def _chat_prompt(messages, system=None) -> str:
 def _try_patch_openai(ek: "EvalKitClient") -> None:
     try:
         import openai.resources.chat.completions.completions as _oc
-    except ImportError:
+    except Exception:
         try:
             import openai.resources.chat.completions as _oc
-        except ImportError:
+        except Exception:
             return
     try:
         _patch_openai_class_sync(ek, _oc.Completions)
@@ -150,7 +152,7 @@ def _patch_openai_class_sync(ek: "EvalKitClient", cls, provider: str = "openai")
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                     span_type="llm_call",
                     status="ERROR" if error is not None else "OK",
-                    status_message=str(error) if error is not None else None,
+                    status_message=str(error) if error is not None else None, exception=error,
                     operation="chat.completions.create",
                     service_name=ek._opts.service_name, provider=provider, model=model,
                     prompt=prompt, completion=completion,
@@ -178,12 +180,12 @@ def _patch_openai_class_sync(ek: "EvalKitClient", cls, provider: str = "openai")
                 end_ts = _now_iso()
                 ek.enqueue(TraceEnvelope(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                    span_type="llm_call", status="ERROR", status_message=str(exc),
+                    span_type="llm_call", status="ERROR", status_message=str(exc), exception=exc,
                     operation="chat.completions.create",
                     service_name=ek._opts.service_name, provider=provider, model=model,
                     prompt=prompt, latency_ms=int(time.time() * 1000 - start_ms),
                     start_time=ts, end_time=_now_iso(), created_at=ts,
-                    attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs), **_exc_attrs(exc)},
+                    attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs)},
                     environment=ek._opts.environment, app_version=ek._opts.app_version,
                     sdk_version=SDK_VERSION,
                 ))
@@ -283,7 +285,7 @@ def _patch_openai_class_async(ek: "EvalKitClient", cls, provider: str = "openai"
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                     span_type="llm_call",
                     status="ERROR" if error is not None else "OK",
-                    status_message=str(error) if error is not None else None,
+                    status_message=str(error) if error is not None else None, exception=error,
                     operation="chat.completions.create",
                     service_name=ek._opts.service_name, provider=provider, model=model,
                     prompt=prompt, completion=completion,
@@ -311,12 +313,12 @@ def _patch_openai_class_async(ek: "EvalKitClient", cls, provider: str = "openai"
                 end_ts = _now_iso()
                 ek.enqueue(TraceEnvelope(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                    span_type="llm_call", status="ERROR", status_message=str(exc),
+                    span_type="llm_call", status="ERROR", status_message=str(exc), exception=exc,
                     operation="chat.completions.create",
                     service_name=ek._opts.service_name, provider=provider, model=model,
                     prompt=prompt, latency_ms=int(time.time() * 1000 - start_ms),
                     start_time=ts, end_time=end_ts, created_at=ts,
-                    attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs), **_exc_attrs(exc)},
+                    attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs)},
                     environment=ek._opts.environment, app_version=ek._opts.app_version,
                     sdk_version=SDK_VERSION,
                 ))
@@ -370,7 +372,7 @@ def _patch_openai_class_async(ek: "EvalKitClient", cls, provider: str = "openai"
 def _try_patch_anthropic(ek: "EvalKitClient") -> None:
     try:
         import anthropic.resources.messages as _am
-    except ImportError:
+    except Exception:
         return
     try:
         _patch_anthropic_class_sync(ek, _am.Messages)
@@ -441,7 +443,7 @@ def _patch_anthropic_class_sync(ek: "EvalKitClient", cls) -> None:
                 latency = int(time.time() * 1000 - start_ms)
                 stream_attrs = {**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs), "gen_ai.streaming": True}
                 if thinking:
-                    stream_attrs["gen_ai.response.thinking"] = thinking[:32768]
+                    stream_attrs["gen_ai.response.thinking"] = thinking
                 if has_redacted_thinking:
                     stream_attrs["gen_ai.response.has_redacted_thinking"] = True
                 if ttft_ms is not None:
@@ -451,7 +453,7 @@ def _patch_anthropic_class_sync(ek: "EvalKitClient", cls) -> None:
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                     span_type="llm_call",
                     status="ERROR" if error is not None else "OK",
-                    status_message=str(error) if error is not None else None,
+                    status_message=str(error) if error is not None else None, exception=error,
                     operation="messages.create",
                     service_name=ek._opts.service_name, provider="anthropic", model=model,
                     prompt=prompt, completion=completion,
@@ -480,12 +482,12 @@ def _patch_anthropic_class_sync(ek: "EvalKitClient", cls) -> None:
                 end_ts = _now_iso()
                 ek.enqueue(TraceEnvelope(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                    span_type="llm_call", status="ERROR", status_message=str(exc),
+                    span_type="llm_call", status="ERROR", status_message=str(exc), exception=exc,
                     operation="messages.create",
                     service_name=ek._opts.service_name, provider="anthropic", model=model,
                     prompt=prompt, latency_ms=int(time.time() * 1000 - start_ms),
                     start_time=ts, end_time=end_ts, created_at=ts,
-                    attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs), **_exc_attrs(exc)},
+                    attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs)},
                     environment=ek._opts.environment, app_version=ek._opts.app_version,
                     sdk_version=SDK_VERSION,
                 ))
@@ -518,7 +520,7 @@ def _patch_anthropic_class_sync(ek: "EvalKitClient", cls) -> None:
             if stop_reason:
                 attrs["gen_ai.response.finish_reasons"] = [stop_reason]
             if thinking_text:
-                attrs["gen_ai.response.thinking"] = thinking_text[:32768]
+                attrs["gen_ai.response.thinking"] = thinking_text
             if has_redacted_thinking:
                 attrs["gen_ai.response.has_redacted_thinking"] = True
             ek.enqueue(TraceEnvelope(
@@ -582,7 +584,7 @@ def _patch_anthropic_class_async(ek: "EvalKitClient", cls) -> None:
                 latency = int(time.time() * 1000 - start_ms)
                 stream_attrs = {**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs), "gen_ai.streaming": True}
                 if thinking:
-                    stream_attrs["gen_ai.response.thinking"] = thinking[:32768]
+                    stream_attrs["gen_ai.response.thinking"] = thinking
                 if has_redacted_thinking:
                     stream_attrs["gen_ai.response.has_redacted_thinking"] = True
                 if ttft_ms is not None:
@@ -592,7 +594,7 @@ def _patch_anthropic_class_async(ek: "EvalKitClient", cls) -> None:
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                     span_type="llm_call",
                     status="ERROR" if error is not None else "OK",
-                    status_message=str(error) if error is not None else None,
+                    status_message=str(error) if error is not None else None, exception=error,
                     operation="messages.create",
                     service_name=ek._opts.service_name, provider="anthropic", model=model,
                     prompt=prompt, completion=completion,
@@ -621,12 +623,12 @@ def _patch_anthropic_class_async(ek: "EvalKitClient", cls) -> None:
                 end_ts = _now_iso()
                 ek.enqueue(TraceEnvelope(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                    span_type="llm_call", status="ERROR", status_message=str(exc),
+                    span_type="llm_call", status="ERROR", status_message=str(exc), exception=exc,
                     operation="messages.create",
                     service_name=ek._opts.service_name, provider="anthropic", model=model,
                     prompt=prompt, latency_ms=int(time.time() * 1000 - start_ms),
                     start_time=ts, end_time=end_ts, created_at=ts,
-                    attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs), **_exc_attrs(exc)},
+                    attributes={**ek._meta_attrs(), "gen_ai.request.model": model, **_request_attrs(kwargs)},
                     environment=ek._opts.environment, app_version=ek._opts.app_version,
                     sdk_version=SDK_VERSION,
                 ))
@@ -659,7 +661,7 @@ def _patch_anthropic_class_async(ek: "EvalKitClient", cls) -> None:
             if stop_reason:
                 attrs["gen_ai.response.finish_reasons"] = [stop_reason]
             if thinking_text:
-                attrs["gen_ai.response.thinking"] = thinking_text[:32768]
+                attrs["gen_ai.response.thinking"] = thinking_text
             if has_redacted_thinking:
                 attrs["gen_ai.response.has_redacted_thinking"] = True
             ek.enqueue(TraceEnvelope(
@@ -687,7 +689,7 @@ def _patch_anthropic_class_async(ek: "EvalKitClient", cls) -> None:
 def _try_patch_google_genai(ek: "EvalKitClient") -> None:
     try:
         from google.genai import models as _gm
-    except ImportError:
+    except Exception:
         return
     try:
         from .llm.google_genai import patch_google_genai
@@ -699,7 +701,7 @@ def _try_patch_google_genai(ek: "EvalKitClient") -> None:
 def _try_patch_google_adk(ek: "EvalKitClient") -> None:
     try:
         import google.adk
-    except ImportError:
+    except Exception:
         return
     try:
         from .llm.google_adk import patch_google_adk
@@ -766,7 +768,7 @@ def _lazy_instance_patch(cls, names, upgrade) -> None:
 def _try_patch_google_ai(ek: "EvalKitClient") -> None:
     try:
         import google.generativeai as _genai
-    except ImportError:
+    except Exception:
         return
     try:
         _patch_google_genai_legacy_class(ek, _genai.GenerativeModel)
@@ -787,7 +789,7 @@ _COHERE_METHODS = ("chat", "chat_stream")
 def _try_patch_cohere(ek: "EvalKitClient") -> None:
     try:
         import cohere as _co
-    except ImportError:
+    except Exception:
         return
     for attr in _COHERE_CLIENT_ATTRS:
         try:
@@ -811,7 +813,7 @@ def _responses_tool_events(output_items: list, ts: str) -> list:
 def _try_patch_openai_responses(ek: "EvalKitClient") -> None:
     try:
         from openai.resources.responses.responses import Responses, AsyncResponses
-    except ImportError:
+    except Exception:
         return
     try:
         _patch_openai_responses_sync(ek, Responses)
@@ -894,7 +896,7 @@ class _ResponsesCall:
         return {**self.ek._meta_attrs(), "gen_ai.request.model": self.model, **_request_attrs(self.kwargs)}
 
     def _enqueue(self, *, status: str, attributes: dict, end_ts: str, status_message=None, completion=None,
-                 tokens_in=None, tokens_out=None, cache_read_tokens=0, events=None) -> None:
+                 tokens_in=None, tokens_out=None, cache_read_tokens=0, events=None, exception=None) -> None:
         import time
         from ..core.types import TraceEnvelope
         from .._version import SDK_VERSION
@@ -905,12 +907,12 @@ class _ResponsesCall:
             span_type="llm_call", status=status, status_message=status_message,
             operation="responses.create",
             service_name=ek._opts.service_name, provider="openai", model=self.model,
-            prompt=self.prompt[:32768], completion=completion[:32768] if completion is not None else None,
+            prompt=self.prompt, completion=completion,
             tokens_in=tokens_in, tokens_out=tokens_out, cache_read_tokens=cache_read_tokens or None,
             latency_ms=int(time.time() * 1000 - self.start_ms), start_time=self.ts, end_time=end_ts,
             created_at=self.ts, events=events or None, attributes=attributes,
             environment=ek._opts.environment, app_version=ek._opts.app_version,
-            sdk_version=SDK_VERSION,
+            sdk_version=SDK_VERSION, exception=exception,
         ))
 
     def failed(self, exc: BaseException) -> None:
@@ -919,7 +921,7 @@ class _ResponsesCall:
 
         try:
             self._enqueue(status="ERROR", status_message=str(exc), end_ts=_now_iso(),
-                          attributes={**self._attrs(), **_exc_attrs(exc)})
+                          attributes=self._attrs(), exception=exc)
         except Exception as hook_exc:
             hook_failed("model call", hook_exc)
 
@@ -942,7 +944,7 @@ class _ResponsesCall:
             output_items = list(getattr(result, "output", []) or [])
             thinking = _responses_reasoning(output_items)
             if thinking:
-                attrs["gen_ai.response.thinking"] = thinking[:32768]
+                attrs["gen_ai.response.thinking"] = thinking
             self._enqueue(
                 status="OK", completion=result.output_text or "", tokens_in=tokens_in, tokens_out=tokens_out,
                 cache_read_tokens=cached, end_ts=end_ts, attributes=attrs,
@@ -973,7 +975,7 @@ class _ResponsesCall:
                 attrs["gen_ai.usage.total_tokens"] = tokens_in + tokens_out
             thinking = thinking or _responses_reasoning(state.output_items)
             if thinking:
-                attrs["gen_ai.response.thinking"] = thinking[:32768]
+                attrs["gen_ai.response.thinking"] = thinking
             attrs.update(stream_response_attrs(state))
             failure = str(error) if error is not None else state.failure
             # The final response lists every call, built-in tools and citations included, as the
@@ -984,6 +986,7 @@ class _ResponsesCall:
                 status="ERROR" if failure is not None else "OK", status_message=failure,
                 completion=completion, tokens_in=tokens_in, tokens_out=tokens_out,
                 cache_read_tokens=cache_read_tokens, end_ts=end_ts, attributes=attrs, events=events,
+                exception=error if isinstance(error, BaseException) else None,
             )
 
         return state, on_stream_done
@@ -1070,7 +1073,7 @@ def _patch_openai_responses_async(ek: "EvalKitClient", cls) -> None:
 def _try_patch_groq(ek: "EvalKitClient") -> None:
     try:
         import groq.resources.chat.completions as _gc
-    except ImportError:
+    except Exception:
         return
     try:
         _patch_openai_class_sync(ek, _gc.Completions, provider="groq")
@@ -1085,7 +1088,7 @@ def _try_patch_groq(ek: "EvalKitClient") -> None:
 def _try_patch_litellm(ek: "EvalKitClient") -> None:
     try:
         import litellm
-    except ImportError:
+    except Exception:
         return
     try:
         from .llm.litellm import patch_litellm
@@ -1097,7 +1100,7 @@ def _try_patch_litellm(ek: "EvalKitClient") -> None:
 def _try_patch_ollama(ek: "EvalKitClient") -> None:
     try:
         import ollama
-    except ImportError:
+    except Exception:
         return
     try:
         from .llm.ollama import patch_ollama
@@ -1109,7 +1112,7 @@ def _try_patch_ollama(ek: "EvalKitClient") -> None:
 def _try_patch_pinecone(ek: "EvalKitClient") -> None:
     try:
         import pinecone
-    except ImportError:
+    except Exception:
         return
     try:
         from .vectordb.pinecone import patch_pinecone
@@ -1121,7 +1124,7 @@ def _try_patch_pinecone(ek: "EvalKitClient") -> None:
 def _try_patch_qdrant(ek: "EvalKitClient") -> None:
     try:
         import qdrant_client
-    except ImportError:
+    except Exception:
         return
     try:
         from .vectordb.qdrant import patch_qdrant
@@ -1133,7 +1136,7 @@ def _try_patch_qdrant(ek: "EvalKitClient") -> None:
 def _try_patch_chroma(ek: "EvalKitClient") -> None:
     try:
         import chromadb
-    except ImportError:
+    except Exception:
         return
     try:
         from .vectordb.chroma import patch_chroma
@@ -1145,7 +1148,7 @@ def _try_patch_chroma(ek: "EvalKitClient") -> None:
 def _try_patch_weaviate(ek: "EvalKitClient") -> None:
     try:
         import weaviate
-    except ImportError:
+    except Exception:
         return
     try:
         from .vectordb.weaviate import patch_weaviate
@@ -1157,7 +1160,7 @@ def _try_patch_weaviate(ek: "EvalKitClient") -> None:
 def _try_patch_llamaindex(ek: "EvalKitClient") -> None:
     try:
         import llama_index.core
-    except ImportError:
+    except Exception:
         return
     try:
         from .llm.llamaindex import patch_llamaindex
@@ -1169,7 +1172,7 @@ def _try_patch_llamaindex(ek: "EvalKitClient") -> None:
 def _try_patch_openai_audio(ek: "EvalKitClient") -> None:
     try:
         import openai
-    except ImportError:
+    except Exception:
         return
     try:
         from .llm.openai_audio import patch_openai_audio
@@ -1181,7 +1184,7 @@ def _try_patch_openai_audio(ek: "EvalKitClient") -> None:
 def _try_patch_elevenlabs(ek: "EvalKitClient") -> None:
     try:
         import elevenlabs
-    except ImportError:
+    except Exception:
         return
     try:
         from .llm.elevenlabs import patch_elevenlabs
@@ -1193,7 +1196,7 @@ def _try_patch_elevenlabs(ek: "EvalKitClient") -> None:
 def _try_patch_assemblyai(ek: "EvalKitClient") -> None:
     try:
         import assemblyai
-    except ImportError:
+    except Exception:
         return
     try:
         from .llm.assemblyai import patch_assemblyai
@@ -1205,7 +1208,7 @@ def _try_patch_assemblyai(ek: "EvalKitClient") -> None:
 def _try_patch_bedrock(ek: "EvalKitClient") -> None:
     try:
         import botocore.client as _bc
-    except ImportError:
+    except Exception:
         return
     try:
         _patch_bedrock_class(ek, _bc.BaseClient)
@@ -1238,7 +1241,7 @@ def _patch_bedrock_class(ek: "EvalKitClient", cls) -> None:
 def _try_patch_aiobotocore(ek: "EvalKitClient") -> None:
     try:
         import aiobotocore.client as _abc
-    except ImportError:
+    except Exception:
         return
     try:
         _patch_aio_bedrock_class(ek, _abc.AioBaseClient)
@@ -1280,7 +1283,7 @@ def _resolve_mistral_chat_cls(mistral_cls):
         if entry:
             try:
                 cls = getattr(importlib.import_module(entry[0]), entry[1], None)
-            except ImportError:
+            except Exception:
                 cls = None
             if cls is not None:
                 return cls
@@ -1292,7 +1295,7 @@ def _resolve_mistral_chat_cls(mistral_cls):
     for path in _MISTRAL_CHAT_MODULES:
         try:
             module = importlib.import_module(path)
-        except ImportError:
+        except Exception:
             continue
         cls = getattr(module, "Chat", None)
         if cls is not None:
@@ -1303,7 +1306,7 @@ def _resolve_mistral_chat_cls(mistral_cls):
 def _try_patch_mistral(ek: "EvalKitClient") -> None:
     try:
         from mistralai import Mistral as _Mistral
-    except ImportError:
+    except Exception:
         return
     try:
         chat_cls = _resolve_mistral_chat_cls(_Mistral)
@@ -1364,7 +1367,7 @@ def _try_patch_databases(ek: "EvalKitClient") -> None:
 def _try_patch_langchain(ek: "EvalKitClient") -> None:
     try:
         import langchain_core
-    except ImportError:
+    except Exception:
         return
     try:
         from .llm.langchain import patch_langchain
@@ -1414,35 +1417,47 @@ def setup_auto_instrumentation(
         except Exception:
             pass
 
-    _try_patch_openai(client)
-    _try_patch_openai_responses(client)
-    _try_patch_anthropic(client)
-    _try_patch_google_genai(client)
-    _try_patch_google_ai(client)
-    _try_patch_google_adk(client)
-    _try_patch_cohere(client)
-    _try_patch_bedrock(client)
-    _try_patch_aiobotocore(client)
-    _try_patch_mistral(client)
-    _try_patch_groq(client)
-    _try_patch_litellm(client)
-    _try_patch_ollama(client)
-    _try_patch_pinecone(client)
-    _try_patch_qdrant(client)
-    _try_patch_chroma(client)
-    _try_patch_weaviate(client)
-    _try_patch_llamaindex(client)
-    _try_patch_openai_audio(client)
-    _try_patch_elevenlabs(client)
-    _try_patch_assemblyai(client)
-    _try_patch_langchain(client)
-    _try_patch_databases(client)
-    _try_patch_claude_agent_sdk(client)
-    _try_patch_google_live(client)
-    _try_patch_openai_realtime(client)
+    # Each integration on its own: one that fails, whatever it raises, leaves the others and init()
+    # unaffected, and the library it instruments works as it would untraced.
+    for patcher in (
+        _try_patch_openai,
+        _try_patch_openai_responses,
+        _try_patch_anthropic,
+        _try_patch_google_genai,
+        _try_patch_google_ai,
+        _try_patch_google_adk,
+        _try_patch_cohere,
+        _try_patch_bedrock,
+        _try_patch_aiobotocore,
+        _try_patch_mistral,
+        _try_patch_groq,
+        _try_patch_litellm,
+        _try_patch_ollama,
+        _try_patch_pinecone,
+        _try_patch_qdrant,
+        _try_patch_chroma,
+        _try_patch_weaviate,
+        _try_patch_llamaindex,
+        _try_patch_openai_audio,
+        _try_patch_elevenlabs,
+        _try_patch_assemblyai,
+        _try_patch_langchain,
+        _try_patch_databases,
+        _try_patch_claude_agent_sdk,
+        _try_patch_google_live,
+        _try_patch_openai_realtime,
+        _try_patch_mcp,
+    ):
+        try:
+            patcher(client)
+        except Exception as exc:
+            _log.debug("instrumenting with %s failed: %s", getattr(patcher, "__name__", patcher), exc)
+
+
+def _try_patch_mcp(ek: "EvalKitClient") -> None:
     try:
         from .mcp import patch_mcp
-        patch_mcp(client)
+        patch_mcp(ek)
     except Exception:
         pass
 
@@ -1458,7 +1473,7 @@ def _try_patch_claude_agent_sdk(ek: "EvalKitClient") -> None:
 def _try_patch_google_live(ek: "EvalKitClient") -> None:
     try:
         from google.genai import live as _live
-    except ImportError:
+    except Exception:
         return
     try:
         from .llm.google_live import patch_google_genai_live
@@ -1470,7 +1485,7 @@ def _try_patch_google_live(ek: "EvalKitClient") -> None:
 def _try_patch_openai_realtime(ek: "EvalKitClient") -> None:
     try:
         import openai
-    except ImportError:
+    except Exception:
         return
     try:
         from .llm.openai_realtime import patch_openai_realtime

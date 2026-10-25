@@ -94,7 +94,7 @@ def patch_anthropic_vertex(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
                     span_type="llm_call",
                     status="ERROR" if error is not None else "OK",
-                    status_message=str(error) if error is not None else None,
+                    status_message=str(error) if error is not None else None, exception=error,
                     operation="messages.create",
                     service_name=client._opts.service_name, provider="anthropic-vertex", model=model,
                     prompt=prompt_text, completion=completion,
@@ -126,7 +126,7 @@ def patch_anthropic_vertex(
                 latency = int(time.time() * 1000 - start_ms)
                 client.enqueue(TraceEnvelope(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                    span_type="llm_call", status="ERROR", status_message=str(exc),
+                    span_type="llm_call", status="ERROR", status_message=str(exc), exception=exc,
                     operation="messages.create",
                     service_name=client._opts.service_name, provider="anthropic-vertex", model=model,
                     prompt=prompt_text, latency_ms=latency, start_time=ts, end_time=end_ts,
@@ -237,7 +237,7 @@ def patch_vertex_generative_model(
                     end_ts = _now_iso()
                     client.enqueue(TraceEnvelope(
                         trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                        span_type="llm_call", status="ERROR", status_message=str(exc),
+                        span_type="llm_call", status="ERROR", status_message=str(exc), exception=exc,
                         operation="generate_content",
                         service_name=client._opts.service_name, provider="vertex-ai", model=model_name,
                         prompt=prompt_text, latency_ms=int(time.time() * 1000 - start_ms),
@@ -339,7 +339,7 @@ def patch_vertex_generative_model(
                 latency = int(time.time() * 1000 - start_ms)
                 client.enqueue(TraceEnvelope(
                     trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id,
-                    span_type="llm_call", status="ERROR", status_message=str(exc),
+                    span_type="llm_call", status="ERROR", status_message=str(exc), exception=exc,
                     operation="generate_content",
                     service_name=client._opts.service_name, provider="vertex-ai", model=model_name,
                     prompt=prompt_text, latency_ms=latency, start_time=ts, end_time=end_ts,

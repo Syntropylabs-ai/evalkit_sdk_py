@@ -14,8 +14,6 @@ from .google_genai import _extract_prompt
 if TYPE_CHECKING:
     from ...core.client import EvalKitClient
 
-_MAX_TEXT = 8192
-
 
 def _base_attrs(model: str) -> dict:
     return {
@@ -55,9 +53,9 @@ def _emit_tool_calls(client: "EvalKitClient", msg: Any, base: dict, parent_ctx: 
                 continue
             try:
                 args = getattr(fc, "args", None) or {}
-                args_str = json.dumps(dict(args))[:_MAX_TEXT]
+                args_str = json.dumps(dict(args))
             except Exception:
-                args_str = str(getattr(fc, "args", ""))[:_MAX_TEXT]
+                args_str = str(getattr(fc, "args", ""))
             events.append(SpanEvent(
                 name="gen_ai.tool.call",
                 timestamp=_now_iso(),
@@ -226,7 +224,7 @@ class _ObservedSession:
             if resp_body:
                 attrs["gen_ai.response.body"] = resp_body
             if thinking:
-                attrs["gen_ai.response.thinking"] = thinking[:_MAX_TEXT]
+                attrs["gen_ai.response.thinking"] = thinking
 
             counts = extract_google_usage(usage)
             tokens_in = counts.tokens_in
@@ -253,8 +251,8 @@ class _ObservedSession:
                 service_name=self._ek._opts.service_name,
                 model=self._base.get("gen_ai.request.model"),
                 provider="google-live",
-                prompt=prompt[:_MAX_TEXT] or None,
-                completion=completion[:_MAX_TEXT] or None,
+                prompt=prompt or None,
+                completion=completion or None,
                 tokens_in=tokens_in,
                 tokens_out=tokens_out,
                 cache_read_tokens=cached_tokens or None,
@@ -335,7 +333,8 @@ class _TracedConnect:
             if self._observed is not None:
                 self._observed._finish()
             elif self._end_session is not None:
-                self._end_session("ERROR" if exc_type else "OK")
+                self._end_session("ERROR" if exc_type else "OK",
+                                  exception=exc if isinstance(exc, BaseException) else None)
         except Exception:
             pass
         return await self._cm.__aexit__(exc_type, exc, tb)

@@ -640,7 +640,7 @@ class BedrockOpsTest(unittest.TestCase):
             })
         span = self._spans()[0]
         self.assertEqual(span.status, "ERROR")
-        self.assertEqual(span.status_message, "throttled")
+        self.assertEqual(span.status_message, "RuntimeError: throttled")
         self.assertEqual(span.prompt, "boom")
 
     def test_explicit_patch_bedrock_uses_shared_path(self):
