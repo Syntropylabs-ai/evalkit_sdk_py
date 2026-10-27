@@ -4,6 +4,7 @@ from typing import Any, Callable
 
 from ..core.client import EvalKitClient, release_ambient_trace
 from ..core.context import SpanContext, _current_span, reset_identity, set_identity
+from ..core.http_status import raised_request_failed, server_span_status
 from ..core.otel_provider import claim_framework_server_span, release_framework_server_span
 from ..utils.headers import parse_traceparent, sanitize_headers
 from ._bodies import RequestBodyTap, ResponseBodyTap
@@ -261,7 +262,7 @@ class EvalKitMiddleware:
             sc = status_code_holder[0]
             try:
                 end(
-                    "ERROR" if sc >= 400 else "OK",
+                    server_span_status(sc),
                     status_code=sc,
                     response_body=response_tap.value(),
                     response_headers=response_headers_holder[0] or None,
@@ -273,13 +274,15 @@ class EvalKitMiddleware:
                 pass
         except BaseException as exc:
             try:
+                answered = _failed_status(exc, status_code_holder[0] if started[0] else None)
+                failed = raised_request_failed(answered)
                 end(
-                    "ERROR",
-                    status_code=_failed_status(exc, status_code_holder[0] if started[0] else None),
+                    "ERROR" if failed else "OK",
+                    status_code=answered,
                     route=route_template(scope, entry_root_path, framework_span, path),
                     request_body=request_tap.value(),
                     attributes=body_attributes() or None,
-                    exception=exc,
+                    exception=exc if failed else None,
                 )
             except Exception:
                 pass

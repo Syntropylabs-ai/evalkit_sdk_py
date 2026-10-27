@@ -35,6 +35,7 @@ from .bounded import RateLimiter
 from .errors import FINGERPRINT_ATTR, apply_exception, exc_attributes
 from .exporter import _MAX_SPAN_BYTES, _Exporter
 from .health import DISABLED, PROBE_SPANS, ExportHealth
+from .http_status import http_answer_status, is_server_error_status
 from .ignore import ignored_callable
 from .limits import cap_envelope_values, estimate_envelope_bytes, fit_envelope
 from .otel_provider import note_sdk_model_call
@@ -1087,7 +1088,8 @@ class EvalKitClient:
         Every way out ends the span exactly once and is passed on as it was: a return, an exception, and
         also what is not an ``Exception`` (a cancelled task, Ctrl-C, ``sys.exit``), which would otherwise
         leave the span open for good. A cancelled task is recorded as an error with ``evalkit.cancelled``.
-        Recording never changes what the call returns or raises.
+        A web framework's HTTP answer with a client error status (``HTTPException(404)``) ends it OK, with
+        ``http.response.status_code``. Recording never changes what the call returns or raises.
         """
         client = self
         limiter = RateLimiter(rate_limit) if rate_limit else None
@@ -1122,6 +1124,14 @@ class EvalKitClient:
             try:
                 end, _ctx, attrs = opened
                 if isinstance(exc, GeneratorExit) or (isinstance(exc, SystemExit) and exc.code in (0, None)):
+                    end("OK")
+                    return
+                answer = http_answer_status(exc)
+                if answer is not None and not is_server_error_status(answer):
+                    # A web framework's own HTTP answer (FastAPI's HTTPException(401) from a dependency,
+                    # Django's Http404): the request is answered with a client error, which is the
+                    # caller's, not this function's failure.
+                    attrs["http.response.status_code"] = answer
                     end("OK")
                     return
                 if fingerprint:

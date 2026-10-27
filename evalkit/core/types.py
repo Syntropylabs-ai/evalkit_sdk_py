@@ -179,6 +179,8 @@ class EvalKitOptions:
     ignore_functions: Optional[List[Any]] = None
     # Whether health and readiness probes are traced like any request.
     trace_health_checks: bool = False
+    # The status codes an incoming request's span is an error for, as given; core.http_status reads them.
+    server_error_status_codes: Optional[List[Any]] = None
 
     @property
     def capture_sensitive_headers(self) -> bool:

@@ -268,17 +268,20 @@ evalkit.instrument_flask(app)
 "evalkit.EvalKitDjangoMiddleware"
 ```
 
-Each middleware records one `http_call` span per request, named after the method and path, such as `GET /orders`. It continues an incoming `traceparent` header, read by the W3C Trace Context rules: lowercase hex only, an all-zero id is ignored, and a later version with more fields after the flags is still joined. It also adds `X-Trace-Id` and `traceparent` headers to the response. The request's trace id stops being the ambient one when the request ends, so a span recorded later on the same worker thread, outside any request, starts a trace of its own.
+Each middleware records one `http_call` span per request, named after the method and the route template the request matched, such as `GET /orders/{order_id}` (`GET /orders/<int:order_id>` in Flask and Django), with the template in `http.route`. A request that matched no route keeps its path. It continues an incoming `traceparent` header, read by the W3C Trace Context rules: lowercase hex only, an all-zero id is ignored, and a later version with more fields after the flags is still joined. It also adds `X-Trace-Id` and `traceparent` headers to the response. The request's trace id stops being the ambient one when the request ends, so a span recorded later on the same worker thread, outside any request, starts a trace of its own.
 
 The request and response bodies are kept up to `max_body_bytes` (64 KiB by default), and never by reading ahead of your app:
 
 - The FastAPI, Starlette and Litestar middleware copy the request body from the messages your app receives, as it receives them, and the response body from the chunks it sends, as a list with a running length that stops at the limit. A body that was cut has `http.request.body.truncated` (or `http.response.body.truncated`) and `.bytes`, its full size.
 - Flask and Django read the request body only when its `Content-Length` is under the limit. A streamed Flask response is never read to record it.
+- The span of a streamed response ends after its last chunk is sent, so its latency covers the stream.
 - Uploads (`multipart/*`, `application/octet-stream`, images, audio, video, archives and PDFs) are not kept, nor are `text/event-stream` responses and compressed responses.
 
-When the app raises, the span records the exception (see [Errors](#errors)): FastAPI, Starlette and Litestar pass on what propagated, Flask the exception its teardown is handed, Django the one its `process_exception` hook receives.
+When the app raises, the span records the exception (see [Errors](#errors)): FastAPI and Starlette the one that propagated, Flask the exception its teardown is handed, Django the one its `process_exception` hook receives, Litestar the one its `after_exception` hooks are handed.
 
-Health and readiness probes (`/health`, `/healthz`, `/health/live`, `/readyz`, `/livez`, matched by whole path segment, so `/healthcare` is recorded) reach the app untraced through every middleware: no request span, no response headers, and nothing the handler records while it answers, such as a database ping, a traced function or a log line. Work the handler starts that runs on after the response, such as a background task or a thread, is traced as usual. `trace_health_checks=True` traces probes like any request, and `ignore_routes` leaves out more routes the same way. See [Keeping things out of traces](#keeping-things-out-of-traces).
+By default a request's span is an error for every 4xx and 5xx answer, with the exception the server answered with, also when a view raised what the framework answers with a status, such as `HTTPException(401)` or Django's `Http404` and `PermissionDenied`. A response that breaks off after it started is an error too. `server_error_status_codes` changes which answers count. `["500-599"]` follows OpenTelemetry's HTTP conventions, where a 4xx (a scanner probing `/.env`, an expired token, a body that fails validation) is the caller's mistake: the span keeps `http.status_code`, has status `OK` and records no exception, which suits a public API that bots probe; `[429, "500-599"]` also counts the 429s your app answers. Outgoing HTTP calls are not affected: a 4xx they get back is an error.
+
+Health and readiness probes (`/health`, `/healthz`, `/health/live`, `/readyz`, `/livez`, matched by whole path segment, so `/healthcare` is recorded, and never under a record, so `/datasets/<id>/health` is the app's own route and is recorded) reach the app untraced through every middleware: no request span, no response headers, and nothing the handler records while it answers, such as a database ping, a traced function or a log line. Work the handler starts that runs on after the response, such as a background task or a thread, is traced as usual. `trace_health_checks=True` traces probes like any request, and `ignore_routes` leaves out more routes the same way. See [Keeping things out of traces](#keeping-things-out-of-traces).
 
 - `EvalKitStarletteMiddleware` is the same class as `EvalKitMiddleware`, exported under a Starlette name.
 - For Litestar, pass the middleware when you create the app: `Litestar(route_handlers=[...], middleware=[create_litestar_middleware()])`.
@@ -325,6 +328,7 @@ evalkit.trace_package(myapp)        # → every function across the whole packag
 - `trace_function(name=None, attributes=None, capture_io=True, *, error_fingerprint=None)` and `trace_tool(...)` take the same arguments. `trace_tool` records a `tool_call` span, which counts toward the tool metrics. `error_fingerprint` groups this function's errors under a name of your own (see [Errors](#errors)).
 - A generator or async generator function is traced across its iteration: the span starts at the first item, ends when the generator finishes, fails or is closed, and is current only while the generator runs. What you send, throw or close passes through to it.
 - Every way out ends the span and is passed on unchanged, including what is not an `Exception`: a cancelled task (status `ERROR` with `evalkit.cancelled=true`), `KeyboardInterrupt` and `SystemExit` (status `OK` for `sys.exit(0)`).
+- A web framework's HTTP answer with a client error status, such as a FastAPI dependency raising `HTTPException(401)`, ends the span with status `OK`, no exception and `http.response.status_code`. The answers recognised are Starlette's and FastAPI's `HTTPException`, Werkzeug's, Litestar's, and Django's `Http404`, `PermissionDenied`, `SuspiciousOperation` and `BadRequest`. With a server error status (see `server_error_status_codes`) the span is an error.
 - `trace_function` records at most `function_rate_limit` spans a second for each function, 100 by default, so a function called in a hot loop costs little; set it to `0` to record every call. The calls left out are counted in `evalkit.stats()["dropped_rate_limited"]`. Tool calls are never left out.
 - `traced` wraps the methods a class defines itself, but not inherited ones, and skips names that start with `__`. Span names default to `ClassName.method`, and `prefix=` replaces the class name.
 - `trace_module(module)` and `trace_package(package)` return the number of functions they wrapped. They skip names that start with `_` unless you pass `include_private=True`. `trace_package` imports every submodule of the package.
@@ -1247,6 +1251,7 @@ evalkit.init(
     ignore_urls=None,                         # outgoing calls left untraced
     ignore_functions=None,                    # functions function tracing leaves alone
     trace_health_checks=False,                # True traces health probes too
+    server_error_status_codes=None,           # None = ["400-599"]: answers a request span is an error for
 )
 ```
 
@@ -1272,6 +1277,7 @@ evalkit.init(
 | `device_id` | `None` | The device id for spans that have none of their own |
 | `ignore_routes`, `ignore_urls`, `ignore_functions` | `None` | Requests, outgoing calls and functions kept out of traces. See [Keeping things out of traces](#keeping-things-out-of-traces). |
 | `trace_health_checks` | `False` | Trace health and readiness probes like any request |
+| `server_error_status_codes` | `["400-599"]` | The answers an incoming request's span is an error for: codes (`503`) and inclusive ranges (`"500-599"`). With `["500-599"]` a 4xx is the caller's mistake and stays `OK`. Outgoing calls are not affected. A value that is not such a list is skipped with one warning and the default stays. See [Web frameworks](#web-frameworks). |
 
 `service_name` defaults to `unknown`. `environment` is recorded on every span as `evalkit.environment`, and every span also carries `evalkit.sdk_version`. With `debug=True`, the exporter logs each export, retry and auth failure at `DEBUG` level on the `evalkit` logger.
 

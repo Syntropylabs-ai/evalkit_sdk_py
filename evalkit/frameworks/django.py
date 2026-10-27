@@ -6,6 +6,7 @@ from typing import Any, Callable
 
 from ..core.client import EvalKitClient, release_ambient_trace
 from ..core.context import _current_span, reset_identity, set_identity
+from ..core.http_status import is_server_error_status, raised_request_failed, server_span_status
 from ..utils.headers import parse_traceparent
 from ._bodies import is_binary, is_event_stream
 from ._identity import user_id_of
@@ -95,6 +96,34 @@ def _route_before_resolving(request: Any) -> "str | None":
     if not isinstance(route, str) or not route:
         return None
     return route if route.startswith("/") else "/" + route
+
+
+def _end_when_closed(response: Any, finish: Callable[[], None]) -> bool:
+    """Run ``finish`` when the server closes a streamed response, after its last chunk, rather than when
+    the view returned it. The WSGI server and Django's ASGI handler both close a response once it is sent."""
+    if not getattr(response, "streaming", False):
+        return False
+    close = getattr(response, "close", None)
+    if not callable(close):
+        return False
+    ended = [False]
+
+    def close_and_finish() -> None:
+        try:
+            close()
+        finally:
+            if not ended[0]:
+                ended[0] = True
+                try:
+                    finish()
+                except Exception:
+                    pass
+
+    try:
+        response.close = close_and_finish
+    except Exception:
+        return False
+    return True
 
 
 def _flush_on_asgi_shutdown() -> None:
@@ -198,14 +227,21 @@ class EvalKitDjangoMiddleware:
             except Exception:
                 pass
             try:
-                # A view's exception is turned into a 500 response before it reaches here;
-                # process_exception kept it.
+                # A view's exception is turned into a response before it reaches here; process_exception
+                # kept it. It failed the request only when that response is a server error: Http404,
+                # PermissionDenied and SuspiciousOperation are answered with a 4xx.
                 raised = getattr(request, "_evalkit_exception", None)
-                end("ERROR" if sc >= 400 else "OK", status_code=sc,
-                    response_body=resp_body, response_headers=resp_headers,
-                    route=django_route(request),
-                    exception=raised if isinstance(raised, BaseException) else None,
-                    exception_escaped=False)
+                if not isinstance(raised, BaseException) or not is_server_error_status(sc):
+                    raised = None
+                route = django_route(request)
+
+                def finish() -> None:
+                    end(server_span_status(sc), status_code=sc,
+                        response_body=resp_body, response_headers=resp_headers,
+                        route=route, exception=raised, exception_escaped=False)
+
+                if not _end_when_closed(response, finish):
+                    finish()
             except Exception:
                 pass
             try:
@@ -216,7 +252,9 @@ class EvalKitDjangoMiddleware:
             return response
         except BaseException as exc:
             try:
-                end("ERROR", status_code=500, route=django_route(request), exception=exc)
+                failed = raised_request_failed(500)
+                end("ERROR" if failed else "OK", status_code=500, route=django_route(request),
+                    exception=exc if failed else None)
             except Exception:
                 pass
             raise

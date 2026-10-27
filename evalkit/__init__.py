@@ -242,6 +242,7 @@ def init(
     ignore_urls: Optional[List[Any]] = None,
     ignore_functions: Optional[List[Any]] = None,
     trace_health_checks: bool = False,
+    server_error_status_codes: Optional[List[Any]] = None,
 ) -> EvalKitClient:
     """Start recording and exporting spans; returns the client.
 
@@ -254,6 +255,12 @@ def init(
     functions out of traces (merged with ``EVALKIT_IGNORE_ROUTES``, ``EVALKIT_IGNORE_URLS`` and
     ``EVALKIT_IGNORE_FUNCTIONS``); a pattern that cannot be read is skipped with a warning. Health
     probes are left out unless ``trace_health_checks=True``.
+
+    ``server_error_status_codes`` are the answers an incoming request's span is an error for: codes
+    (``503``) and inclusive ranges (``"500-599"``), by default ``["400-599"]``: every 4xx and 5xx answer is
+    an error. ``["500-599"]`` follows OpenTelemetry's HTTP conventions instead, where a request answered
+    with a 4xx is the caller's mistake and stays OK. Outgoing calls are not affected. A value that cannot
+    be read is skipped with a warning and the default stays.
     """
     global _instance, _init_options
     options: Dict[str, Any] = dict(
@@ -268,6 +275,7 @@ def init(
         sample_rate=sample_rate, capture_unhandled=capture_unhandled, in_app_include=in_app_include,
         in_app_exclude=in_app_exclude, ignore_routes=ignore_routes, ignore_urls=ignore_urls,
         ignore_functions=ignore_functions, trace_health_checks=trace_health_checks,
+        server_error_status_codes=server_error_status_codes,
     )
     if _instance is not None:
         try:
@@ -357,6 +365,7 @@ def _start(options: Dict[str, Any]) -> EvalKitClient:
         ignore_urls=options["ignore_urls"],
         ignore_functions=options["ignore_functions"],
         trace_health_checks=bool(options["trace_health_checks"]),
+        server_error_status_codes=options["server_error_status_codes"],
     )
     set_capture_sensitive_headers(opts.capture_secrets)
     try:
@@ -368,6 +377,12 @@ def _start(options: Dict[str, Any]) -> EvalKitClient:
     except Exception as exc:
         _log.warning("evalkit.init(): the ignore options could not be read (%s); nothing is ignored by them.",
                      type(exc).__name__)
+    try:
+        from .core.http_status import configure as configure_http_status
+
+        configure_http_status(opts.server_error_status_codes)
+    except Exception:
+        pass
     try:
         configure_errors(opts.in_app_include, opts.in_app_exclude)
     except Exception:

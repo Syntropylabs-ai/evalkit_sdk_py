@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.3.7 — 2026-10-27
+
+Every server middleware now decides which answers make a request's span an error by one rule, and the
+rule can be chosen. By default every 4xx and 5xx answer is an error, as before.
+
+### Behaviour changes
+- A route whose last segment names a probe is a health probe, and untraced by default, only when no
+  segment before it names a record: `/health`, `/api/v2/health` and `/actuator/health/readiness` are
+  probes, while `/datasets/<id>/health`, `/users/42/healthz` and a template such as
+  `/datasets/:datasetId/health` are the app's own routes and are recorded. A record is a number, a UUID,
+  a long hex or opaque id, or a route parameter.
+- The FastAPI, Starlette, Flask, Django and Litestar middleware judge an answer the same way: a request's
+  span is `ERROR` for an answer in `server_error_status_codes` (every 4xx and 5xx by default), with the
+  exception the server answered with, also when a view raised what the framework answers with a status
+  (Django's `Http404`, `PermissionDenied`, `SuspiciousOperation` and `BadRequest`, Litestar's HTTP
+  exceptions). A request that raises after its response started is still an error; a cancelled request is
+  recorded as before. A traced function (`trace_function`, `trace_tool`, function tracing) that raises a web
+  framework's HTTP answer is judged by the status it carries, and records `http.response.status_code`.
+- The span of a streamed Flask or Django response ends after its last chunk is sent, so its latency
+  covers the stream.
+
+### Added
+- `server_error_status_codes`: the status codes an incoming request's span is an error for, as codes
+  (`503`) and inclusive ranges (`"500-599"`), by default `["400-599"]`, as the TypeScript SDK's
+  `serverErrorStatusCodes`. `["500-599"]` follows OpenTelemetry's HTTP conventions, where a 4xx is the
+  caller's mistake: the span keeps `http.status_code`, stays `OK` and records no exception, so scanners'
+  404s, expired tokens' 401s and bad request bodies stay out of the error rate and the Errors page.
+  `[429, "500-599"]` also counts the 429s the app answers. A value that is not such a list is skipped with
+  one warning and the default stays. Outgoing calls are not affected: a 4xx they get back is an error.
+
+### Fixed
+- The Litestar request span is named by the route template (`GET /orders/{order_id}`) and records
+  `http.route`; it was named by the raw path.
+- The Litestar middleware records the exception Litestar answered with a 5xx, with `exception.escaped`
+  false; only the status reached it.
+- An exception Flask hands on to the server (`PROPAGATE_EXCEPTIONS`, debug or testing mode) is recorded
+  with `exception.escaped` true.
+
 ## 0.3.6 — 2026-10-26
 
 The SDK can no longer crash, hang, slow down or grow without bound in the application it observes, and a

@@ -4,6 +4,7 @@ from typing import Any, Callable
 
 from ..core.client import EvalKitClient, release_ambient_trace
 from ..core.context import _current_span
+from ..core.http_status import is_server_error_status, raised_request_failed, server_span_status
 from ..utils.headers import parse_traceparent, sanitize_headers
 from ._bodies import RequestBodyTap, ResponseBodyTap
 from .fastapi import _failed_status
@@ -11,6 +12,39 @@ from ._lifespan import flush_on_lifespan_shutdown, register_client, registered_c
 from ._probe import answer_probe_untraced, is_ignored
 
 _BODY_MAX = 64 * 1024
+
+# Where the scope of a request the middleware records keeps the exceptions Litestar answered.
+_RAISED_KEY = "evalkit.raised"
+
+
+async def _keep_raised(exc: Any, scope: Any) -> None:
+    try:
+        raised = scope.get(_RAISED_KEY)
+        if isinstance(raised, list) and not raised:
+            raised.append(exc)
+    except Exception:
+        pass
+
+
+def _watch_raised(scope: Any) -> None:
+    # Litestar answers a handler's exception inside the route, between the handler and the route's
+    # middleware, so only the status reaches this middleware; the app's after_exception hooks are the
+    # one place told which exception it was, with the request's scope.
+    try:
+        hooks = getattr(scope.get("litestar_app"), "after_exception", None)
+        if isinstance(hooks, list) and _keep_raised not in hooks:
+            hooks.append(_keep_raised)
+        scope[_RAISED_KEY] = []
+    except Exception:
+        pass
+
+
+def _answered_exception(scope: Any) -> "BaseException | None":
+    try:
+        raised = scope.get(_RAISED_KEY)
+        return raised[0] if raised and isinstance(raised[0], BaseException) else None
+    except Exception:
+        return None
 
 
 def _flush_on_litestar_shutdown(client: "EvalKitClient | None") -> None:
@@ -75,6 +109,8 @@ def create_litestar_middleware(client: "EvalKitClient | None" = None) -> Any:
             # Kept from what the app reads, as it reads it; see _bodies.
             request_tap = RequestBodyTap(receive, _BODY_MAX, raw_headers)
             response_tap = ResponseBodyTap(_BODY_MAX)
+            # Routed already, so the template is the one the request matched (`/orders/{order_id}`).
+            route = scope.get("path_template") or None
 
             try:
                 trace_id, end, ctx = ek.start_http_trace(
@@ -122,28 +158,37 @@ def create_litestar_middleware(client: "EvalKitClient | None" = None) -> Any:
             def body_attributes() -> dict:
                 return {**request_tap.attributes(), **response_tap.attributes()}
 
+            _watch_raised(scope)
             try:
                 await self.app(scope, request_tap.receive, send_wrapper)
                 sc = status_code_holder[0]
                 try:
+                    # Litestar turned the handler's exception into this response, so it did not escape.
+                    answered = _answered_exception(scope) if is_server_error_status(sc) else None
                     end(
-                        "ERROR" if sc >= 400 else "OK",
+                        server_span_status(sc),
                         status_code=sc,
                         response_body=response_tap.value(),
                         response_headers=response_headers_holder[0] or None,
+                        route=route,
                         request_body=request_tap.value(),
                         attributes=body_attributes() or None,
+                        exception=answered,
+                        exception_escaped=False if answered is not None else None,
                     )
                 except Exception:
                     pass
             except BaseException as exc:
                 try:
+                    status = _failed_status(exc, status_code_holder[0] if started[0] else None)
+                    failed = raised_request_failed(status)
                     end(
-                        "ERROR",
-                        status_code=_failed_status(exc, status_code_holder[0] if started[0] else None),
+                        "ERROR" if failed else "OK",
+                        status_code=status,
+                        route=route,
                         request_body=request_tap.value(),
                         attributes=body_attributes() or None,
-                        exception=exc,
+                        exception=exc if failed else None,
                     )
                 except Exception:
                     pass

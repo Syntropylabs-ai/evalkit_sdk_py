@@ -4,6 +4,7 @@ from typing import Any
 
 from ..core.client import EvalKitClient, release_ambient_trace
 from ..core.context import _current_span, end_suppression, suppress_tracing
+from ..core.http_status import is_server_error_status, raised_request_failed
 from ..utils.headers import parse_traceparent, sanitize_headers
 from ._bodies import capped_prefix, is_binary, is_event_stream
 from ._probe import is_ignored
@@ -36,6 +37,38 @@ def _response_body(response: Any) -> Any:
     if prefix is None:
         return None
     return prefix.decode("utf-8", errors="replace") or None
+
+
+def _end_when_closed(response: Any, end: Any, fields: dict) -> bool:
+    """End the span when the server closes a streamed response, after its last chunk, rather than when
+    the view returned it; False when the response is sent as it is (a file) and closes nothing.
+
+    Flask answers abort() and an unmatched route through the exception's own WSGI interface, which leaves
+    even a short error page reading as streamed, so only a success or a redirect is waited for.
+    """
+    if getattr(response, "direct_passthrough", False) or not getattr(response, "is_streamed", False):
+        return False
+    if not isinstance(fields.get("status_code"), int) or fields["status_code"] >= 400:
+        return False
+    call_on_close = getattr(response, "call_on_close", None)
+    if not callable(call_on_close):
+        return False
+    ended = [False]
+
+    def finish() -> None:
+        if ended[0]:
+            return
+        ended[0] = True
+        try:
+            end("OK", **fields)
+        except Exception:
+            pass
+
+    try:
+        call_on_close(finish)
+    except Exception:
+        return False
+    return True
 
 
 def flask_route(request: Any) -> "str | None":
@@ -110,12 +143,13 @@ def instrument_flask(app: Any, client: EvalKitClient) -> None:
                     response_headers=resp_headers,
                     route=flask_route(flask_request),
                 )
-                if response.status_code >= 500:
+                if is_server_error_status(response.status_code):
                     # Flask answers an unhandled exception with a 500 that runs through here before
                     # teardown is handed the exception, so the span ends there, with it.
                     g._ek_pending = fields
                 else:
-                    end("ERROR" if response.status_code >= 400 else "OK", **fields)
+                    if not _end_when_closed(response, end, fields):
+                        end("OK", **fields)
                     g._ek_ended = True
             if trace_id:
                 response.headers["X-Trace-Id"] = trace_id
@@ -130,14 +164,17 @@ def instrument_flask(app: Any, client: EvalKitClient) -> None:
         try:
             end = getattr(g, "_ek_end", None)
             if end and not getattr(g, "_ek_ended", False):
-                fields = getattr(g, "_ek_pending", None) or dict(
-                    status_code=500, route=flask_route(flask_request),
-                )
+                pending = getattr(g, "_ek_pending", None)
+                fields = pending or dict(status_code=500, route=flask_route(flask_request))
+                raised = exc if isinstance(exc, BaseException) else None
                 try:
-                    # The view raised and Flask answered 500 itself: the exception did not get past
-                    # the request, but it ended the view, which is what the span is read for.
-                    end("ERROR", exception=exc if isinstance(exc, BaseException) else None,
-                        exception_escaped=False, **fields)
+                    if raised_request_failed(fields.get("status_code")):
+                        # A response that ran through after_request is the one Flask answered the
+                        # exception with, so it did not get past the request; without one, Flask
+                        # propagated it to the server.
+                        end("ERROR", exception=raised, exception_escaped=pending is None, **fields)
+                    else:
+                        end("OK", **fields)
                 except Exception:
                     pass
                 g._ek_ended = True

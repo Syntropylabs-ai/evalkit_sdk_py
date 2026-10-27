@@ -2,7 +2,7 @@
 
 EvalKit is the SyntropyLabs SDK for Python. It traces your LLM app and sends the traces to [SyntropyLabs](https://syntropylabs.ai). It can also replay test scenarios against your agent and score the answers.
 
-The package is `syntropylabs-evalkit`, at version 0.3.2, and you import it as `evalkit`. It needs Python 3.9 or later. The [README](README.md) is the full reference. It also covers identity, evaluation runs, feedback, prompts and the `evalkit` command.
+The package is `syntropylabs-evalkit`, at version 0.3.7, and you import it as `evalkit`. It needs Python 3.9 or later. The [README](README.md) is the full reference. It also covers identity, evaluation runs, feedback, prompts and the `evalkit` command.
 
 > Tracing never breaks your app. Every patch, span and export is wrapped, so a failure in tracing becomes a no-op and your code keeps running. If your `mask` function raises, EvalKit drops that span, so content you meant to hide is not sent. Calls to the SyntropyLabs API are the exception: `Eval()`, `feedback()`, `prompts.get()`, `generate_scenarios()` and `evaluate_simulation()` raise when the request fails.
 
@@ -77,6 +77,7 @@ evalkit.init(
     sample_rate=None,                               # share of traces kept, or OTEL_TRACES_SAMPLER
     capture_unhandled=False,                        # record uncaught exceptions
     in_app_include=None, in_app_exclude=None,       # module prefixes that are / are not your code
+    server_error_status_codes=None,                 # ["400-599"]: answers a request span is an error for
 )
 ```
 
@@ -191,7 +192,9 @@ Use the wrappers only where `init()` has not patched `connect()`. On a connectio
 
 ## Web frameworks
 
-Add the middleware for your framework. Each inbound request then becomes an `http_call` span named after its method and path, such as `GET /orders`. The middleware continues an incoming `traceparent` header and adds `X-Trace-Id` and `traceparent` headers to the response.
+Add the middleware for your framework. Each inbound request then becomes an `http_call` span named after its method and the route template it matched, such as `GET /orders/{order_id}`. The middleware continues an incoming `traceparent` header and adds `X-Trace-Id` and `traceparent` headers to the response.
+
+A request's span is an error for every 4xx and 5xx answer by default, with the exception the server answered with. `server_error_status_codes=["500-599"]` in `init()` follows OpenTelemetry's HTTP conventions instead: a 4xx (a scanner probing `/.env`, an expired token, a body that fails validation) keeps its status code and stays `OK`, with no exception recorded. Outgoing calls always record a 4xx they get back as an error.
 
 For FastAPI or Starlette, add `EvalKitMiddleware`:
 

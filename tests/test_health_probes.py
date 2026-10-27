@@ -19,12 +19,14 @@ PROBES = [
     "/actuator/health", "/actuator/health/liveness", "/v1/healthcheck?verbose=1", "/HEALTHZ", "/health-check",
     "/health_check", "/health?probe=k8s",
     "http://svc/health", "https://svc:8443/HEALTHZ", "/actuator/health/readiness", "/health/alive",
-    "/api/v1/healthz#top", "/express/health/started",
+    "/api/v1/healthz#top", "/express/health/started", "/api/v2/health", "/services/billing/healthz",
 ]
 APP_PATHS = [
     "/healthcare", "/api/health-records", "/healthcare/claims", "/patients/7/health/records",
     "/v1/orders?next=/health", "/wealth", "/health/records",
     "http://svc/healthcare", "/cb?next=http://h/health", "/healthz/details", "/", "",
+    "/datasets/6650a1b2c3d4e5f601234567/health", "/datasets/:datasetId/health", "/users/42/healthz",
+    "/runs/0b6f6a52-6d0e-4b0c-9a51-3f1f3d4b2a10/health/ready", "/projects/{projectId}/health",
 ]
 
 

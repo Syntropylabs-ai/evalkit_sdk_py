@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from urllib.parse import urlsplit
 
 from ...core.context import tracing_suppressed
@@ -20,6 +21,22 @@ _PROBE_QUALIFIERS = frozenset({
 })
 
 
+# A segment that names one record, or a route template's parameter standing for one. A probe never
+# sits under a record, so /datasets/<id>/health is the dataset's own route and is recorded;
+# /api/v2/health is a probe.
+_RECORD_SEGMENT_RES = tuple(re.compile(p) for p in (
+    r"^\d+$",
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    r"^(?=[^\d]*\d)[0-9a-f]{12,}$",
+    r"^(?=(?:[^\d]*\d){2})[a-z0-9_-]{16,}$",
+    r"^(?::.+|\{.+\})$",
+))
+
+
+def _names_record(segment: str) -> bool:
+    return any(pattern.match(segment) for pattern in _RECORD_SEGMENT_RES)
+
+
 def _path_segments(url: str) -> list:
     try:
         path = urlsplit(url).path if "://" in url else url.split("?", 1)[0].split("#", 1)[0]
@@ -30,13 +47,18 @@ def _path_segments(url: str) -> list:
 
 def is_health_check(url: str) -> bool:
     """Whether a URL is a health or readiness probe: its last path segment names one, or a health
-    segment is followed only by a liveness or readiness qualifier."""
+    segment is followed only by a liveness or readiness qualifier, and no segment before it names a
+    record."""
     segments = _path_segments(url)
     if not segments:
         return False
     if segments[-1] in _PROBE_SEGMENTS:
-        return True
-    return len(segments) >= 2 and segments[-1] in _PROBE_QUALIFIERS and segments[-2] in _PROBE_SEGMENTS
+        probe_at = len(segments) - 1
+    elif len(segments) >= 2 and segments[-1] in _PROBE_QUALIFIERS and segments[-2] in _PROBE_SEGMENTS:
+        probe_at = len(segments) - 2
+    else:
+        return False
+    return not any(_names_record(segment) for segment in segments[:probe_at])
 
 
 def ignored_outgoing(url: str, method: object = None) -> bool:

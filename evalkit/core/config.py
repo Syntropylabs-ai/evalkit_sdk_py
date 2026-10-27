@@ -108,7 +108,7 @@ def resolve_log_level(value: Any) -> int:
 def _comparable(options: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(options)
     for name in ("trace_packages", "in_app_include", "in_app_exclude", "ignore_routes", "ignore_urls",
-                 "ignore_functions"):
+                 "ignore_functions", "server_error_status_codes"):
         value = out.get(name)
         if isinstance(value, (list, tuple, set, frozenset)):
             out[name] = tuple(value)
