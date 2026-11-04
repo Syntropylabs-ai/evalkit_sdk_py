@@ -1,5 +1,66 @@
 # Changelog
 
+## 0.3.8 — 2026-11-01
+
+Voice bots built on Pipecat or LiveKit Agents report each turn's timing, and join the session of a
+Simulate test call that reaches them. `evalkit voice-test` places those test calls from your machine or
+CI and gates the job on the voice evaluators' verdict.
+
+### Added
+- `evalkit voice-test run` and `evalkit.voicetest.run()`: a voice test run against your own bot, over its
+  WebSocket in the `twilio` (Twilio Media Streams) or `pcm16` format. The run is created with the
+  subscription key (`POST /v1/voice-tests`, with an `Idempotency-Key`, so a create whose answer was lost
+  is sent again without opening a second run, and with `timingOnly` for `--timing-only`). The caller's
+  synthesized lines are downloaded once, checked against their sha256 and cached
+  (`EVALKIT_VOICETEST_CACHE`). The plan's calls are placed up to `maxConcurrentCalls` at once, in the
+  plan's order, each with its session token. Each call is measured from its two-channel
+  recording (response delay, talk-over, interruptions, silences, the caller's own health); its recording
+  is uploaded through a signed URL (not with `--timing-only`), its `voice.call` trace is sent, and its
+  result is posted. The run is then completed and the verdict awaited. The command prints each call's
+  figures and the evaluators' results (`--json` prints one object instead), and exits with `0` passed,
+  `1` failed, `2` on a setup or network failure, and `130` when interrupted. Options: `--url`, `--format`,
+  `--sample-rate`, `--header K=V` (sent to the bot only), `--scenario-set`, `--scenario`, `--repeats`,
+  `--agent`, `--name`, `--voice`, `--timing-only`, `--first-speaker auto|bot|caller` (who opens each
+  call, which sets the wait before its first line; sent as the target's `firstSpeaker`), `--out DIR`,
+  `--json`, `--key`, `--api-url`, `--wait-timeout` and `--cache-dir`. A failed call (connection refused, the bot hanging up early, a call
+  past `maxCallMs`) is reported with its error, and the run goes on. Ctrl-C stops new calls; a second
+  Ctrl-C or a SIGTERM ends the calls in progress; either way every call is reported and the run is
+  completed. Calls to the API that fail on the network or with a 5xx are retried with backoff.
+- `evalkit voice-test check`, `call` and `refbot`: local tools that need no backend. `check` makes one
+  short call and reports whether the bot answered, how fast, and any frames its format does not define;
+  `--first-speaker` sets its wait before the line.
+  `call` runs one scripted call into a recording directory. A script's `bot_done` wait takes
+  `start_within_ms`: with no bot speech started by then, the wait ends (`wait_end` reason `no_greeting`)
+  and the line is spoken. `refbot` is the reference bot, with known
+  delays and faults.
+- The `voice` extra (`pip install "syntropylabs-evalkit[voice]"`: numpy, websockets, webrtcvad). It is
+  not part of `all`; `import evalkit` loads none of it, and `evalkit.voicetest` imports it only when a
+  call is placed or analysed.
+- For runners that place calls for others: `evalkit.voicetest.run_planned_call()` places and reports one
+  plan call, with the credential (`VoiceTestApi.with_run_token`), the trace client
+  (`evalkit.voicetest.ingest_client`), a stop event and a WebSocket `connector` supplied by the runner;
+  `script_from_plan_call()` turns a plan call into a script and its line sources.
+- `instrument_pipecat(worker)` and `pipecat_observer()` for Pipecat, and `instrument_livekit_agents(session)`
+  for LiveKit Agents. Each call becomes a `voice.session` trace with one `voice.turn` span (type `agent`) per
+  bot turn, from when the bot heard the user start to speak to when it stopped speaking its reply, numbered
+  from 0 at the first user utterance. A turn carries the voice test contract's `evalkit.voice.v1.*`
+  attributes: `turn.index`, `user.speech_end_ms`, `eou.delay_ms`, `stt.duration_ms`, `llm.ttft_ms`,
+  `tts.ttfb_ms`, `interrupted`, `transcript.user`, `transcript.bot` and `session`. Pipecat's figures come
+  from the frames a pipeline observer sees and its `MetricsFrame`s (with `enable_metrics=True`); LiveKit's
+  from the session's conversation messages (`ChatMessage.metrics` from 1.4, `metrics_collected` before).
+  Neither framework's own OpenTelemetry spans are needed.
+- The test call's session token: `voice_session_from_url`, `voice_session_from_twilio_start`,
+  `voice_session_from_pcm16_start`, `voice_session_from_start_message` and
+  `voice_session_from_livekit_participant` read it, and `set_voice_session` / `clear_voice_session` make it
+  `session.id` for the call. The Pipecat integration reads it from the WebSocket's query, the Twilio `start`
+  message `parse_telephony_websocket` read, and the `start` message a transport's serializer is handed; the
+  LiveKit one from the linked participant's `evalkit.session` attribute.
+
+### Fixed
+- `capture_content=False` removes LiveKit Agents' content attributes (`lk.pii.*`: transcripts, chat context,
+  tool arguments and outputs) from the spans LiveKit sends through the OpenTelemetry bridge. The voice
+  transcripts (`evalkit.voice.v1.transcript.*`) are content too.
+
 ## 0.3.7 — 2026-10-27
 
 Every server middleware now decides which answers make a request's span an error by one rule, and the

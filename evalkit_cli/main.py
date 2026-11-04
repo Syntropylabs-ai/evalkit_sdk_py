@@ -78,6 +78,14 @@ def _parser() -> argparse.ArgumentParser:
     gate = eval_actions.add_parser("gate", help="read an existing run's gate and exit with the same codes")
     gate.add_argument("run_id")
     _eval_flags(gate)
+
+    # Listed here for `evalkit --help`; main() hands `voice-test` to evalkit.voicetest.cli before
+    # parsing, so its options are defined once, there.
+    sub.add_parser(
+        "voice-test",
+        help="test a voice bot over WebSocket: run, check, call, refbot (needs the voice extra)",
+        add_help=False,
+    )
     return parser
 
 
@@ -226,6 +234,13 @@ def _timestamp() -> str:
 
 def main(argv: Optional[List[str]] = None, home: Optional[Path] = None, out=None) -> int:
     out = out or sys.stdout
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["voice-test"]:
+        # Imported only for this command: the coding hooks run `evalkit` on every agent event, and
+        # importing the evalkit package costs them about 100 ms.
+        from evalkit.voicetest.cli import main as voice_test_main
+
+        return voice_test_main(argv[1:], prog="evalkit voice-test", out=out)
     args = _parser().parse_args(argv)
     store = ConfigStore(home)
     if args.command == "eval":

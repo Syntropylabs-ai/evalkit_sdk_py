@@ -20,7 +20,7 @@ pip install "syntropylabs-evalkit[all]"         # every provider integration
 pip install "syntropylabs-evalkit[otel]"        # OpenTelemetry bridge (community auto-instrumentation)
 ```
 
-The extras are `openai`, `anthropic`, `google`, `cohere`, `mistral`, `groq`, `bedrock`, `litellm`, `ollama`, `langchain`, `langgraph`, `pinecone`, `qdrant`, `chroma`, `weaviate`, `llamaindex`, `elevenlabs`, `assemblyai`, `otel` and `all`. Each extra installs its library, for example `google-genai` for `google` and `boto3` for `bedrock`. `all` installs every one of them.
+The extras are `openai`, `anthropic`, `google`, `cohere`, `mistral`, `groq`, `bedrock`, `litellm`, `ollama`, `langchain`, `langgraph`, `pinecone`, `qdrant`, `chroma`, `weaviate`, `llamaindex`, `elevenlabs`, `assemblyai`, `otel` and `all`. Each extra installs its library, for example `google-genai` for `google` and `boto3` for `bedrock`. `all` installs every one of them. The `voice` extra is not an integration and is not in `all`: it adds what the voice bot tests need (see [Testing your voice bot](#testing-your-voice-bot)).
 
 You do not need an extra for a library you already have. EvalKit instruments each supported library that it can import when `init()` runs.
 
@@ -107,7 +107,7 @@ After `init()`, EvalKit instruments every supported library that is installed. L
 - AWS Bedrock: the runtime's Converse and InvokeModel calls, streaming included, and the agent runtime's InvokeAgent, InvokeInlineAgent, Retrieve and RetrieveAndGenerate calls.
 - Frameworks: LiteLLM, LangChain and LangGraph, LlamaIndex, Google ADK and the Claude Agent SDK.
 - Vector stores: Pinecone, Qdrant, Chroma and Weaviate.
-- Voice: OpenAI audio and Realtime, ElevenLabs, AssemblyAI and Google GenAI Live.
+- Voice: OpenAI audio and Realtime, ElevenLabs, AssemblyAI and Google GenAI Live. Pipecat and LiveKit Agents bots need a call of their own; see [Voice bots: Pipecat and LiveKit Agents](#voice-bots-pipecat-and-livekit-agents).
 - HTTP clients: `requests`, `httpx` and `aiohttp`, as `http_call` spans.
 - Databases: Redis, PyMongo (Motor included), asyncpg, psycopg 3, psycopg2 and PyMySQL, as `db_query` spans.
 - MCP: `mcp.ClientSession.call_tool`, as `tool_call` spans.
@@ -189,6 +189,42 @@ conn = evalkit.trace_openai_realtime(openai_client, model="gpt-realtime")
 ```
 
 Use the wrappers only where `init()` has not patched `connect()`. On a connection that `init()` already traces, a wrapper records a second `voice.session` span.
+
+### Voice bots: Pipecat and LiveKit Agents
+
+A Pipecat or LiveKit Agents bot is instrumented by one call per call. Each call becomes a `voice.session` trace, and each bot turn a `voice.turn` span of type `agent`. A turn runs from when the bot heard the user start to speak to when it stopped speaking its reply, and is numbered from 0 at the first user utterance. It carries the end-of-utterance delay, the STT, LLM and TTS timings, whether the user interrupted, and both transcripts, in the `evalkit.voice.v1.*` attributes:
+
+```python
+import evalkit
+
+# Pipecat: an observer on the pipeline's worker (PipelineTask before Pipecat 1.3)
+worker = PipelineWorker(pipeline, params=PipelineParams(enable_metrics=True))
+evalkit.instrument_pipecat(worker, websocket=websocket, call_data=call_data)
+# or PipelineWorker(pipeline, observers=[evalkit.pipecat_observer(websocket=websocket)])
+
+# LiveKit Agents: hooks on the session, before it starts
+session = AgentSession(stt=..., llm=..., tts=..., vad=...)
+evalkit.instrument_livekit_agents(session)
+await session.start(agent=Assistant(), room=ctx.room)
+```
+
+A Simulate test call sends a session token. Spans with it as `session.id` join the test call's session. The integrations read it from the WebSocket URL's `evalkit_session` query parameter, from the Twilio `start` message (Pipecat's `call_data`), and from the raw-PCM `start` message (pass the Pipecat transport's `serializer=`). `session_id=` sets it directly. For a bot that reads the start message itself, `voice_session_from_url`, `voice_session_from_twilio_start`, `voice_session_from_pcm16_start`, `voice_session_from_start_message` and `voice_session_from_livekit_participant` return the token, and `set_voice_session(token)` puts it on every span of the call, as `set_user` does for a user.
+
+The transcripts follow `capture_content` and `mask`. The README section [Voice bots: Pipecat and LiveKit Agents](README.md#voice-bots-pipecat-and-livekit-agents) has the attribute table, the figures each framework cannot measure, and why the integrations read the frameworks' events instead of their OpenTelemetry spans.
+
+### Testing your voice bot
+
+`evalkit voice-test` places those test calls from your own machine or CI, so a bot on `localhost` or on a private network can be tested. It needs the `voice` extra:
+
+```bash
+pip install "syntropylabs-evalkit[voice]"
+
+evalkit voice-test check --url ws://localhost:8765/ws --format pcm16            # reachable? answers? (no backend)
+evalkit voice-test run --url ws://localhost:8765/ws --format pcm16 \
+    --scenario-set <scenarioSetId> --header "Authorization=Bearer $BOT_TOKEN"   # exit 0 passed, 1 failed
+```
+
+`run` creates the run with your subscription key, downloads the caller's synthesized lines (checked by sha256 and cached), calls the bot once per scripted scenario and repeat, and measures each call from its recording: the response delay, talk-over, interruptions and silences. It then uploads each recording (unless `--timing-only`), sends each call's `voice.call` trace with the call's session token as `session.id`, posts each result, and waits for the voice evaluators' verdict. It exits with `0` when the run passed, `1` when it failed, `2` on a setup or network failure, and `130` when it was interrupted. A call that fails is reported with its error and the run goes on. The bot's `--header` values and the URL's query are sent to the bot only. From Python, `evalkit.voicetest.run(url, format=..., scenario_set=...)` returns the run, and its `exit_code`. The README section [Testing your voice bot](README.md#testing-your-voice-bot) lists every option, the output and the local tools (`check`, `call`, `refbot`).
 
 ## Web frameworks
 
@@ -501,4 +537,4 @@ Trace context carries into threads and thread pools without extra code. If you s
 
 ### Span types
 
-You will see these span types: `llm_call`, `tool_call`, `http_call`, `db_query`, `function_call`, `log` and `eval_result`.
+You will see these span types: `llm_call`, `tool_call`, `http_call`, `db_query`, `function_call`, `log`, `eval_result`, and `agent` for a voice bot's turns.

@@ -49,6 +49,10 @@ CONTENT_ATTRIBUTES = frozenset({
     "evalkit.prompt",
     "evalkit.completion",
     "gen_ai.response.refusal",
+    # What a voice call's two sides said, as speech-to-text heard it and as the bot spoke it.
+    "evalkit.voice.v1.transcript.user",
+    "evalkit.voice.v1.transcript.bot",
+    "evalkit.voice.v1.transcript.caller",
     # The OpenTelemetry GenAI semantic conventions' content attributes, current and earlier ones.
     # Other instrumentation in the process writes them on the spans the bridge forwards, whatever
     # its own content switch says, so capture off has to remove them here.
@@ -103,6 +107,11 @@ CONTENT_LIST_PREFIXES = (
 )
 CONTENT_FIELDS = frozenset({"content", "contents", "text", "arguments", "result", "value", "message", "query", "url"})
 
+# LiveKit Agents marks every span attribute that carries conversational content or user data with
+# a `pii` segment (lk.pii.user_transcript, lk.pii.chat_ctx, lk.pii.response.text); it is the only
+# marker that framework keeps on such attributes.
+PII_SEGMENT = "pii"
+
 # The GenAI conventions' message events (gen_ai.user.message, gen_ai.choice and the rest) carry the
 # message under these generic names rather than under a gen_ai.* key. The events themselves stay,
 # so a trace still shows that a message was there and who sent it.
@@ -115,6 +124,8 @@ CONTENT_STRIPPED_ATTRIBUTE = "evalkit.content_captured"
 def is_content_attribute(key: str) -> bool:
     """Whether a span or event attribute holds content that capture_content=False withholds."""
     if key in CONTENT_ATTRIBUTES or key.endswith(CONTENT_ATTRIBUTE_SUFFIXES):
+        return True
+    if key.startswith("lk.") and PII_SEGMENT in key.split("."):
         return True
     return key.startswith(CONTENT_LIST_PREFIXES) and key.rsplit(".", 1)[-1] in CONTENT_FIELDS
 

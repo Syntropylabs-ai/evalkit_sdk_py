@@ -61,6 +61,15 @@ from .instrumentation.llm.openai_realtime import (
     trace_openai_realtime as _trace_openai_realtime,
     patch_openai_realtime as _patch_openai_realtime,
 )
+from .instrumentation.voice.session_token import (
+    clear_voice_session,
+    set_voice_session,
+    voice_session_from_livekit_participant,
+    voice_session_from_pcm16_start,
+    voice_session_from_start_message,
+    voice_session_from_twilio_start,
+    voice_session_from_url,
+)
 
 from .instrumentation.http.requests import patch_requests
 from .instrumentation.http.httpx import patch_httpx
@@ -141,6 +150,16 @@ __all__ = [
     "trace_openai_realtime",
     "patch_google_genai_live",
     "patch_openai_realtime",
+    "instrument_pipecat",
+    "pipecat_observer",
+    "instrument_livekit_agents",
+    "set_voice_session",
+    "clear_voice_session",
+    "voice_session_from_url",
+    "voice_session_from_twilio_start",
+    "voice_session_from_pcm16_start",
+    "voice_session_from_start_message",
+    "voice_session_from_livekit_participant",
     "patch_mistral_client",
     "patch_async_openai_client",
     "patch_async_anthropic_client",
@@ -729,6 +748,86 @@ def patch_openai_realtime() -> None:
     _patch_openai_realtime(_get_instance())
 
 
+def pipecat_observer(
+    *,
+    session_id: Optional[str] = None,
+    websocket: Any = None,
+    call_data: Any = None,
+    serializer: Any = None,
+    query_param: str = "evalkit_session",
+) -> Any:
+    """A Pipecat observer that records the call as a ``voice.session`` trace with one ``voice.turn``
+    span per bot turn. Pass it in ``PipelineWorker(..., observers=[...])`` (``PipelineTask`` before
+    Pipecat 1.3); one observer per call.
+
+    The call's test session token is ``session_id``, else the one ``set_voice_session`` set, else the
+    one in ``call_data`` (what ``parse_telephony_websocket`` returned), else the one in the
+    ``websocket``'s URL query (``query_param``) or the Twilio ``start`` message Pipecat already read
+    from it. With ``serializer``, the ``start`` message the transport hands it is read too. Needs
+    ``pipecat-ai`` installed; when the SDK is a no-op, the observer records nothing.
+    """
+    from .instrumentation.voice.pipecat_ai import pipecat_observer as _pipecat_observer
+
+    return _pipecat_observer(
+        _get_instance(), session_id=session_id, websocket=websocket, call_data=call_data,
+        serializer=serializer, query_param=query_param,
+    )
+
+
+def instrument_pipecat(
+    task: Any,
+    *,
+    session_id: Optional[str] = None,
+    websocket: Any = None,
+    call_data: Any = None,
+    serializer: Any = None,
+    query_param: str = "evalkit_session",
+) -> Any:
+    """Add a ``pipecat_observer`` to a ``PipelineWorker`` (``PipelineTask`` before Pipecat 1.3) before
+    it runs, and return it. Returns None, with a warning, when it cannot take one; the pipeline then
+    runs untraced. Does nothing when the SDK is a no-op."""
+    instance = _get_instance()
+    if not instance.enabled:
+        return None
+    try:
+        from .instrumentation.voice.pipecat_ai import instrument_pipecat as _instrument_pipecat
+
+        return _instrument_pipecat(
+            instance, task, session_id=session_id, websocket=websocket, call_data=call_data,
+            serializer=serializer, query_param=query_param,
+        )
+    except Exception as exc:
+        _log.warning("evalkit.instrument_pipecat could not instrument its target (%s: %s); it runs untraced.",
+                     type(exc).__name__, exc)
+        return None
+
+
+def instrument_livekit_agents(
+    session: Any,
+    *,
+    session_id: Optional[str] = None,
+    participant: Any = None,
+) -> Any:
+    """Record a LiveKit Agents ``AgentSession`` as a ``voice.session`` trace with one ``voice.turn``
+    span per bot turn. Call it before ``await session.start(...)``; it returns the hooks, or None
+    when the SDK is a no-op or the session cannot be listened to.
+
+    The test session token is ``session_id``, else the one ``set_voice_session`` set, else the
+    ``evalkit.session`` attribute of ``participant`` or of the participant the session links to.
+    """
+    instance = _get_instance()
+    if not instance.enabled:
+        return None
+    try:
+        from .instrumentation.voice.livekit_agents import instrument_livekit_agents as _instrument_livekit
+
+        return _instrument_livekit(instance, session, session_id=session_id, participant=participant)
+    except Exception as exc:
+        _log.warning("evalkit.instrument_livekit_agents could not instrument its target (%s: %s); it runs "
+                     "untraced.", type(exc).__name__, exc)
+        return None
+
+
 @_guarded_patch
 def patch_async_openai_client(
     async_openai_client: Any,
@@ -917,3 +1016,13 @@ def trace_package(
         except Exception:
             continue
     return total
+
+
+def __getattr__(name: str) -> Any:
+    # The voice test caller is an optional extra: `evalkit.voicetest` is imported on first use, so
+    # `import evalkit` never loads its package (or, through it, numpy, websockets or webrtcvad).
+    if name == "voicetest":
+        import importlib
+
+        return importlib.import_module(".voicetest", __name__)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

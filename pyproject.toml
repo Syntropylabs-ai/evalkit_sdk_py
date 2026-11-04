@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "syntropylabs-evalkit"
-version = "0.3.7"
+version = "0.3.8"
 description = "EvalKit Python SDK — LLM observability and tracing"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -73,6 +73,8 @@ llamaindex = ["llama-index-core>=0.11.0"]
 elevenlabs = ["elevenlabs>=1.4.0"]
 assemblyai = ["assemblyai>=0.35.1"]
 otel = ["opentelemetry-sdk>=1.20.0", "opentelemetry-instrumentation>=0.41b0"]
+# The voice test caller (evalkit.voicetest, `evalkit voice-test`): pip install "syntropylabs-evalkit[voice]"
+voice = ["numpy>=1.26", "websockets>=13", "webrtcvad-wheels>=2.0.14"]
 # Install every supported integration at once:  pip install "syntropylabs-evalkit[all]"
 all = [
     "openai>=1.0.0",

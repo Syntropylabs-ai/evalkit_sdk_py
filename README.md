@@ -10,7 +10,7 @@ One call to `init()` instruments your LLM clients, HTTP calls, database queries 
 pip install syntropylabs-evalkit
 ```
 
-The package is named `syntropylabs-evalkit`, and you import it as `evalkit`. It needs Python 3.9 or later. It also installs the `evalkit` command, which runs evaluations in CI and connects coding agents.
+The package is named `syntropylabs-evalkit`, and you import it as `evalkit`. It needs Python 3.9 or later. It also installs the `evalkit` command, which runs evaluations in CI, tests voice bots and connects coding agents.
 
 ## Contents
 
@@ -20,6 +20,8 @@ The package is named `syntropylabs-evalkit`, and you import it as `evalkit`. It 
 - [Streaming HTTP response bodies](#streaming-http-response-bodies)
 - [Request and response headers](#request-and-response-headers)
 - [Web frameworks](#web-frameworks)
+- [Voice bots: Pipecat and LiveKit Agents](#voice-bots-pipecat-and-livekit-agents)
+- [Testing your voice bot](#testing-your-voice-bot)
 - [Trace your own code](#trace-your-own-code)
 - [Manual spans](#manual-spans)
 - [Keeping things out of traces](#keeping-things-out-of-traces)
@@ -70,7 +72,7 @@ Spans wait in a queue. A background thread exports them in batches, and the queu
 - LLM clients: OpenAI (Chat Completions and Responses), Anthropic, Bedrock (`boto3` and `aiobotocore`), Google GenAI, Google AI (`google.generativeai`), Cohere, Mistral, Groq and Ollama. Anthropic on Vertex (`AnthropicVertex`) and Google GenAI in Vertex mode are included.
 - Agent frameworks: LangChain and LangGraph (through LangChain callbacks), LiteLLM, LlamaIndex, Google ADK, the Claude Agent SDK, and tool calls from MCP clients.
 - Vector stores: Pinecone, Qdrant, Chroma and Weaviate.
-- Voice: OpenAI audio and Realtime, ElevenLabs, AssemblyAI and Google GenAI Live.
+- Voice: OpenAI audio and Realtime, ElevenLabs, AssemblyAI and Google GenAI Live. Pipecat and LiveKit Agents bots need one call each; see [Voice bots](#voice-bots-pipecat-and-livekit-agents).
 - HTTP: `requests`, `httpx`, `httpx2` and `aiohttp`, with method, URL, status, latency, headers and bodies. Health and readiness probes (`/health`, `/healthz`, `/health/live`, `/readyz`, `/livez`) are left out, matched by whole path segment.
 - Databases: Redis, PyMongo (Motor included), asyncpg, psycopg 3, psycopg2 and PyMySQL, with query text and latency. psycopg2 also records each `connect()` as a `postgresql CONNECT` span, with `db.name`, `server.address` and `server.port`. A statement SQLAlchemy already records (through its OpenTelemetry instrumentation or `patch_sqlalchemy_engine`) is not recorded a second time by the driver underneath.
 - Logging: records from Python's `logging` module. See [Logging](#logging).
@@ -288,6 +290,219 @@ Health and readiness probes (`/health`, `/healthz`, `/health/live`, `/readyz`, `
 - `instrument_flask(app)` needs `init()` to have run first. It raises `RuntimeError` otherwise.
 - Until `init()` runs, the FastAPI middleware passes requests through untraced. It traces HTTP requests only, so WebSocket and lifespan events pass through as well.
 - The Django, FastAPI and Starlette middleware can fill in the user id. See [Identity](#identity).
+
+## Voice bots: Pipecat and LiveKit Agents
+
+A voice bot built on Pipecat or LiveKit Agents reports each turn's timing with one call. The call becomes a `voice.session` trace, and each bot turn a `voice.turn` span of type `agent`, with real start and end times: from when the bot heard the user start to speak to when it stopped speaking its reply. Turns are counted from the first user utterance, starting at 0, so bot speech before it, such as a greeting, belongs to no turn. When the user talks over the reply, the turn ends when the bot falls silent, and the next turn has already started.
+
+### Pipecat
+
+Add the observer to the pipeline's worker (`PipelineTask` before Pipecat 1.3) before it runs. The STT, LLM and TTS timings come from Pipecat's metrics, so build the worker with `enable_metrics=True`:
+
+```python
+import evalkit
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+from pipecat.runner.utils import parse_telephony_websocket
+from pipecat.workers.runner import WorkerRunner
+
+evalkit.init(subscription_key="tk_live_...", service_name="booking-bot")
+
+@app.websocket("/ws")
+async def media_stream(websocket: WebSocket):
+    await websocket.accept()
+    transport_type, call_data = await parse_telephony_websocket(websocket)
+    ...
+    worker = PipelineWorker(pipeline, params=PipelineParams(enable_metrics=True))
+    evalkit.instrument_pipecat(worker, websocket=websocket, call_data=call_data)
+    runner = WorkerRunner()
+    await runner.add_workers(worker)
+    await runner.run()
+```
+
+`instrument_pipecat` returns the observer, or `None` with a warning when the worker cannot take one. To pass it when you build the worker, use `PipelineWorker(pipeline, observers=[evalkit.pipecat_observer(websocket=websocket)])`. Use one observer per call.
+
+### LiveKit Agents
+
+Instrument the session before you start it:
+
+```python
+import evalkit
+
+async def entrypoint(ctx: JobContext):
+    session = AgentSession(stt=..., llm=..., tts=..., vad=...)
+    evalkit.instrument_livekit_agents(session)
+    await session.start(agent=Assistant(), room=ctx.room)
+```
+
+The timings come from the messages the session adds to the conversation (`ChatMessage.metrics`, LiveKit Agents 1.4 and later). On earlier versions they come from `metrics_collected` and the user and agent state changes. On 1.4 and later EvalKit does not listen to `metrics_collected`, which is deprecated there and logs a warning for each listener.
+
+### What each turn records
+
+| Attribute | Meaning | Pipecat | LiveKit Agents |
+|---|---|---|---|
+| `evalkit.voice.v1.turn.index` | the turn number, from the first user utterance | | |
+| `evalkit.voice.v1.user.speech_end_ms` | when the bot decided the user had stopped, in ms from the start of its session | `UserStoppedSpeakingFrame` | end of speech plus `end_of_turn_delay` |
+| `evalkit.voice.v1.eou.delay_ms` | end-of-utterance delay: from the end of the user's speech to that decision | VAD `stop_secs` back from `VADUserStoppedSpeakingFrame`, to the decision | `end_of_turn_delay` |
+| `evalkit.voice.v1.stt.duration_ms` | speech-to-text time: from the end of speech to the final transcript | the STT service's TTFB | `transcription_delay` |
+| `evalkit.voice.v1.llm.ttft_ms` | the model's time to first token | the LLM service's TTFB | `llm_node_ttft` |
+| `evalkit.voice.v1.tts.ttfb_ms` | text-to-speech time to first byte | the TTS service's TTFB | `tts_node_ttfb` |
+| `evalkit.voice.v1.interrupted` | whether the user cut the reply off, as the bot saw it | the user started speaking while the bot spoke | the reply's `interrupted` flag |
+| `evalkit.voice.v1.transcript.user` | the bot's speech-to-text of what it heard | `TranscriptionFrame` | the user's message |
+| `evalkit.voice.v1.transcript.bot` | the text the bot spoke | `TTSTextFrame` | the reply's message |
+| `evalkit.voice.v1.session` and `session.id` | the test call's session token, when there is one | | |
+
+Each figure is the first one in the turn: a later sentence's speech synthesis, or the model call after a tool call, does not replace it. A figure the framework did not measure is left out:
+
+- Pipecat reports STT, LLM and TTS timings only with `enable_metrics=True`. EvalKit logs this once, at the end of a call that had none.
+- The end-of-utterance delay needs a Pipecat VAD frame that says how much silence it waited for (`stop_secs`, Pipecat 1.0 and later). A pipeline without a local VAD, which leaves turn detection to its speech-to-text service, has none.
+- Speech-to-speech models (OpenAI Realtime, Gemini Live) have no separate STT or TTS step, so those figures are left out on both frameworks.
+- LiveKit Agents leaves out the end-of-utterance and transcription figures for a turn whose voice activity detection it found unreliable.
+
+The transcripts are content. `capture_content=False` drops them, along with the span's prompt and completion, which hold the same text, and a `mask` sees them. See [Content capture and masking](#content-capture-and-masking).
+
+### The test call's session
+
+A Simulate test call carries a session token, `<simulationId>:<runId>:<scenarioId>:<callIndex>`. A bot that puts it on its spans as `session.id` joins the test call's session, and its turns line up with the caller's by session and time. The token travels in three places, and the integrations look for it there:
+
+- the WebSocket URL's query parameter `evalkit_session` (`query_param=` when the target named another one);
+- the Twilio Media Streams `start` message, as `start.customParameters.evalkit_session`; Pipecat's `parse_telephony_websocket` reads that message, so pass its `call_data`, or the `websocket` it read;
+- the raw-PCM `start` message, `{"type": "start", "session": "<token>", ...}`. Pass the transport's `serializer` and the observer reads the token from the `start` message the transport hands it.
+
+`session_id=` on either integration sets the token directly. With LiveKit Agents, EvalKit also reads the `evalkit.session` attribute of the participant you pass as `participant=`, or of the one the session is linked to. Test calls do not join LiveKit rooms yet; the attribute is reserved for when they do.
+
+For a bot that reads the start message itself, these helpers return the token, or `None`:
+
+```python
+token = (
+    evalkit.voice_session_from_url(websocket.query_params)   # or a URL or a query string
+    or evalkit.voice_session_from_twilio_start(message)      # text, bytes or parsed
+    or evalkit.voice_session_from_pcm16_start(message)
+)
+evalkit.voice_session_from_start_message(message)           # either format's start message
+evalkit.voice_session_from_livekit_participant(participant)
+```
+
+`evalkit.set_voice_session(token)` makes the token the call's session: every span recorded from there on in that task (the LLM calls, the HTTP calls) gets `session.id`, and the voice spans also get `evalkit.voice.v1.session`. Like `set_user`, it is scoped to the asyncio task and inherited by the tasks started after it, so call it before the pipeline or session starts. It returns a handle for `evalkit.clear_voice_session(handle)`. A value that cannot be a token (empty, over 512 characters, or with control characters) is ignored.
+
+If the bot also enables Pipecat's own OpenTelemetry tracing, pass the token as `PipelineWorker(..., conversation_id=token)`: Pipecat puts it on its conversation and turn spans as `conversation.id`, which EvalKit reads as the session too.
+
+### Why the frameworks' events, not their OpenTelemetry spans
+
+Both frameworks have OpenTelemetry tracing, and EvalKit receives OpenTelemetry spans, but neither framework's spans give the turn the test caller measures:
+
+- Pipecat's tracing is off unless the worker is built with `enable_tracing=True`. Its first `turn` span starts when the pipeline starts, a turn ends 2.5 seconds after the bot stops speaking unless the user speaks first, and the turn's transcripts and timings are on separate STT, LLM and TTS spans.
+- LiveKit Agents splits a turn into a `user_turn` and an `agent_turn` span, and has renamed span attributes between minor versions. With LiveKit Cloud observability on, its spans reach EvalKit only if `evalkit.init()` ran before `livekit.agents` was imported; otherwise LiveKit gives them a tracer provider of its own.
+
+The observer frames and session events the integrations use carry the times directly and have kept their names across versions.
+
+## Testing your voice bot
+
+`evalkit voice-test` tests a voice bot the way a caller would. It calls the bot over its WebSocket, plays a scripted caller, records both sides, and measures each call from the recording. The calls are then reported to SyntropyLabs, where the voice evaluators score them. The calls start in your process, so a bot on `localhost` or on a private network can be tested, on your machine or in CI.
+
+```bash
+pip install "syntropylabs-evalkit[voice]"     # adds numpy, websockets and webrtcvad
+```
+
+The `voice` extra is needed only for voice tests. `import evalkit` never loads it.
+
+### Run a test
+
+Check first that the bot is reachable and speaks the format. `check` needs no key and sends nothing to SyntropyLabs:
+
+```bash
+evalkit voice-test check --url ws://localhost:8765/ws --format pcm16 --sample-rate 16000
+```
+
+Then run a scenario set against it:
+
+```bash
+evalkit voice-test run --url ws://localhost:8765/ws --format pcm16 --sample-rate 16000 \
+    --scenario-set <scenarioSetId> --header "Authorization=Bearer $BOT_TOKEN"
+```
+
+A run takes these steps:
+
+1. It creates the run with your subscription key. SyntropyLabs answers with the plan: one call per scripted scenario and repeat, each with its own session token, and the caller's lines as speech synthesized on our side.
+2. It downloads each line's audio once and checks it against the plan's sha256. Clips are cached by hash, in `~/.cache/evalkit/voicetest/audio` (or `EVALKIT_VOICETEST_CACHE`, or `--cache-dir`), so a later run reuses them.
+3. It places the calls, at most as many at once as the plan allows. Each call carries its session token (see [The test call's session](#the-test-calls-session)), so the bot's own spans join the call's session.
+4. It analyses each call, uploads the recording through a short-lived signed URL (unless `--timing-only`), sends the call's `voice.call` trace, and posts the call's result.
+5. Once every call is reported, it completes the run and waits for the evaluators' verdict.
+
+Only scripted scenarios can be voice-tested; the API refuses a set of goal-based ones.
+
+| Option | Meaning |
+|---|---|
+| `--url` | The bot's `ws://` or `wss://` URL. |
+| `--format` | `twilio` (Twilio Media Streams messages, 8 kHz mu-law) or `pcm16` (raw 16-bit PCM in binary frames). |
+| `--sample-rate` | `pcm16` only: `8000`, `16000` (the default) or `24000`. |
+| `--header K=V` | A handshake header for the bot, repeatable, up to 10. |
+| `--scenario-set`, `--scenario` | The scenario set, and optionally only some of its scenarios (repeatable). |
+| `--repeats` | Calls per scenario (1 by default). |
+| `--agent` | Score the run under a registered agent. |
+| `--name` | The run's name. The default is `voice test <time>`. |
+| `--voice PROVIDER:MODEL:VOICE` | The caller's voice, for example `openai:tts-1:alloy`. The default is your organisation's. |
+| `--timing-only` | Upload no audio. Only the timings and the scorecards are sent. |
+| `--first-speaker` | Who opens each call, which sets how long the caller waits before its first line. `auto` (the API's default) hears out a greeting that starts within 3 s and otherwise speaks at 3 s; `bot` waits up to 15 s for the greeting to start; `caller` speaks at once. Use `caller` for a bot that waits to be spoken to, so no call starts with silence. |
+| `--out DIR` | Keep each call's recording, events and scorecard under `DIR/<runId>/call-NNN/`, and the run's summary in `DIR/<runId>/run.json`. Without it, they are deleted when the run ends. |
+| `--json` | Print one JSON object instead of the summary. |
+| `--key`, `--api-url` | The subscription key and API base. They are resolved like `evalkit eval`'s: `EVALKIT_API_KEY`, then `EVALKIT_SUBSCRIPTION_KEY`, then the stored coding config; and `EVALKIT_API_URL`, then `https://api.syntropylabs.ai`. |
+| `--wait-timeout` | How long to wait for the verdict after the last call, in seconds (600 by default). |
+| `--session-query-param`, `--no-start` | The query parameter that carries the session token (`evalkit_session` by default), and, for `pcm16`, not sending the `start` message. |
+
+The bot's headers and the URL's query are sent to the bot only. SyntropyLabs receives the URL as a label: its scheme, host and path. The subscription key goes only to the SyntropyLabs API. It never goes to the storage URLs, and it is never printed or logged.
+
+### What it prints, and the exit code
+
+Each call's figures are printed as it ends. They are the response delay (p50, p95 and per turn), talk-over, planned interruptions and how fast the bot stopped, the longest silence, and the caller's own health. A turn where the caller itself ran late is left out of the scores, and the summary says so. After the last call come the evaluators' results, the console link and the verdict:
+
+```
+call 0: refund for a duplicate charge (repeat 0), 6.2 s: ok
+  response delay   p50 646 ms, p95 646 ms; 2 of 2 turns answered; per turn 646 ms / 646 ms
+  talk-over        none
+  interruptions    none planned
+  longest silence  0 ms
+  caller           healthy (no late frames)
+  recording        uploaded (390 kB)
+...
+verdict: passed (exit 0)
+```
+
+| Exit code | Meaning |
+|---|---|
+| `0` | The run passed. |
+| `1` | The run failed: the evaluators' `passed` is false. |
+| `2` | A setup or network failure: a bad option, a missing key or extra, a run the API refused to create, a result that could not be sent, caller audio that could not be fetched or did not match its sha256, or a verdict that could not be read in time. |
+| `130` | The run was interrupted. |
+
+A call that fails does not stop the run. If the bot refuses the connection, hangs up before the script ends, or the call runs past the plan's `maxCallMs`, the call is reported with an `error` and the run goes on to the next call. `--json` prints `runId`, `consoleUrl`, `passed`, `verdict`, `exitCode`, `interrupted`, `problems`, `calls` (each with its `error`, its `figures` and its `recording`) and `run` (the API's own summary). Calls to the SyntropyLabs API that fail on the network or with a 5xx are retried with backoff. Creating the run is retried only when the server cannot have received it.
+
+Pressing Ctrl-C once stops new calls, and the calls in progress finish. Pressing it again, or sending SIGTERM, ends those calls at once. Either way each call is reported, with what was recorded, and calls that never started are reported as `not_run`. The run is then completed, so it does not stay open.
+
+### From Python
+
+```python
+import sys
+import evalkit.voicetest
+
+result = evalkit.voicetest.run(
+    "ws://localhost:8765/ws", format="pcm16", sample_rate=16000,
+    scenario_set="<scenarioSetId>", headers={"Authorization": "Bearer ..."},
+)
+print(result.verdict, result.console_url)
+sys.exit(result.exit_code)
+```
+
+`run()` takes its key from `subscription_key=`, else from the client `evalkit.init()` made, else from `EVALKIT_API_KEY` or `EVALKIT_SUBSCRIPTION_KEY`, and its API base from `api_url=`, `EVALKIT_API_URL`, then that client's `api_url`. The `voice.call` traces go through the `evalkit.init()` client when it sends under the run's key, and otherwise through a client of the run's own, which leaves your process's tracing as it was. It raises `VoiceTestSetupError` when the run cannot start. It returns a `VoiceTestRun` with `calls` (one `CallOutcome` each), `passed`, `verdict` and `exit_code`. `run_async()` is the same for code already inside an event loop. `evalkit.voicetest.check(url, format=...)` is the `check` command.
+
+### Local tools
+
+These need no backend:
+
+- `evalkit voice-test check` makes one short call. It reports whether the bot connected, whether it answered the line and how fast, the frames it sent that the format does not define, and hints such as "try `--format twilio`". `--first-speaker` sets the wait before the line, as for `run` (`auto` by default). It exits with `0` when the bot answered with no format errors, and `1` otherwise.
+- `evalkit voice-test call --script script.json --out DIR` runs one scripted call and writes `recording.wav` (two channels at 16 kHz: the caller as sent, the bot as heard), `events.jsonl` and `call.json`. `--analyse` also writes `scorecard.json`. A line's audio is a WAV file, the deterministic synthetic speech signal, or a plan's `audio`.
+- `evalkit voice-test refbot --format pcm16 --port 19500` runs the reference bot. Its delays, talk-over and interruptions are known, and it logs the ground truth, so you can try the caller with no bot of your own.
+
+`python -m evalkit.voicetest` takes the same commands.
 
 ## Trace your own code
 
@@ -1126,8 +1341,8 @@ evalkit.init(
 `capture_content=False` keeps every metric and drops every payload.
 
 - You keep tokens, cost, latency, TTFT, model, provider, finish reason, status, errors, tool names and call IDs, the span hierarchy, and `db.system`, `db.operation` and row counts.
-- You lose prompts, completions, thinking text, refusal text, request and response bodies and headers, tool arguments and results, traced-function arguments and return values, SQL text and bound parameters, retriever queries, and log message bodies.
-- The same holds for content other OpenTelemetry instrumentation puts on its spans, whatever its own content switch says: the GenAI conventions' `gen_ai.input.messages`, `gen_ai.output.messages`, `gen_ai.system_instructions`, `gen_ai.prompt`, `gen_ai.completion` and `gen_ai.retrieval.*` text, flattened message fields such as `gen_ai.prompt.0.content` and `llm.input_messages.0.message.content` (their role, tool name and finish reason stay), `input.value` and `output.value`, keys ending in `.observation.input`, `.trace.output` and the like, and the `content` and `message` of `gen_ai.*.message` and `gen_ai.choice` events.
+- You lose prompts, completions, thinking text, refusal text, request and response bodies and headers, tool arguments and results, traced-function arguments and return values, SQL text and bound parameters, retriever queries, log message bodies, and voice transcripts (`evalkit.voice.v1.transcript.*`).
+- The same holds for content other OpenTelemetry instrumentation puts on its spans, whatever its own content switch says: the GenAI conventions' `gen_ai.input.messages`, `gen_ai.output.messages`, `gen_ai.system_instructions`, `gen_ai.prompt`, `gen_ai.completion` and `gen_ai.retrieval.*` text, flattened message fields such as `gen_ai.prompt.0.content` and `llm.input_messages.0.message.content` (their role, tool name and finish reason stay), `input.value` and `output.value`, keys ending in `.observation.input`, `.trace.output` and the like, LiveKit Agents' `lk.pii.*` attributes, and the `content` and `message` of `gen_ai.*.message` and `gen_ai.choice` events.
 
 Stripped spans carry `evalkit.content_captured=false`, so the dashboard can tell "capture is off" apart from "the SDK failed to read the body".
 
@@ -1318,7 +1533,7 @@ The SDK sends spans to `{base_url}/v1/ingest` with your key in the `X-Subscripti
 
 | Variable | Effect |
 | --- | --- |
-| `EVALKIT_API_URL` | Sets the control-plane base for `Eval()`, feedback, prompts, `generate_scenarios()`, the live simulated user of `simulate_user()` and `evaluate_simulation()`. It does not change where traces go. |
+| `EVALKIT_API_URL` | Sets the control-plane base for `Eval()`, feedback, prompts, `generate_scenarios()`, the live simulated user of `simulate_user()`, `evaluate_simulation()` and voice test runs. It does not change where traces go, except a voice test run's own `voice.call` traces. |
 | `EVALKIT_CAPTURE_CONTENT` | `false` drops payloads. See [Content capture and masking](#content-capture-and-masking). |
 | `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` | The same, read after `EVALKIT_CAPTURE_CONTENT` |
 | `EVALKIT_CAPTURE_SECRETS` | `1` turns off secret masking. |
@@ -1334,6 +1549,7 @@ The SDK sends spans to `{base_url}/v1/ingest` with your key in the `X-Subscripti
 | `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` | The share of traces kept when `sample_rate` is not passed. See [Configuration](#configuration). |
 | `OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT`, `OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT` | The most one value keeps, in bytes, when lower than `max_value_bytes` |
 | `EVALKIT_IGNORE_ROUTES`, `EVALKIT_IGNORE_URLS`, `EVALKIT_IGNORE_FUNCTIONS` | Comma-separated patterns added to `ignore_routes`, `ignore_urls` and `ignore_functions`. See [Keeping things out of traces](#keeping-things-out-of-traces). |
+| `EVALKIT_VOICETEST_CACHE` | Where `evalkit voice-test` keeps downloaded caller audio. See [Testing your voice bot](#testing-your-voice-bot). |
 
 An argument to `init()` or to the function wins over its environment variable, except for the `EVALKIT_IGNORE_*` lists, which are added to the options. The capture variables and `EVALKIT_EXPORT_GZIP` accept `1`, `true`, `yes` or `on`, and `0`, `false`, `no` or `off`. For any other value, EvalKit logs a warning and keeps the default.
 
