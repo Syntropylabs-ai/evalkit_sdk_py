@@ -286,3 +286,81 @@ def test_a_quota_refusal_is_not_waited_out():
     error = HttpError("POST", "http://x", 429, "daily voice test quota reached")
     assert not error.retryable
     assert HttpError("POST", "http://x", 429, "slow down", retry_after_s=2).retryable
+
+
+# A dynamic call (RUN_API section 3.3): the opening as line 0, and the loop's rules.
+DYNAMIC = dict(PLAN, caller={"provider": "google", "model": "gemini-2.5-flash", "keySource": "platform"},
+               platformMinutesLeft=87, calls=[dict(PLAN["calls"][0], script={
+                   "mode": "dynamic", "maxCallMs": 300000,
+                   "lines": [dict(PLAN["calls"][0]["script"]["lines"][0],
+                                  wait={"rule": "bot_done", "startWithinMs": 3000, "silenceMs": 700, "maxMs": 15000})],
+                   "turns": {"max": 8, "wait": {"rule": "bot_done", "silenceMs": 700, "maxMs": 15000},
+                             "interrupt": {"turn": 2, "afterBotMs": 1500}},
+                   "end": {"afterLastLine": "bot_done"}})])
+
+
+def test_a_dynamic_plan_becomes_a_dynamic_script():
+    plan = parse_plan(DYNAMIC)
+    assert plan.caller == {"provider": "google", "model": "gemini-2.5-flash", "keySource": "platform"}
+    assert plan.platform_minutes_left == 87
+    (call,) = plan.calls
+    assert call.mode == "dynamic"
+    script, _ = script_from_plan_call(call)
+    assert script.dynamic and len(script.lines) == 1
+    turns = script.turns
+    assert (turns.max, turns.wait.mode, turns.wait.silence_ms, turns.wait.max_ms) == (8, "bot_done", 700, 15000)
+    assert (turns.interrupt_turn, turns.interrupt_after_bot_ms) == (2, 1500)
+    assert script.raw["mode"] == "dynamic" and script.raw["turns"]["interrupt"] == {"turn": 2, "after_bot_ms": 1500}
+
+
+def test_fields_a_newer_server_adds_to_turns_are_left_out():
+    call = dict(PLAN["calls"][0], script=dict(PLAN["calls"][0]["script"], mode="dynamic",
+                                              turns={"max": 2, "voiceStyle": "warm"}))
+    script, _ = script_from_plan_call(call)
+    assert script.turns.max == 2 and script.raw["turns"] == {"max": 2}
+
+
+def test_a_scripted_plan_with_or_without_mode_keeps_the_script_as_before():
+    plain, _ = script_from_plan_call(PLAN["calls"][0])
+    marked, _ = script_from_plan_call(dict(PLAN["calls"][0], script=dict(PLAN["calls"][0]["script"], mode="scripted")))
+    assert not plain.dynamic and plain.turns is None and "mode" not in plain.raw
+    assert marked.raw == plain.raw
+    assert parse_plan(PLAN).caller is None and parse_plan(PLAN).platform_minutes_left is None
+    assert parse_plan(dict(PLAN, caller="x", platformMinutesLeft=True)).caller is None
+
+
+@pytest.mark.parametrize("script, message", [
+    ({"mode": "live"}, "not one this caller plays"),
+    ({"mode": "dynamic", "turns": {"max": 21}}, "turns.max must be a whole number from 1 to 20"),
+    ({"mode": "dynamic", "turns": {"max": 2, "interrupt": {"turn": 3, "afterBotMs": 5}}}, "from 1 to turns.max"),
+])
+def test_a_dynamic_script_that_cannot_run_is_refused(script, message):
+    call = dict(PLAN["calls"][0], script=dict(PLAN["calls"][0]["script"], **script))
+    with pytest.raises(ScriptError, match=message):
+        script_from_plan_call(call)
+
+
+def test_the_turn_request_scrubs_the_keys_it_carries():
+    with FakeVoiceApi(answer=lambda *a: {"status": 400, "message": "refused AIza-caller and sk-voice"}) as fake:
+        api = VoiceTestApi.with_subscription_key(fake.url, KEY, retry=FAST)
+        fake.plan = {"calls": [{"callIndex": 0, "script": {"turns": {"max": 2}}}]}
+        fake.next_turn[0] = 1
+        import base64
+        import io
+        import wave
+
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(16000)
+            w.writeframes(b"\0\0" * 1600)
+        with pytest.raises(VoiceTestApiError) as info:
+            api.next_turn("r1", 0, 1, 0, {"data": base64.b64encode(buf.getvalue()).decode(), "durationMs": 100},
+                          {"caller": "AIza-caller", "voice": "sk-voice", "unused": None})
+        assert info.value.status == 400
+        assert "AIza-caller" not in str(info.value) and "sk-voice" not in str(info.value)
+        assert info.value.server_message == "refused *** and ***"
+        (sent,) = fake.turn_requests
+        assert sent["keys"] == {"caller": "AIza-caller", "voice": "sk-voice"}
+        assert len(fake.requests_to(r"POST /v1/voice-tests/r1/calls/0/turns")) == 1  # one attempt: the caller retries

@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import io
 import json
+import re
 import os
 import signal
 import subprocess
@@ -363,7 +364,9 @@ def test_cli_run_prints_a_summary_and_exits_0_when_it_passes(tmp_path):
             out, err = proc.communicate(timeout=120)
             assert proc.returncode == 0, out + err
             assert "call 0: refund for a duplicate charge (repeat 0)" in out
-            assert "response delay   p50 5" in out and "talk-over        none" in out
+            # The figure is measured live against the refbot, so a busy machine moves it; its accuracy
+            # is the calibration's to prove, and this test checks the summary's shape.
+            assert re.search(r"response delay   p50 \d[\d,]* ms", out) and "talk-over        none" in out
             assert "caller           healthy" in out and "recording        uploaded" in out
             assert "voice_response_delay  1.00  passed  p95 840 ms, limit 1,200 ms, 0 of 2 turns over" in out
             assert "console: https://console.example/voice/run000" in out
@@ -475,6 +478,26 @@ def test_check_waits_before_its_line_as_the_first_speaker_says():
             parser.parse_args(base + ["--first-speaker", "nobody"])
     assert parser.parse_args(commands["check"]).first_speaker == "auto"
     assert parser.parse_args(commands["run"]).first_speaker is None  # left to the API's default
+
+
+@pytest.mark.parametrize("bot_format,check_format,first_hint", [
+    ("twilio", "pcm16", "nothing usable came back in pcm16 at 16000 Hz: try --format twilio, or another "
+                        "--sample-rate (8000 or 24000); then check the endpoint path (/media)"),
+    ("pcm16", "twilio", "nothing usable came back in the twilio format: try --format pcm16 with "
+                        "--sample-rate 8000, 16000 or 24000; then check the endpoint path (/media)"),
+])
+async def test_check_in_the_wrong_format_suggests_the_other_format_first(bot_format, check_format, first_hint):
+    from evalkit.voicetest.check import check_async
+
+    # The reference bot, like many bots, waits for a start message of its own format and sends nothing.
+    port = _port()
+    async with RefBotServer(Behaviour.from_json(BEHAVIOUR), bot_format, port=port, sample_rate=16000):
+        found = await check_async(Target(url=f"ws://127.0.0.1:{port}/media?{BOT_QUERY}", format=check_format),
+                                  answer_timeout_ms=1000, first_speaker="caller")
+    assert found["connected"] and not found["ok"] and found["botChunks"] == 0
+    assert found["hints"][0] == first_hint
+    assert found["hints"][1].startswith("the bot sent no audio: if the format and path are right")
+    assert all("botsecret" not in hint for hint in found["hints"])
 
 
 async def test_check_names_a_format_mix_up_and_an_unreachable_bot(tmp_path):

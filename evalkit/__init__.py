@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple
 
 from ._version import SDK_VERSION
+from .core.api import ApiError
 from .core.client import EvalKitClient
 from .core.config import changed_options, config_problems, disabled_by_env, resolve_log_level
 from .core.context import (
@@ -178,6 +179,7 @@ __all__ = [
     "EvalKitLogFilter",
     "EvalKitClient",
     "EvalKitOptions",
+    "ApiError",
     "SpanContext",
     "TraceEnvelope",
     "SpanEvent",
@@ -196,6 +198,22 @@ def _get_instance() -> EvalKitClient:
     if _instance is None:
         raise RuntimeError("[evalkit] call evalkit.init() before using the SDK")
     return _instance
+
+
+_voice_uninit_warned = False
+
+
+def _voice_instance(what: str) -> Optional[EvalKitClient]:
+    """The client a voice hook records with, or None when the SDK is a no-op or ``evalkit.init()`` was
+    never called. A voice bot that skips ``init`` where it has no key takes its calls untraced rather than
+    dropping them. Warns once."""
+    global _voice_uninit_warned
+    if _instance is None:
+        if not _voice_uninit_warned:
+            _voice_uninit_warned = True
+            _log.warning("evalkit.%s: evalkit.init() was not called, so calls run untraced.", what)
+        return None
+    return _instance if _instance.enabled else None
 
 
 def _warn_if_reconfigured(options: Dict[str, Any]) -> None:
@@ -785,9 +803,9 @@ def instrument_pipecat(
 ) -> Any:
     """Add a ``pipecat_observer`` to a ``PipelineWorker`` (``PipelineTask`` before Pipecat 1.3) before
     it runs, and return it. Returns None, with a warning, when it cannot take one; the pipeline then
-    runs untraced. Does nothing when the SDK is a no-op."""
-    instance = _get_instance()
-    if not instance.enabled:
+    runs untraced. Does nothing when the SDK is a no-op or ``evalkit.init()`` was not called."""
+    instance = _voice_instance("instrument_pipecat")
+    if instance is None:
         return None
     try:
         from .instrumentation.voice.pipecat_ai import instrument_pipecat as _instrument_pipecat
@@ -810,13 +828,13 @@ def instrument_livekit_agents(
 ) -> Any:
     """Record a LiveKit Agents ``AgentSession`` as a ``voice.session`` trace with one ``voice.turn``
     span per bot turn. Call it before ``await session.start(...)``; it returns the hooks, or None
-    when the SDK is a no-op or the session cannot be listened to.
+    when the SDK is a no-op, ``evalkit.init()`` was not called, or the session cannot be listened to.
 
     The test session token is ``session_id``, else the one ``set_voice_session`` set, else the
     ``evalkit.session`` attribute of ``participant`` or of the participant the session links to.
     """
-    instance = _get_instance()
-    if not instance.enabled:
+    instance = _voice_instance("instrument_livekit_agents")
+    if instance is None:
         return None
     try:
         from .instrumentation.voice.livekit_agents import instrument_livekit_agents as _instrument_livekit

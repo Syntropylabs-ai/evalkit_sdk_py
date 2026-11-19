@@ -74,6 +74,13 @@ class PlannedCall:
         )
 
 
+    @property
+    def mode(self) -> str:
+        """``dynamic`` when the call asks for its lines during the call (RUN_API section 3.4), else
+        ``scripted``: a plan without ``mode`` is scripted."""
+        return "dynamic" if str(self.script.get("mode") or "").strip().lower() == "dynamic" else "scripted"
+
+
 @dataclass
 class RunPlan:
     run_id: str
@@ -82,6 +89,12 @@ class RunPlan:
     max_call_ms: Optional[int] = None
     max_concurrent_calls: int = 1
     raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+    # The model that decides a dynamic call's lines, as `{provider, model, keySource}` (`keySource`
+    # `request`, `organization` or `platform`); None when no call is dynamic.
+    caller: Optional[Dict[str, Any]] = None
+    # The organization's SyntropyLabs model minutes left this month; None when its plan has none, -1
+    # when they are unlimited.
+    platform_minutes_left: Optional[float] = None
 
     @property
     def limits(self) -> Dict[str, Any]:
@@ -106,6 +119,8 @@ def parse_plan(body: Mapping[str, Any]) -> RunPlan:
     if len(set(indices)) != len(indices):
         raise PlanError("the plan repeats a callIndex")
     console = _pick(body, "consoleUrl", "console_url")
+    caller = body.get("caller")
+    minutes = _pick(body, "platformMinutesLeft", "platform_minutes_left")
     return RunPlan(
         run_id=run_id,
         calls=sorted(calls, key=lambda c: c.call_index),
@@ -113,6 +128,10 @@ def parse_plan(body: Mapping[str, Any]) -> RunPlan:
         max_call_ms=_int(max_call, "limits.maxCallMs", 1) if max_call is not None else None,
         max_concurrent_calls=max(1, _int(concurrent, "limits.maxConcurrentCalls", 1)),
         raw=dict(body),
+        # Read, never relied on: a plan from a server without them still runs.
+        caller=dict(caller) if isinstance(caller, Mapping) else None,
+        platform_minutes_left=(minutes if isinstance(minutes, (int, float)) and not isinstance(minutes, bool)
+                               else None),
     )
 
 
@@ -155,16 +174,45 @@ def _line(raw: Any, index: int) -> Dict[str, Any]:
     return out
 
 
+def _turns(raw: Any) -> Dict[str, Any]:
+    """A dynamic script's ``turns`` (RUN_API section 3.3) in the script format."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        raise ScriptError("turns: must be an object")
+    out: Dict[str, Any] = {}
+    if raw.get("max") is not None:
+        out["max"] = raw["max"]
+    wait = _wait_rule(raw.get("wait"))
+    if wait is not None:
+        out["wait"] = wait
+    interrupt = raw.get("interrupt")
+    if interrupt is not None:
+        if not isinstance(interrupt, Mapping):
+            raise ScriptError("turns.interrupt: must be {turn, afterBotMs}")
+        out["interrupt"] = {"turn": interrupt.get("turn"),
+                            "after_bot_ms": _pick(interrupt, "afterBotMs", "after_bot_ms", 0)}
+    return out
+
+
 def script_json_from_plan(script: Mapping[str, Any], *, name: str = "",
                           max_call_ms: Optional[int] = None) -> Dict[str, Any]:
     """A plan call's ``script`` in the caller's script format. `max_call_ms` (the run's limit) caps
-    the script's own ``maxCallMs``."""
+    the script's own ``maxCallMs``. A dynamic script keeps its ``mode`` and ``turns``; a scripted one is
+    written without ``mode``, as before there was one."""
     if not isinstance(script, Mapping):
         raise ScriptError("a script must be a JSON object")
     lines = script.get("lines")
     if not isinstance(lines, list) or not lines:
         raise ScriptError("a script needs a non-empty lines list")
+    mode = str(script.get("mode") or "scripted").strip().lower()
+    if mode not in ("scripted", "dynamic"):
+        # A call this caller cannot play: refused as invalid_script rather than played wrongly.
+        raise ScriptError(f"the script's mode {mode!r} is not one this caller plays (scripted, dynamic)")
     out: Dict[str, Any] = {"lines": [_line(raw, i) for i, raw in enumerate(lines)]}
+    if mode == "dynamic":
+        out["mode"] = "dynamic"
+        out["turns"] = _turns(script.get("turns"))
     title = script.get("name") or name
     if title:
         out["name"] = str(title)

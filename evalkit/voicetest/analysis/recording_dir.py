@@ -55,6 +55,12 @@ class RecordingDir:
         return None
 
     @property
+    def mode(self) -> str:
+        """``dynamic`` when the call asked for its lines during the call (CONTRACT section 4.1)."""
+        script = self.call.get("script") if isinstance(self.call.get("script"), dict) else {}
+        return "dynamic" if script.get("mode") == "dynamic" else "scripted"
+
+    @property
     def vad_version(self) -> Optional[str]:
         vad = self.call.get("vad")
         if isinstance(vad, dict) and isinstance(vad.get("version"), str):

@@ -4,7 +4,8 @@ No backend is involved. The caller connects, waits for a greeting as the bot's f
 (the same waits a run's plan gives line 0), says one synthetic line, and waits for an answer; the call
 is then analysed like any other, so "answered" means speech the analysis found on the bot's channel
 after the line, not merely bytes on the socket. Frames the format does not define are listed, with a
-hint when they look like the other format.
+hint when they look like the other format. When nothing usable comes back (no audio, or audio with no
+speech in it), the first hint is the other format, the other pcm16 rates and the endpoint path.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import os
 import shutil
 import tempfile
 from typing import Any, Dict, List, Mapping, Optional
+from urllib.parse import urlsplit
 
 log = logging.getLogger("evalkit.voicetest.check")
 
@@ -38,20 +40,38 @@ def check_script(answer_timeout_ms: int, first_speaker: str = "auto") -> Dict[st
     }
 
 
+def _rates(rates: List[int]) -> str:
+    names = [str(r) for r in rates]
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " or " + names[-1]
+
+
+def _format_hint(fmt: str, sample_rate: int, path: str) -> str:
+    """What to try when nothing usable came back. A bot spoken to in the wrong format usually sends
+    nothing at all, since it waits for a start message of its own format, so the other format comes
+    first; a pcm16 bot at another rate sends audio the analysis hears no speech in."""
+    from .audio import SUPPORTED_RATES
+
+    if fmt == "pcm16":
+        others = [r for r in SUPPORTED_RATES if r != sample_rate]
+        return (f"nothing usable came back in pcm16 at {sample_rate} Hz: try --format twilio, or "
+                f"another --sample-rate ({_rates(others)}); then check the endpoint path ({path})")
+    return (f"nothing usable came back in the twilio format: try --format pcm16 with --sample-rate "
+            f"{_rates(list(SUPPORTED_RATES))}; then check the endpoint path ({path})")
+
+
 def _hints(fmt: str, details: List[str], chunks: int, speech: bool, answered: bool,
-           sample_rate: int) -> List[str]:
+           sample_rate: int, path: str = "/") -> List[str]:
     hints: List[str] = []
     joined = " ".join(details)
     if fmt == "pcm16" and ("event " in joined or "not a JSON object" in joined):
         hints.append("the bot sends JSON events, as Twilio Media Streams does: try --format twilio")
     if fmt == "twilio" and "binary frame" in joined:
         hints.append("the bot sends binary audio frames: try --format pcm16")
-    if chunks and not speech:
-        hints.append("the bot sent audio but no speech was found in it: check the format, and for "
-                     f"pcm16 the sample rate (--sample-rate, now {sample_rate})")
+    if not (chunks and speech) and not hints:
+        hints.append(_format_hint(fmt, sample_rate, path))
     if not chunks:
-        hints.append("the bot sent no audio: check that it answers on this URL and path, and any "
-                     "--header it needs")
+        hints.append("the bot sent no audio: if the format and path are right, check that it answers "
+                     "on this URL and any --header it needs")
     elif speech and not answered:
         hints.append("the bot spoke, but not after the caller's line: it may not hear the caller "
                      "(format or sample rate), or need longer (--timeout)")
@@ -107,7 +127,8 @@ async def check_async(target: Any, *, answer_timeout_ms: int = 8000, out_dir: Op
         result["answered"] = delay is not None
         result["responseDelayMs"] = delay
         result["hints"] = _hints(target.format, [str(d) for d in unknown], len(chunks),
-                                 result["botSpeech"], result["answered"], target.sample_rate)
+                                 result["botSpeech"], result["answered"], target.sample_rate,
+                                 urlsplit(target.url).path or "/")
         result["ok"] = bool(result["answered"] and not unknown and not call.errors
                             and call.ended_by in ("script", "bot_closed"))
         if keep:

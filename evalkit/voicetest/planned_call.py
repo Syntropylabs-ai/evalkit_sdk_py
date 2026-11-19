@@ -43,8 +43,12 @@ ERROR_KINDS = (
     "not_run",
     "caller_error",
     "analysis_failed",
+    "caller_turn_failed",
 )
-SETUP_ERROR_KINDS = frozenset({"invalid_script", "audio_unavailable", "caller_error", "analysis_failed"})
+# A dynamic call whose next line could not be had says nothing about the bot either: the turn endpoint,
+# or the caller's model key behind it, failed.
+SETUP_ERROR_KINDS = frozenset({"invalid_script", "audio_unavailable", "caller_error", "analysis_failed",
+                               "caller_turn_failed"})
 # A call runs to its own maxCallMs; this is only the backstop for a socket that will not close.
 GUARD_MS = 60_000
 _MESSAGE_CAP = 1000
@@ -63,6 +67,8 @@ class CallOutcome:
     scenario_name: str = ""
     scenario_id: Optional[str] = None
     repeat: int = 0
+    # "scripted" or "dynamic" (RUN_API section 3.3)
+    mode: str = "scripted"
     out_dir: Optional[str] = None
     ended_by: Optional[str] = None
     duration_ms: Optional[int] = None
@@ -102,6 +108,20 @@ class CallOutcome:
             "error": self.error,
         }
 
+    @property
+    def transcript(self) -> Optional[List[Dict[str, Any]]]:
+        """A dynamic call's conversation (CONTRACT section 5): ``[{turn, role, text}]``, the bot's turns as
+        the turn endpoint heard them. None for a scripted call."""
+        value = ((self.scorecard or {}).get("call") or {}).get("transcript")
+        return list(value) if isinstance(value, list) else None
+
+    @property
+    def turns_taken(self) -> Optional[int]:
+        """A dynamic call's caller lines after the opening; None for a scripted call."""
+        if self.mode != "dynamic" or not self.scorecard:
+            return None
+        return max(0, len(self.scorecard.get("turns") or []) - 1)
+
     def figures(self) -> Dict[str, Any]:
         call = (self.scorecard or {}).get("call") or {}
         keys = ("first_word_ms", "response_delay_p50_ms", "response_delay_p95_ms", "talk_over_ms",
@@ -115,12 +135,15 @@ class CallOutcome:
             "scenarioId": self.scenario_id,
             "scenarioName": self.scenario_name,
             "repeat": self.repeat,
+            "mode": self.mode,
             "sessionToken": self.session_token,
             "endedBy": self.ended_by,
             "durationMs": self.duration_ms,
             "error": self.error,
             "callerHealthy": self.caller_healthy if self.scorecard else None,
             "figures": self.figures(),
+            "turnsTaken": self.turns_taken,
+            "transcript": self.transcript,
             "recording": self.recording,
             "traceId": self.trace_id,
             "reported": self.reported,
@@ -158,6 +181,9 @@ def _classify(result: Any, script: Script) -> Optional[Dict[str, str]]:
                                   "script ended")
     if ended == "aborted":
         return _error("aborted", "the run was interrupted during this call")
+    if ended == "turn_failed":
+        return _error("caller_turn_failed", getattr(result, "turn_failure", None)
+                      or "the next caller line could not be had from the turn endpoint")
     if ended == "bot_closed":
         spoken = sum(1 for e in result.events if e.get("type") == "line_end")
         if spoken >= len(script.lines):
@@ -238,6 +264,7 @@ async def run_planned_call(
     executor: Any = None,
     analysis_executor: Any = None,
     trace_flush_timeout_s: float = 10.0,
+    turn_keys: Optional[Mapping[str, Optional[str]]] = None,
 ) -> CallOutcome:
     """Runs one plan call (a RUN_API section 3.3 ``calls[]`` entry, or a `PlannedCall`) against
     `target` and reports it through `api`. Never raises for the call's own failures: they come back
@@ -254,6 +281,10 @@ async def run_planned_call(
     - `slots`: semaphores held for the live part of the call only (the run's and, say, a pod's limit
       on calls at once); `may_start` is asked once they are held.
     - `sources`/`audio_cache`: line sources shared by the run's calls, so audio is fetched once.
+    - A dynamic call (``script.mode: dynamic``) asks `api` for each line after the opening, with the
+      same credential (RUN_API section 4.1). `turn_keys` are the request keys an SDK run was created
+      with (``caller``, ``voice``), sent again with every turn and kept out of every message; a hosted
+      run has none.
 
     Raises PlanError only when `call` itself is malformed (no callIndex, sessionToken or script),
     since there is then no call to report against.
@@ -269,6 +300,7 @@ async def run_planned_call(
         scenario_name=planned.scenario_name,
         scenario_id=planned.scenario_id,
         repeat=planned.repeat,
+        mode=planned.mode,
         out_dir=str(out_dir),
     )
     if connector is not None:
@@ -282,6 +314,16 @@ async def run_planned_call(
                                                sources=sources)
     except (PlanError, ScriptError) as exc:
         outcome.error = _error("invalid_script", str(exc))
+    turn_client = None
+    if script is not None and script.dynamic:
+        if api is None:
+            outcome.error = _error("invalid_script", "a dynamic call asks the turn endpoint for its lines, and "
+                                                     "no API was given to ask")
+            script = None
+        else:
+            from .turns import TurnClient
+
+            turn_client = TurnClient(api, run_id, planned.call_index, turn_keys, executor)
     if script is not None:
         try:
             await loop.run_in_executor(executor, prepare_script_audio, script, chosen, target.sample_rate)
@@ -304,7 +346,7 @@ async def run_planned_call(
                 try:
                     result = await asyncio.wait_for(
                         run_call(target, script, str(out_dir), session=planned.session_token,
-                                 sources=chosen, stop=stop),
+                                 sources=chosen, stop=stop, turn_client=turn_client),
                         guard_s,
                     )
                 except CallError as exc:
@@ -326,6 +368,7 @@ async def run_planned_call(
                     outcome.ended_by = result.ended_by
                     outcome.duration_ms = result.duration_ms
                     outcome.error = _classify(result, script)
+                    outcome.problems.extend(getattr(result, "warnings", None) or [])
         finally:
             for slot in reversed(held):
                 slot.release()

@@ -166,6 +166,20 @@ def test_interruption_while_the_bot_is_silent():
     assert t["interruption_overlap_ms"] == 0
 
 
+def test_an_interruption_the_bot_never_reached_is_scored_as_a_normal_turn():
+    # The bot answered line 0 in 600 ms, short of the planned 2,000 ms, so line 1 was said 700 ms after.
+    planned = {"planned_interruption": True, "after_bot_ms": 2000, "interruption_status": "not_reached",
+               "bot_spoke_ms": 600}
+    tl = _timeline([(1000, 2000, {}), (3300, 4300, planned)], duration=9000)
+    turns, call = _one(tl, [(2000, 2600), (4800, 5400)])
+    t = turns[1]
+    assert t["interruption_planned"] is True and t["interruption_status"] == "not_reached"
+    assert t["interruption_bot_spoke_ms"] == 600
+    assert t["interruption_stop_ms"] is None and t["interruption_overlap_ms"] == 0
+    assert call["interruption_count"] == 1 and call["interruption_not_reached_count"] == 1
+    assert call["interruption_stop_p50_ms"] is None
+
+
 def test_a_bot_restarting_during_an_interruption_is_talk_over():
     planned = {"planned_interruption": True, "after_bot_ms": 500}
     tl = _timeline([(1000, 2000, {}), (3000, 5000, planned)], duration=9000)
@@ -214,9 +228,36 @@ def test_silence_counts_dead_air_but_not_the_wait_before_the_first_word_or_think
     assert t["silences"] == [[5800, 9300]]
     assert t["silence_ms"] == 3500
     assert call["max_silence_ms"] == 3500
-    # Without the think event the 4,100 ms before line 1 would count too.
+    # The 4,100 ms between the bot's last word and line 1 is the caller's, think event or not.
     tl.think_ms = {}
-    assert compute_turns(tl, bot)[0]["silence_ms"] == 3500 + 4100
+    assert compute_turns(tl, bot)[0]["silence_ms"] == 3500
+
+
+def test_the_callers_own_waits_are_not_silence_but_the_bot_going_quiet_mid_reply_is():
+    # Line 0 waits fixed 6 s after the bot's short answer, line 1 waits with silenceMs 5000, and the call
+    # ends 8 s after the bot's last answer: every long gap follows the bot's last word in its turn.
+    tl = _timeline(
+        [(0, 1000, {}), (8500, 9500, {}), (16000, 17000, {})],
+        duration=27000,
+        waits=[(1000, 8500, 1), (9500, 16000, 2), (17000, 27000, 3)],
+    )
+    bot = [(1500, 2500), (10000, 11000), (17500, 19000)]
+    turns, call = _one(tl, bot)
+    assert [t["silence_ms"] for t in turns] == [0, 0, 0]
+    assert call["max_silence_ms"] == 0
+    # The bot stops for 3,600 ms in the middle of its answer to line 2: that gap is the bot's.
+    turns, call = _one(tl, [(1500, 2500), (10000, 11000), (17500, 18400), (22000, 23000)])
+    assert [t["silence_ms"] for t in turns] == [0, 0, 3600]
+    assert turns[2]["silences"] == [[18400, 22000]]
+    assert call["max_silence_ms"] == 3600
+
+
+def test_a_talk_over_does_not_pull_the_response_gap_into_the_reply():
+    # The bot says something while the caller speaks, then answers 4 s after the line ends.
+    tl = _timeline([(1000, 3000, {})], duration=12000)
+    turns, _ = _one(tl, [(1500, 1800), (7000, 8000)])
+    assert turns[0]["response_delay_ms"] == 4000 and turns[0]["talk_over_count"] == 1
+    assert turns[0]["silence_ms"] == 0
 
 
 def test_gaps_of_exactly_three_seconds_are_not_silence():
@@ -267,3 +308,98 @@ def test_timeline_from_caller_events():
     assert tl.pacing == [(2400, 7)]
     assert tl.queue_depths_ms == [900] and tl.bot_chunk_count == 1
     assert tl.clears == [(3100, 640)] and tl.errors == ["boom"]
+
+
+def test_a_planned_interruptions_status_comes_from_why_its_wait_ended():
+    events = [
+        {"t": 0, "type": "line_start", "index": 0, "text": "a"},
+        {"t": 1000, "type": "line_end", "index": 0, "text": "a"},
+        {"t": 1000, "type": "wait_start", "index": 1, "reason": "interrupt", "after_bot_ms": 500},
+        {"t": 1000, "type": "interrupt_planned", "index": 1, "after_bot_ms": 500},
+        {"t": 2200, "type": "wait_end", "index": 1, "reason": "interrupt"},
+        {"t": 2200, "type": "line_start", "index": 1, "text": "b"},
+        {"t": 3000, "type": "line_end", "index": 1, "text": "b"},
+        {"t": 3000, "type": "wait_start", "index": 2, "reason": "interrupt", "after_bot_ms": 4000},
+        {"t": 3000, "type": "interrupt_planned", "index": 2, "after_bot_ms": 4000},
+        {"t": 5100, "type": "interrupt_not_reached", "index": 2, "bot_spoke_ms": 900},
+        {"t": 5100, "type": "wait_end", "index": 2, "reason": "bot_done"},
+        {"t": 5100, "type": "line_start", "index": 2, "text": "c"},
+        {"t": 6000, "type": "line_end", "index": 2, "text": "c"},
+        {"t": 6000, "type": "wait_start", "index": 3, "reason": "interrupt", "after_bot_ms": 500},
+        {"t": 6000, "type": "interrupt_planned", "index": 3, "after_bot_ms": 500},
+        {"t": 21000, "type": "wait_end", "index": 3, "reason": "max_wait"},
+        {"t": 21000, "type": "line_start", "index": 3, "text": "d"},
+        {"t": 22000, "type": "line_end", "index": 3, "text": "d"},
+    ]
+    tl = timeline_from_events(events, 23000)
+    assert [(l.interruption_status, l.bot_spoke_ms) for l in tl.lines] == [
+        (None, None), ("reached", None), ("not_reached", 900), ("max_wait", None),
+    ]
+    assert [(w.reason, w.end_reason) for w in tl.waits] == [
+        ("interrupt", "interrupt"), ("interrupt", "bot_done"), ("interrupt", "max_wait"),
+    ]
+    turns = compute_turns(tl, [(1200, 2500), (3500, 4400)])
+    assert [t["interruption_status"] for t in turns] == [None, "reached", "not_reached", "max_wait"]
+    assert turns[1]["interruption_stop_ms"] == 300
+    assert turns[2]["interruption_bot_spoke_ms"] == 900
+
+
+# --- dynamic calls ------------------------------------------------------------------------------------------
+
+def _dynamic_events():
+    """A dynamic call's caller events: the opening, then a line decided in 3.6 s while the bot, which had
+    answered, spoke again 3.2 s after its answer ended."""
+    return [
+        {"type": "line_start", "t": 0, "index": 0, "text": "Hi there."},
+        {"type": "line_end", "t": 800, "index": 0},
+        {"type": "turn_request", "t": 2600, "index": 1, "retake": 0, "attempt": 0},
+        {"type": "turn_failed", "t": 2900, "index": 1, "status": 429},
+        {"type": "turn_request", "t": 3900, "index": 1, "retake": 0, "attempt": 1},
+        {"type": "turn_answer", "t": 5000, "index": 1, "retake": 0, "heard": "How can I help?"},
+        {"type": "retake", "t": 5000, "index": 1, "bot_spoke_ms": 1100},
+        {"type": "turn_request", "t": 5000, "index": 1, "retake": 1, "attempt": 0},
+        {"type": "turn_answer", "t": 6200, "index": 1, "retake": 1, "heard": "How can I help? Hello?"},
+        {"type": "think", "t": 6200, "index": 1, "ms": 3600},
+        {"type": "line_start", "t": 6200, "index": 1, "text": "I was charged twice."},
+        {"type": "line_end", "t": 7400, "index": 1},
+        {"type": "turn_answer", "t": 10000, "index": 2, "retake": 0, "heard": "Refunded.", "final": True},
+    ]
+
+
+def test_a_dynamic_calls_think_time_is_never_silence_and_its_transcript_is_kept():
+    events = _dynamic_events()
+    # bot: answers 800-1900, then speaks again at 5100-5700 while the caller decides; answers line 1 at 8000
+    bot = [(1300, 1900), (5100, 5700), (8000, 9000)]
+    timeline = timeline_from_events(events, 10000, mode="dynamic")
+    turns = compute_turns(timeline, bot)
+    # the 3.2 s gap 1900-5100 lies inside the caller's think time (2600-6200) less 700 ms: not silence
+    assert [t["silence_ms"] for t in turns] == [0, 0]
+    undecided = compute_turns(timeline_from_events([e for e in events if e["type"] != "think"], 10000), bot)
+    assert undecided[0]["silence_ms"] == 3200  # the same gap, were it not the caller deciding
+    assert [t["heard"] for t in turns] == ["How can I help? Hello?", "Refunded."]
+    assert [t["caller_text"] for t in turns] == ["Hi there.", "I was charged twice."]
+    assert [t["caller"]["think_ms"] for t in turns] == [0, 3600]
+    assert [t["response_delay_ms"] for t in turns] == [500, 600]
+    call = compute_call(timeline, bot, turns)
+    assert call["mode"] == "dynamic"
+    assert call["transcript"] == [
+        {"turn": 0, "role": "caller", "text": "Hi there."},
+        {"turn": 0, "role": "bot", "text": "How can I help? Hello?"},
+        {"turn": 1, "role": "caller", "text": "I was charged twice.", "think_ms": 3600},
+        {"turn": 1, "role": "bot", "text": "Refunded."},
+    ]
+    health = compute_caller_health(timeline, turns)
+    assert (health["think_ms_p50"], health["think_ms_max"]) == (3600, 3600)
+    assert (health["turn_requests"], health["turn_failures"], health["retakes"]) == (2, 1, 1)
+    assert health["healthy"] is True  # deciding is not lateness
+
+
+def test_a_scripted_call_has_no_transcript_of_the_bot():
+    timeline = timeline_from_events([{"type": "line_start", "t": 0, "index": 0, "text": "Hi"},
+                                     {"type": "think", "t": 0, "index": 0, "ms": 0},
+                                     {"type": "line_end", "t": 500, "index": 0}], 3000)
+    turns = compute_turns(timeline, [(900, 1500)])
+    assert turns[0]["heard"] is None and turns[0]["caller_text"] == "Hi"
+    call = compute_call(timeline, [(900, 1500)], turns)
+    assert call["mode"] == "scripted" and call["transcript"] is None
+    assert compute_caller_health(timeline, turns)["think_ms_p50"] is None

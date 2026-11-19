@@ -59,14 +59,17 @@ def call_attributes(scorecard: Dict[str, Any], recording_uri: Optional[str] = No
     _put(attrs, "talk_over_count", call.get("talk_over_count"))
     _put(attrs, "max_silence_ms", call.get("max_silence_ms"))
     _put(attrs, "vad_version", (scorecard.get("vad") or {}).get("version"))
+    _put(attrs, "analysis_version", (scorecard.get("analysis") or {}).get("version"))
     _put(attrs, "recording_uri", recording_uri)
     _put(attrs, "caller_health", _caller_health_json(scorecard.get("caller_health") or {}))
     _put(attrs, "session", call.get("session"))
+    _put(attrs, "call.mode", call.get("mode"))
     return attrs
 
 
-def turn_attributes(turn: Dict[str, Any]) -> Dict[str, Any]:
-    """One ``voice.turn``'s attributes, named as in CONTRACT section 6."""
+def turn_attributes(turn: Dict[str, Any], mode: Optional[str] = None) -> Dict[str, Any]:
+    """One ``voice.turn``'s attributes, named as in CONTRACT section 6. `mode` is the call's: a dynamic
+    call's turns also carry the caller's think time."""
     attrs: Dict[str, Any] = {}
     caller = turn.get("caller") or {}
     bot = turn.get("bot") or {}
@@ -79,12 +82,15 @@ def turn_attributes(turn: Dict[str, Any]) -> Dict[str, Any]:
     _put(attrs, "talk_over_ms", turn.get("talk_over_ms"))
     _put(attrs, "caller_overlap_ms", turn.get("caller_overlap_ms"))
     _put(attrs, "interruption.planned", bool(turn.get("interruption_planned")))
+    _put(attrs, "interruption.status", turn.get("interruption_status"))
     _put(attrs, "interruption.stop_ms", turn.get("interruption_stop_ms"))
     _put(attrs, "silence_ms", turn.get("silence_ms"))
     _put(attrs, "caller_unhealthy", bool(turn.get("caller_unhealthy")))
-    _put(attrs, "transcript.caller", turn.get("text") or "")
-    # Empty until a post-call speech-to-text exists.
-    _put(attrs, "transcript.bot", turn.get("bot_transcript") or "")
+    _put(attrs, "transcript.caller", turn.get("caller_text") or turn.get("text") or "")
+    # What the turn endpoint heard the bot say (dynamic calls); empty for a scripted call.
+    _put(attrs, "transcript.bot", turn.get("heard") or turn.get("bot_transcript") or "")
+    if mode == "dynamic":
+        _put(attrs, "turn.think_ms", int(caller.get("think_ms") or 0))
     return attrs
 
 
@@ -147,6 +153,7 @@ def build_call_spans(
             **common,  # type: ignore[arg-type]
         )
     ]
+    mode = call.get("mode")
     for turn in scorecard.get("turns") or []:
         window = turn.get("window") or {}
         lo = int(window.get("start_ms", 0))
@@ -157,10 +164,12 @@ def build_call_spans(
                 trace_id=trace_id,
                 span_id=secrets.token_hex(8),
                 parent_span_id=root_id,
-                span_type="log",
+                # The bot's own voice.turn spans are "agent" spans; the caller's match them, and a
+                # leaf "log" row would be hidden by the waterfall's default log filter.
+                span_type="agent",
                 status="OK",
                 operation=TURN_SPAN,
-                attributes=attributes(turn_attributes(turn)),
+                attributes=attributes(turn_attributes(turn, mode)),
                 latency_ms=max(0, hi - lo),
                 start_time=start,
                 end_time=_iso(t0 + hi),

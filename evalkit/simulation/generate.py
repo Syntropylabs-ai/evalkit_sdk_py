@@ -38,10 +38,24 @@ def generate_scenarios(
     api_url: Optional[str] = None,
     scripted_turns: bool = False,
 ) -> List[Dict[str, Any]]:
-    """Writes scenarios for the agent. By default each carries what a live
-    simulated user plays from (persona, user_goal, hidden_info, success_criteria
-    and the opening message) and no later turns; scripted_turns=True writes
-    every user turn out instead, for replaying a conversation verbatim."""
+    """Writes scenarios for the agent and returns them. By default each carries
+    what a live simulated user plays from (persona, user_goal, hidden_info,
+    success_criteria and the opening message) and no later turns;
+    scripted_turns=True writes every user turn out instead, for replaying a
+    conversation verbatim.
+
+    The server saves nothing and returns no set id: keep the list, or pass it
+    on, for example to a voice test as inline scenarios with
+    ``evalkit.voicetest.run(url, format=..., scenarios=generate_scenarios(...,
+    scripted_turns=True))``.
+
+    The model: `model`, `provider` and `api_key` name one with your own key,
+    used for this request only (``provider="gemini"`` and ``"google"`` are the
+    same); `model` and `provider` alone use the organization's connection for
+    that provider; with none of them the organization's text model (under
+    Models in the console) is used. With none of those the API answers 400
+    saying both ways to fix it, raised as `evalkit.ApiError` with that message.
+    """
     from .. import _get_instance
 
     client = _get_instance()

@@ -27,7 +27,7 @@ class TestFunctionTracer(unittest.TestCase):
 
     def tearDown(self):
         sys.meta_path[:] = [
-            f for f in sys.meta_path if type(f).__name__ != "_EvalKitTracingFinder"
+            f for f in sys.meta_path if not getattr(f, "_evalkit_finder", False)
         ]
         functrace._installed = False
 
@@ -134,7 +134,7 @@ class TestFunctionTracer(unittest.TestCase):
         tmp = tempfile.mkdtemp()
         functrace.install_function_tracer(self.client, tmp)
         functrace.install_function_tracer(self.client, tmp)
-        finders = [f for f in sys.meta_path if type(f).__name__ == "_EvalKitTracingFinder"]
+        finders = [f for f in sys.meta_path if getattr(f, "_evalkit_finder", False)]
         self.assertEqual(len(finders), 1)
 
 

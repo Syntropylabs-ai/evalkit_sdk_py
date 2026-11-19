@@ -95,6 +95,13 @@ def test_spans_sit_at_the_recordings_times_and_carry_the_session():
     assert root.agent_name == ""
 
 
+def test_turns_are_agent_spans_like_the_bots_own():
+    # A leaf "log" row is hidden by the waterfall's default log filter; the bot's turns are "agent".
+    spans = build_call_spans(_scorecard(), recording_uri="file:///tmp/rec.wav")
+    turns = [s for s in spans if s.operation == "voice.turn"]
+    assert turns and all(s.span_type == "agent" for s in turns)
+
+
 def test_attribute_names_match_the_contract():
     card = _scorecard()
     attrs = call_attributes(card, "file:///tmp/rec.wav")
@@ -113,6 +120,15 @@ def test_attribute_names_match_the_contract():
     # No bot speech: the bot figures are absent, never null.
     assert NS + "response_delay_ms" not in third and NS + "bot.speech_start_ms" not in third
     assert third[NS + "caller_unhealthy"] is True
+
+
+def test_the_analysis_version_and_an_interruptions_status_are_carried_when_the_scorecard_has_them():
+    card = _scorecard()
+    card["analysis"] = {"version": "timing-v2"}
+    card["turns"][1]["interruption_status"] = "not_reached"
+    assert call_attributes(card)[NS + "analysis_version"] == "timing-v2"
+    assert turn_attributes(card["turns"][1])[NS + "interruption.status"] == "not_reached"
+    assert NS + "interruption.status" not in turn_attributes(card["turns"][0])
 
 
 def test_a_scorecard_without_t0_is_refused():
@@ -174,3 +190,20 @@ def test_without_a_client_it_needs_evalkit_init(monkeypatch):
     monkeypatch.setattr(evalkit, "_instance", None)
     with pytest.raises(RuntimeError, match="evalkit.init"):
         send_call_trace(_scorecard())
+
+
+def test_a_dynamic_calls_spans_carry_its_mode_what_the_bot_said_and_the_think_time():
+    card = _scorecard()
+    card["call"]["mode"] = "dynamic"
+    card["turns"][0].update(heard="How can I help?", caller_text="Hi there", caller={
+        **card["turns"][0]["caller"], "think_ms": 0})
+    card["turns"][1].update(heard="Refunded.", caller={**card["turns"][1]["caller"], "think_ms": 1640})
+    spans = build_call_spans(card)
+    assert spans[0].attributes[NS + "call.mode"] == "dynamic"
+    first, second = spans[1].attributes, spans[2].attributes
+    assert first[NS + "transcript.bot"] == "How can I help?" and first[NS + "transcript.caller"] == "Hi there"
+    assert (first[NS + "turn.think_ms"], second[NS + "turn.think_ms"]) == (0, 1640)
+    card["call"]["mode"] = "scripted"
+    scripted = build_call_spans(card)
+    assert scripted[0].attributes[NS + "call.mode"] == "scripted"
+    assert NS + "turn.think_ms" not in scripted[2].attributes

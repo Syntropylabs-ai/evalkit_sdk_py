@@ -12,7 +12,10 @@ import os
 from typing import Any, Dict, List, Optional, Sequence
 
 from .intervals import Interval, overlap
+import logging
+
 from .metrics import (
+    ANALYSIS_VERSION,
     CallerLine,
     compute_call,
     compute_caller_health,
@@ -20,8 +23,11 @@ from .metrics import (
     compute_turns,
     timeline_from_events,
 )
+from .prosody import DEFAULT_PROSODY_VERSION, compute_prosody
 from .recording_dir import RECORDING_RATE, RecordingDir, load_recording_dir
 from .vad import DEFAULT_VAD_VERSION, detect_segments, get_spec
+
+_log = logging.getLogger("evalkit.voicetest")
 
 SCORECARD_SCHEMA = "evalkit.voice.scorecard.v1"
 SCORECARD_NAME = "scorecard.json"
@@ -84,7 +90,7 @@ def build_scorecard(recording: RecordingDir, vad_version: Optional[str] = None) 
     spec = get_spec(version)
     bot = detect_segments(recording.bot_pcm, RECORDING_RATE, spec)
     caller_vad = detect_segments(recording.caller_pcm, RECORDING_RATE, spec)
-    timeline = timeline_from_events(recording.events, recording.duration_ms)
+    timeline = timeline_from_events(recording.events, recording.duration_ms, recording.mode)
     turns = compute_turns(timeline, bot, spec.onset_tolerance_ms)
     call = {
         "session": recording.session,
@@ -95,12 +101,17 @@ def build_scorecard(recording: RecordingDir, vad_version: Optional[str] = None) 
     call.update(compute_call(timeline, bot, turns))
     health = compute_caller_health(timeline, turns)
     health["vad_crosscheck"] = crosscheck_caller(timeline.lines, caller_vad, spec.version)
+    preamble = compute_preamble(timeline, bot)
     return {
         "schema": SCORECARD_SCHEMA,
+        # Which definitions made the figures (CONTRACT section 5), so a scorecard from before a definition
+        # changed is told apart from one after it.
+        "analysis": {"version": ANALYSIS_VERSION},
         "vad": spec.describe(),
         "call": call,
-        "preamble": compute_preamble(timeline, bot),
+        "preamble": preamble,
         "turns": turns,
+        "prosody": _prosody(recording, turns, preamble),
         "caller_health": health,
         "segments": {
             "bot": [list(s) for s in bot],
@@ -109,6 +120,17 @@ def build_scorecard(recording: RecordingDir, vad_version: Optional[str] = None) 
         },
         "problems": list(recording.problems),
     }
+
+
+def _prosody(recording: RecordingDir, turns: Sequence[Dict[str, Any]], preamble: Dict[str, Any]) -> Dict[str, Any]:
+    """The bot channel's measured prosody. A failure here is reported in the section and never costs the
+    call its timing, which the scorecard exists for."""
+    heard = {t["index"]: t["heard"] for t in turns if t.get("heard")}
+    try:
+        return compute_prosody(recording.bot_pcm, RECORDING_RATE, turns, preamble, bot_transcripts=heard or None)
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("%s: prosody not measured: %s", recording.path, exc)
+        return {"version": DEFAULT_PROSODY_VERSION, "error": f"{type(exc).__name__}: {exc}"[:300]}
 
 
 def analyze(recording_dir: str, vad_version: Optional[str] = None) -> Dict[str, Any]:

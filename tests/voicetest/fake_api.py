@@ -1,17 +1,22 @@
 """A local stand-in for the SyntropyLabs voice test API (RUN_API sections 3 and 4), plus the storage the
 signed URLs point at and the trace ingest, so the runner can be tested end to end with no backend.
 
-Every request is recorded with its headers, so a test can check what reached which endpoint.
+Every request is recorded with its headers, so a test can check what reached which endpoint. Scenarios
+with a goal, and callers written from ``generate``, are planned as dynamic calls, and the turn endpoint
+(RUN_API section 4.1) answers them from a script of fake answers: it hears nothing, so ``heard`` names the
+turn, and each line is synthetic speech.
 """
 
 from __future__ import annotations
 
+import base64
 import gzip
 import hashlib
 import io
 import json
 import re
 import threading
+import time
 import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -55,13 +60,126 @@ def default_scenarios() -> List[Dict[str, Any]]:
     ]
 
 
+# RUN_API section 3.3: the wait a line gets when it names none, line 0's by the target's firstSpeaker.
+DEFAULT_LINE_WAIT = {"rule": "bot_done", "silenceMs": 700, "maxMs": 15000}
+FIRST_LINE_WAIT = {
+    "auto": {"rule": "bot_done", "startWithinMs": 3000, "silenceMs": 700, "maxMs": 15000},
+    "bot": DEFAULT_LINE_WAIT,
+    "caller": {"rule": "fixed", "ms": 0},
+}
+NO_VOICE_KEY = ("No key to synthesize the caller's lines with: this organisation has no Text-to-Speech "
+                "model. Either add a provider connection and a Text-to-Speech model under Models in the "
+                "console, or pass voice {provider, model, voice, apiKey} from the SDK "
+                "(evalkit voice-test run --tts-provider openai with OPENAI_API_KEY set).")
+
+
+# The wait after each bot answer before the next line is asked for, shorter than the API's so the tests run fast.
+TURN_WAIT = {"rule": "bot_done", "silenceMs": 600, "maxMs": 6000}
+CUT_IN_TEXT = "Sorry, quick question."
+
+
+def _clip_for(text: str) -> Dict[str, Any]:
+    return {"text": text, "ms": min(1200, 300 + 12 * len(text)), "seed": 100 + sum(text.encode()) % 800}
+
+
+def _dynamic(sc: Dict[str, Any], first: Dict[str, Any], default_max: int) -> Dict[str, Any]:
+    """A goal scenario as the fake plans it: the opening as line 0 and, for an interruption before turn 1,
+    the cut-in as line 1 (CONTRACT section 4.1), and the loop's rules."""
+    opening = sc.get("opening") or f"Hi, I need help: {sc['goal'][:60]}"
+    lines = [dict(_clip_for(opening), wait=dict(first), interruptAfterBotMs=None)]
+    interrupt = sc.get("interrupt")
+    if interrupt and interrupt["turn"] == 1:
+        lines.append(dict(_clip_for(CUT_IN_TEXT), wait=dict(DEFAULT_LINE_WAIT),
+                          interruptAfterBotMs=interrupt["afterBotMs"]))
+    turns = {"max": sc.get("maxTurns") or default_max, "wait": dict(TURN_WAIT)}
+    if interrupt:
+        turns["interrupt"] = dict(interrupt)
+    return {"lines": lines, "mode": "dynamic", "turns": turns, "goal": sc["goal"]}
+
+
+def inline_scenarios(run_id: str, body: Dict[str, Any], default_max: int = 2) -> List[Dict[str, Any]]:
+    """The request's inline scenarios as the fake plans them: a clip per text, the waits as the API
+    fills them in, and the scenario ids the API derives from the run and the index."""
+    first = FIRST_LINE_WAIT[(body.get("target") or {}).get("firstSpeaker") or "auto"]
+    out = []
+    for i, sc in enumerate(body["scenarios"]):
+        if sc.get("goal"):
+            out.append(dict(_dynamic(sc, first, default_max), id=f"scn_{run_id}_{i}", name=sc["name"]))
+            continue
+        lines = []
+        for j, line in enumerate(sc["lines"]):
+            text = line["text"]
+            interrupt = line.get("interruptAfterBotMs")
+            wait = dict(line["wait"]) if line.get("wait") else None
+            if wait and wait["rule"] == "bot_done":
+                wait = {"silenceMs": 700, "maxMs": 15000, **wait}
+            if wait is None:
+                wait = dict(DEFAULT_LINE_WAIT if (j or interrupt is not None) else first)
+            lines.append({"text": text, "ms": min(1200, 300 + 12 * len(text)), "seed": 100 + sum(text.encode()) % 800,
+                          "wait": wait, "interruptAfterBotMs": interrupt})
+        out.append({"id": f"scn_{run_id}_{i}", "name": sc["name"], "lines": lines})
+    return out
+
+
+def generated_scenarios(run_id: str, generate: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """`generate` as the fake writes it: `count` goal scenarios about the bot, the first impatient."""
+    out = []
+    for i in range(int(generate.get("count") or 5)):
+        sc: Dict[str, Any] = {"name": f"generated caller {i}", "goal": f"Caller {i}: {generate['about'][:80]}",
+                              "persona": "IMPATIENT" if i == 0 else "NOVICE"}
+        if generate.get("maxTurns"):
+            sc["maxTurns"] = generate["maxTurns"]
+        out.append(sc)
+    return out
+
+
+def wav_b64(text: str) -> Dict[str, Any]:
+    """A line's audio as the turn endpoint sends it inline: a base64 WAV, 16 kHz mono."""
+    clip = _clip_for(text)
+    data = synth_clip(clip["ms"], clip["seed"], "wav")
+    return {"data": base64.b64encode(data).decode(), "encoding": "wav", "sampleRate": 16000,
+            "durationMs": clip["ms"] + 200, "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def default_answer(call: Dict[str, Any], turn: int, retake: int, request: Dict[str, Any]) -> Dict[str, Any]:
+    """The fake caller model: a line per turn up to turns.max, and the planned cut-in with the answer before
+    its turn. Returns {"line"?: text, "done"?: bool, "cutIn"?: {text, afterBotMs}}."""
+    turns = call["script"]["turns"]
+    out: Dict[str, Any] = {"line": f"Here is my reply number {turn}."}
+    interrupt = turns.get("interrupt")
+    if interrupt and interrupt["turn"] == turn + 1 and turn + 1 <= turns["max"]:
+        out["cutIn"] = {"text": CUT_IN_TEXT, "afterBotMs": interrupt["afterBotMs"]}
+    return out
+
+
 class FakeVoiceApi:
     def __init__(self, scenarios: Optional[List[Dict[str, Any]]] = None, *, encoding: str = "pcm16",
                  max_concurrent: int = 2, max_call_ms: int = 60000,
                  passed: Any = True, create_status: Optional[int] = None,
                  fail_once: Optional[Dict[str, int]] = None, statuses: Tuple[str, ...] = ("scoring", "completed"),
-                 corrupt: Tuple[str, ...] = (), lose_create_answer: bool = False) -> None:
+                 corrupt: Tuple[str, ...] = (), lose_create_answer: bool = False,
+                 require_voice_key: bool = False,
+                 answer: Optional[Callable[..., Dict[str, Any]]] = None, think_s: float = 0.3,
+                 default_max_turns: int = 2, call_max_ms: Optional[int] = None,
+                 caller: Optional[Dict[str, Any]] = None, platform_minutes_left: Any = None) -> None:
+        # The turn endpoint (RUN_API 4.1): `answer(call, turn, retake, request)` writes each answer (see
+        # `default_answer`); it may also return {"status", "message", "retryAfter"} to fail the request,
+        # and {"lose": True} to store the answer but lose it on the way back. `think_s` is the model's time.
+        self.answer = answer or default_answer
+        self.think_s = think_s
+        self.default_max_turns = default_max_turns
+        self.call_max_ms = call_max_ms
+        self.caller = caller
+        self.platform_minutes_left = platform_minutes_left
+        self.turn_requests: List[Dict[str, Any]] = []
+        self.turn_answers: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
+        self.next_turn: Dict[int, Optional[int]] = {}
+        self.last_turn: Dict[int, Tuple[int, int]] = {}
+        self.final_turn: Dict[int, int] = {}
+        self.model_calls = 0
         self.scenarios = scenarios if scenarios is not None else default_scenarios()
+        # Answer a create that brings no voice key as the API does for an org with no TTS model.
+        self.require_voice_key = require_voice_key
         self.encoding = encoding
         self.max_concurrent = max_concurrent
         self.max_call_ms = max_call_ms
@@ -173,7 +291,13 @@ class FakeVoiceApi:
 
     def _plan(self, body: Dict[str, Any]) -> Dict[str, Any]:
         run_id = "run%03d" % (len(self.created))
-        chosen = [s for s in self.scenarios if not body.get("scenarioIds") or s["id"] in body["scenarioIds"]]
+        if body.get("generate"):
+            chosen = inline_scenarios(run_id, dict(body, scenarios=generated_scenarios(run_id, body["generate"])),
+                                      self.default_max_turns)
+        elif body.get("scenarios"):
+            chosen = inline_scenarios(run_id, body, self.default_max_turns)
+        else:
+            chosen = [s for s in self.scenarios if not body.get("scenarioIds") or s["id"] in body["scenarioIds"]]
         calls = []
         index = 0
         for repeat in range(int(body.get("repeats") or 1)):
@@ -194,26 +318,92 @@ class FakeVoiceApi:
                         "futureField": {"ignored": True},
                     }
                     lines.append(entry)
+                script = {"maxCallMs": self.call_max_ms or sc.get("maxCallMs", 300000), "lines": lines,
+                          "end": {"afterLastLine": "bot_done", "silenceMs": 600, "maxMs": 5000}}
+                if sc.get("mode") == "dynamic":
+                    script.update(mode="dynamic", turns=sc["turns"])
+                    self.next_turn[index] = len(lines)
                 calls.append({
                     "callIndex": index, "scenarioId": sc["id"], "scenarioName": sc["name"], "repeat": repeat,
                     "sessionToken": f"{body.get('agentId') or 'sdk'}:{run_id}:{sc['id']}:{index}",
-                    "script": {"maxCallMs": sc.get("maxCallMs", 300000), "lines": lines,
-                               "end": {"afterLastLine": "bot_done", "silenceMs": 600, "maxMs": 5000}},
+                    "script": script,
                 })
                 index += 1
+        dynamic = any(c["script"].get("mode") == "dynamic" for c in calls)
+        caller = self.caller
+        if caller is None and dynamic:
+            given = body.get("caller") or {}
+            caller = {"provider": given.get("provider") or "google", "model": given.get("model") or "gemini-2.5-flash",
+                      "keySource": "request" if given.get("apiKey") else "organization"}
         return {"runId": run_id, "consoleUrl": f"https://console.example/voice/{run_id}",
                 "limits": {"maxCallMs": self.max_call_ms, "maxConcurrentCalls": self.max_concurrent},
+                "caller": caller if dynamic else None, "platformMinutesLeft": self.platform_minutes_left,
                 "calls": calls}
+
+    def _turn(self, index: int, req: Dict[str, Any], headers: Dict[str, str]):
+        """RUN_API 4.1: the next caller line of call `index`."""
+        turn, retake = req.get("turn"), req.get("retake", 0)
+        audio = base64.b64decode((req.get("botAudio") or {}).get("data") or "")
+        with wave.open(io.BytesIO(audio), "rb") as w:
+            fmt = (w.getnchannels(), w.getsampwidth(), w.getframerate())
+            audio_ms = int(round(w.getnframes() * 1000 / w.getframerate()))
+        with self.lock:
+            self.turn_requests.append({"call": index, "turn": turn, "retake": retake, "keys": req.get("keys"),
+                                       "format": fmt, "audioMs": audio_ms,
+                                       "durationMs": (req.get("botAudio") or {}).get("durationMs"),
+                                       "headers": headers, "at": time.monotonic()})
+            stored = self.turn_answers.get((index, turn, retake))
+            if stored is not None:  # a repeat: the stored answer, the model is not asked again
+                return 200, stored, None, None
+            last = self.last_turn.get(index)
+            again = last is not None and turn == last[0] and retake == last[1] + 1 == 1
+            if not again and (turn != self.next_turn.get(index) or retake != 0):
+                return 409, {"message": f"turn {turn} is not the next turn of call {index} "
+                                        f"(expected {self.next_turn.get(index)})"}, None, None
+            call = next(c for c in self.plan["calls"] if c["callIndex"] == index)
+            final = turn > call["script"]["turns"]["max"] or turn == self.final_turn.get(index)
+        spec = {} if final else self.answer(call, turn, retake, req)
+        if spec.get("status"):
+            hdrs = {"Retry-After": str(spec["retryAfter"])} if spec.get("retryAfter") is not None else None
+            return spec["status"], {"message": spec.get("message", "try again")}, None, hdrs
+        delay = spec.get("delay", self.think_s)
+        time.sleep(delay)
+        answer: Dict[str, Any] = {"turn": turn, "heard": f"bot answer before turn {turn} ({audio_ms} ms)",
+                                  "done": bool(final or spec.get("done")), "line": None, "cutIn": None,
+                                  "thinkMs": int(delay * 1000)}
+        if not final and spec.get("line"):
+            answer["line"] = {"text": spec["line"], "audio": wav_b64(spec["line"])}
+        if not answer["done"] and spec.get("cutIn"):
+            cut = spec["cutIn"]
+            answer["cutIn"] = {"text": cut["text"], "audio": wav_b64(cut["text"]), "afterBotMs": cut["afterBotMs"]}
+        with self.lock:
+            self.model_calls += 1
+            self.turn_answers[(index, turn, retake)] = answer
+            self.last_turn[index] = (turn, retake)
+            if final or (answer["done"] and answer["line"] is None):
+                self.next_turn[index] = None
+            elif answer["done"]:
+                self.next_turn[index] = self.final_turn[index] = turn + 1
+            else:
+                self.next_turn[index] = turn + (2 if answer["cutIn"] else 1)
+        if spec.get("lose"):
+            return 502, {"message": "bad gateway"}, None, None
+        return 200, answer, None, None
 
     def _summary(self, run_id: str, status: str) -> Dict[str, Any]:
         passed = self.passed(self.results) if callable(self.passed) else self.passed
         calls = []
         for index, result in sorted(self.results.items()):
-            calls.append({"callIndex": index, "error": result.get("error"), "evaluators": [
+            evaluators = [
                 {"ruleId": "rule-1", "key": "voice_response_delay", "name": "voice_response_delay",
                  "score": 1.0 if passed else 0.5, "passed": bool(passed),
                  "figures": {"p95Ms": 840, "p50Ms": 610, "limitMs": 1200, "turnsOver": 0 if passed else 1,
-                             "turns": 2, "unanswered": 0, "unscoredTurns": []}}]})
+                             "turns": 2, "unanswered": 0, "unscoredTurns": []}}]
+            if ((result.get("scorecard") or {}).get("call") or {}).get("mode") == "dynamic":
+                evaluators.append({"ruleId": "rule-2", "key": "voice_task_success", "name": "Voice Task Success",
+                                   "score": 0.8, "passed": True,
+                                   "reason": "Met: the agent refunds the second charge."})
+            calls.append({"callIndex": index, "error": result.get("error"), "evaluators": evaluators})
         out = {"runId": run_id, "status": status, "calls": calls}
         if status not in ("scoring", "running"):
             out["passed"] = passed
@@ -248,6 +438,11 @@ class FakeVoiceApi:
             if self.create_status:
                 return self.create_status, {"message": "scenario set sc-missing not found"}, None, None
             req = json.loads(body)
+            if sum(bool(req.get(k)) for k in ("scenarios", "scenarioSetId", "generate")) != 1:
+                return 400, {"statusCode": 400, "error": "Bad Request",
+                             "message": "Send one of generate, scenarioSetId or scenarios"}, None, None
+            if self.require_voice_key and not (req.get("voice") or {}).get("apiKey"):
+                return 400, {"statusCode": 400, "error": "Bad Request", "message": NO_VOICE_KEY}, None, None
             key = lower.get("idempotency-key")
             with self.lock:
                 if key and key in self.by_idempotency_key:  # RUN_API 3.1: the first run, not a second
@@ -259,6 +454,9 @@ class FakeVoiceApi:
                 if self.lose_create_answer and len(self.created) == 1:
                     return 502, {"message": "bad gateway"}, None, None
             return 201, self.plan, None, None
+        m = re.fullmatch(r"/v1/voice-tests/([^/]+)/calls/(\d+)/turns", path)
+        if m and method == "POST":
+            return self._turn(int(m.group(2)), json.loads(body), lower)
         m = re.fullmatch(r"/v1/voice-tests/([^/]+)/calls/(\d+)/(recording|result)", path)
         if m and method == "POST":
             run_id, index, what = m.group(1), int(m.group(2)), m.group(3)

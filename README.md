@@ -362,7 +362,7 @@ The transcripts are content. `capture_content=False` drops them, along with the 
 
 ### The test call's session
 
-A Simulate test call carries a session token, `<simulationId>:<runId>:<scenarioId>:<callIndex>`. A bot that puts it on its spans as `session.id` joins the test call's session, and its turns line up with the caller's by session and time. The token travels in three places, and the integrations look for it there:
+A Simulate test call carries a session token, `<agentId or sdk>:<runId>:<scenarioId>:<callIndex>` (`sdk` for a run started without `--agent`). A bot that puts it on its spans as `session.id` joins the test call's session, and its turns line up with the caller's by session and time. The token travels in three places, and the integrations look for it there:
 
 - the WebSocket URL's query parameter `evalkit_session` (`query_param=` when the target named another one);
 - the Twilio Media Streams `start` message, as `start.customParameters.evalkit_session`; Pipecat's `parse_telephony_websocket` reads that message, so pass its `call_data`, or the `websocket` it read;
@@ -397,10 +397,10 @@ The observer frames and session events the integrations use carry the times dire
 
 ## Testing your voice bot
 
-`evalkit voice-test` tests a voice bot the way a caller would. It calls the bot over its WebSocket, plays a scripted caller, records both sides, and measures each call from the recording. The calls are then reported to SyntropyLabs, where the voice evaluators score them. The calls start in your process, so a bot on `localhost` or on a private network can be tested, on your machine or in CI.
+`evalkit voice-test` tests a voice bot the way a caller would. It calls the bot over its WebSocket, plays a caller, records both sides, and measures each call from the recording. A caller with a goal talks to the bot until the goal is met or it gives up, answering what the bot actually says; a caller with lines says exactly those lines. The calls are then reported to SyntropyLabs, where the voice evaluators score them. The calls start in your process, so a bot on `localhost` or on a private network can be tested, on your machine or in CI.
 
 ```bash
-pip install "syntropylabs-evalkit[voice]"     # adds numpy, websockets and webrtcvad
+pip install "syntropylabs-evalkit[voice]"     # adds numpy, websockets, webrtcvad and PyYAML
 ```
 
 The `voice` extra is needed only for voice tests. `import evalkit` never loads it.
@@ -413,22 +413,142 @@ Check first that the bot is reachable and speaks the format. `check` needs no ke
 evalkit voice-test check --url ws://localhost:8765/ws --format pcm16 --sample-rate 16000
 ```
 
-Then run a scenario set against it:
+Then run it. The quickest way is to say what your bot does: SyntropyLabs writes the callers, each with a goal, and nothing needs saving first. The run needs only your subscription key:
 
 ```bash
 evalkit voice-test run --url ws://localhost:8765/ws --format pcm16 --sample-rate 16000 \
-    --scenario-set <scenarioSetId> --header "Authorization=Bearer $BOT_TOKEN"
+    --about "A refund desk for an online shop: it finds orders, refunds duplicate charges and explains the 30-day return policy." \
+    --callers 5 --header "Authorization=Bearer $BOT_TOKEN"
 ```
+
+For exact control, write the callers in a file. `init` writes a starter file (below) to edit into your bot's:
+
+```bash
+evalkit voice-test init                      # writes voice-tests.yaml
+evalkit voice-test run --url ws://localhost:8765/ws --format pcm16 --sample-rate 16000 \
+    --scenarios voice-tests.yaml --header "Authorization=Bearer $BOT_TOKEN"
+```
+
+A scenario set saved in the console runs the same way, with `--scenario-set <scenarioSetId>`. A run takes exactly one of `--about` (or `--about-file FILE`), `--scenarios` and `--scenario-set`.
 
 A run takes these steps:
 
-1. It creates the run with your subscription key. SyntropyLabs answers with the plan: one call per scripted scenario and repeat, each with its own session token, and the caller's lines as speech synthesized on our side.
-2. It downloads each line's audio once and checks it against the plan's sha256. Clips are cached by hash, in `~/.cache/evalkit/voicetest/audio` (or `EVALKIT_VOICETEST_CACHE`, or `--cache-dir`), so a later run reuses them.
-3. It places the calls, at most as many at once as the plan allows. Each call carries its session token (see [The test call's session](#the-test-calls-session)), so the bot's own spans join the call's session.
+1. It creates the run with your subscription key, sending what your bot does (or the file's scenarios, or the set's id). SyntropyLabs answers with the plan: one call per scenario and repeat, each with its own session token, and the lines known before the call (a scripted caller's lines, a caller's opening) as speech synthesized on our side (see [The caller's voice](#the-callers-voice)). The run keeps the scenarios, so the console shows them.
+2. It downloads each line's audio once and checks it against the plan's sha256. Clips are cached by hash, in `~/.cache/evalkit/voicetest/audio` (`$XDG_CACHE_HOME/evalkit/voicetest/audio` when that is set, or `EVALKIT_VOICETEST_CACHE`, or `--cache-dir`), so a later run reuses them.
+3. It places the calls, at most as many at once as the plan allows. Each call carries its session token (see [The test call's session](#the-test-calls-session)), so the bot's own spans join the call's session. A caller with a goal asks SyntropyLabs for each next line during the call ([How a caller with a goal talks](#how-a-caller-with-a-goal-talks)).
 4. It analyses each call, uploads the recording through a short-lived signed URL (unless `--timing-only`), sends the call's `voice.call` trace, and posts the call's result.
 5. Once every call is reported, it completes the run and waits for the evaluators' verdict.
 
-Only scripted scenarios can be voice-tested; the API refuses a set of goal-based ones.
+A scenario set's goal-based scenarios are played as callers with a goal, and its scripted ones as written.
+
+### The scenarios file
+
+`--scenarios FILE` takes YAML (`.yaml` or `.yml`, read with PyYAML from the `voice` extra) or JSON (`.json`, which needs nothing more). This is the file `evalkit voice-test init` writes (`init voice-tests.json` writes the same as JSON, and `--force` overwrites a file that exists): a refund desk, three calls, two with a goal (the first cuts in on the bot) and one with exact lines.
+
+```yaml
+# voice-tests.yaml: callers for `evalkit voice-test run --scenarios voice-tests.yaml`
+#
+# Each scenario is one call. A caller with a goal talks to your bot until the goal is met or it gives
+# up, answering what your bot actually says. A caller with lines says exactly those lines.
+# Without a file, `evalkit voice-test run --about "what your bot does"` writes the callers for you.
+# Limits: 50 scenarios; a goal of 1,000 characters; 20 turns a call; 40 lines, 500 characters each.
+scenarios:
+  - name: Refund for a duplicate charge
+    goal: Get the second charge on order 4471 refunded and find out when the money arrives
+    persona: IMPATIENT
+    facts:
+      order_number: "4471"
+    successCriteria:
+      - The agent refunds the second charge
+      - The agent says when the refund will arrive
+    interrupt: { turn: 1, afterBotMs: 1500 }
+  - name: Refund outside the return window
+    goal: Get money back for headphones bought two months ago that stopped working last week
+    persona: NOVICE
+    successCriteria:
+      - The agent explains the 30-day return policy
+      - The agent offers store credit or a repair
+  - name: Opening hours, exact lines
+    lines:
+      - Hi, what are your opening hours on Saturday?
+      - Thanks, that's all.
+```
+
+Each scenario is one call (times `--repeats`). It has a `goal` or `lines`, never both. A caller with a goal:
+
+| Field | Meaning |
+|---|---|
+| `name` | The scenario's name, as the console and the summary show it. At most 200 characters. |
+| `goal` | What the caller wants, 1 to 1,000 characters. The caller talks to the bot until the goal is met or it would give up. |
+| `persona` | How the caller behaves: `EXPERT`, `NOVICE`, `ADVERSARIAL`, `VAGUE`, `CONTEXT_SWITCHER` or `IMPATIENT` (in any case), or a description of up to 500 characters. Without one, a realistic, moderately patient caller. |
+| `facts` | What the caller knows and keeps back until the bot asks: up to 12, each `name: "value"` or `name: {value, revealWhen}` (500 characters each). Quote a number such as an order number. |
+| `opening` | The caller's first line, up to 500 characters. Without one, the caller's model writes it from the persona and the goal. |
+| `successCriteria` | What a correct call achieves: a string or up to 20 (500 characters each). Voice Task Success judges the conversation against them and the goal. |
+| `maxTurns` | Caller lines after the opening, 1 to 20 (8 by default, or `--max-turns`). The caller ends earlier when it is done. |
+| `interrupt` | `{turn: N, afterBotMs: M}`: before caller line N (1 to `maxTurns`), the caller cuts into the bot's answer M ms into it (0 to 30,000), with a short line written the turn before. Scored like a planned interruption, including when the bot finishes first. |
+
+A caller with lines:
+
+| Field | Meaning |
+|---|---|
+| `name` | As above. |
+| `lines` | What the caller says, in order: 1 to 40 lines. A line is its text, or a mapping with `text` and the fields below. At most 500 characters a line. |
+| `wait` | When the caller says the line. Without one, the caller waits for the bot to finish (`{rule: bot_done, silenceMs: 700, maxMs: 15000}`: 700 ms of silence after bot speech, giving up after 15 s), and the first line follows `--first-speaker`. `{rule: bot_done, silenceMs, maxMs, startWithinMs}` sets other limits (`silenceMs` 0 to 10,000; `maxMs` 1,000 to 60,000; `startWithinMs`: speak anyway when no bot speech has started by then). `{rule: fixed, ms}` speaks `ms` after the previous line (0 to 60,000). |
+| `interruptAfterBotMs` | A planned interruption: the caller cuts in this many ms after the bot starts its answer, while the bot is still speaking (0 to 30,000, and less than the wait's `maxMs`). The line's wait is `bot_done` without `startWithinMs`, or none. The voice evaluators then score how fast the bot stopped. If the bot finishes its answer before that point, the caller says the line once the bot has been quiet for the wait's `silenceMs`, as a normal turn, and the interruption is left out of the score. |
+| `successCriteria` | What a correct call achieves: a string or a list of up to 20 (500 characters each). Stored with the run and shown in the console. |
+
+At most 50 scenarios a file, and 50 calls a run (scenarios times repeats). The same limits are checked before anything is sent, and a mistake names the file, the scenario and the field: `voice-tests.yaml: scenarios[0] ("Refund for a duplicate charge"): interrupt.turn must be a caller line from 1 to maxTurns (8), not 9`. Unknown fields are refused. snake_case spellings are accepted too (`success_criteria`, `max_turns`, `after_bot_ms`, `reveal_when`, `interrupt_after_bot_ms`, `silence_ms`, `max_ms`, `start_within_ms`, `mode` for `rule`), and the file may be a bare list of scenarios. In YAML, quote a line that is only `Yes` or `No` (YAML reads it as true or false) or that holds `: `.
+
+### How a caller with a goal talks
+
+A caller with a goal says its opening, then, once the bot's answer is over (700 ms of quiet), sends that answer's audio to SyntropyLabs. The caller's model hears it, writes down what the bot said, and decides the next line as the persona would, with the goal and the facts; the line comes back spoken, and the caller says it. While it waits it sends silence. This goes on until the model says the caller is done (with an optional last line), or the caller reaches `maxTurns`, the call's time limit, or the bot hangs up. After the last line the bot's answer is still sent, after the hang-up, so the conversation ends with what the bot last said.
+
+- **The bot is measured as before.** Every figure is the bot's, from the recording. The caller's own deciding time runs from the end of the bot's answer to its next line: it is not response delay, not silence and not the bot's fault. The summary reports it under the caller's health.
+- **The bot talking on.** If the bot speaks again while the line is being decided, the caller waits for it to finish, and when it said 1,000 ms or more, drops the line and asks once more with the longer audio.
+- **The conversation** is kept on the call: each turn's `heard` text and the caller's lines, in the scorecard's `call.transcript`. Voice Task Success judges it against the goal and the success criteria.
+- **When a line cannot be had.** A rate limit or an overloaded model is asked again after its `Retry-After` while the call's time lasts. Any other refusal (a key the provider refused, for one) ends the call at once with the error `caller_turn_failed` in the provider's words, and the run exits with `2`: the testing side failed, which says nothing about your bot.
+
+### The caller's model
+
+The model that hears the bot and decides each line must take audio (any Gemini chat model, or one the model catalog marks for audio input). It is taken in this order:
+
+1. **Your own key, sent with the run.** `--caller-provider` (default `google`), `--caller-model` (default: the API's, `gemini-2.5-flash` on google) and `--caller-key-env`: the key is read from the environment, from `GOOGLE_API_KEY`, then `GEMINI_API_KEY`, for google, `<PROVIDER>_API_KEY` for another provider, or the variable `--caller-key-env` names. Any of these flags sends `caller` with the run. The key is used for this run only: SyntropyLabs keeps it nowhere, so the SDK sends it again with each turn, and it is kept out of everything the SDK prints and writes. There is no option that takes the key itself.
+2. **Your organization's connection** for that provider, when a `--caller-*` flag names the provider and no key is in the environment.
+3. **Your organization's own audio-capable model**, with no `--caller-*` flag: a model configuration saved for audio, else its Google AI Studio connection.
+4. **The SyntropyLabs model**, on a plan with platform voice minutes left this month (by default 100 a month on Pro and 1,000 on Enterprise). It also writes the callers for `--about`, speaks the caller's lines when no text-to-speech key is set, and runs the AI listener and Voice Task Success. A run that uses it counts its calls' minutes, and the summary says how many are left.
+
+With none of them, the API refuses the run naming the fixes.
+
+```bash
+export GOOGLE_API_KEY=...              # from your CI's secret store
+evalkit voice-test run --url wss://bot.example.com/ws --format twilio \
+    --scenarios voice-tests.yaml --caller-provider google
+```
+
+### The caller's voice
+
+The caller's lines are synthesized on our side, with a text-to-speech key of yours. It comes from one of two places:
+
+- **Your organization's settings in the console:** a provider connection, and a Text-to-Speech model under Models. `--voice PROVIDER:MODEL:VOICE` names the voice and uses your connection for that provider; with neither flag, your Text-to-Speech model and its voice are used.
+- **Your own key, sent with the run:** for CI where nothing is stored in the console. `--tts-provider` names the provider and the key is read from the environment, from the variable the provider's own SDK reads:
+
+  ```bash
+  export OPENAI_API_KEY=...             # from your CI's secret store
+  evalkit voice-test run --url wss://bot.example.com/ws --format twilio \
+      --scenarios voice-tests.yaml --tts-provider openai
+  ```
+
+  | `--tts-provider` | Key variable |
+  |---|---|
+  | `openai` | `OPENAI_API_KEY` |
+  | `google` (or `gemini`) | `GOOGLE_API_KEY`, then `GEMINI_API_KEY` |
+  | `elevenlabs` | `ELEVENLABS_API_KEY` |
+  | `cartesia` | `CARTESIA_API_KEY` |
+  | any other | `<PROVIDER>_API_KEY` |
+
+  `--tts-model` and `--tts-voice` name the model and the voice; left out, the API takes them from your project's Text-to-Speech model on that provider, else its own default for the provider (`openai`: `tts-1`, `alloy`; `google`: `gemini-2.5-flash-preview-tts`, `Kore`), and otherwise refuses the run asking for them. `--tts-key-env NAME` reads the key from another variable. The key is never taken on the command line, where the shell's history would keep it: there is no option for it, and an option given by mistake is reported without its value. It goes to the SyntropyLabs API over TLS in the run's create request, is used to synthesize that run's lines, and is not stored, logged or returned; the SDK keeps it out of everything it prints and writes. When the variable is not set, the command says so and sends no key, and your organization's stored key for the provider is used.
+
+With neither, the API refuses the run with a 400 that names both ways to fix it, and the command prints that message and exits with `2`. Synthesized lines are cached by voice and text, so a line already made is not synthesized again.
 
 | Option | Meaning |
 |---|---|
@@ -436,13 +556,19 @@ Only scripted scenarios can be voice-tested; the API refuses a set of goal-based
 | `--format` | `twilio` (Twilio Media Streams messages, 8 kHz mu-law) or `pcm16` (raw 16-bit PCM in binary frames). |
 | `--sample-rate` | `pcm16` only: `8000`, `16000` (the default) or `24000`. |
 | `--header K=V` | A handshake header for the bot, repeatable, up to 10. |
-| `--scenario-set`, `--scenario` | The scenario set, and optionally only some of its scenarios (repeatable). |
+| `--about TEXT`, `--about-file FILE` | What your bot does, in a few sentences: SyntropyLabs writes the callers, each with a goal. |
+| `--callers N` | With `--about`: how many callers to write, 1 to 20 (5 by default). |
+| `--scenarios FILE` | The scenarios to play, from a YAML or JSON file ([The scenarios file](#the-scenarios-file)). |
+| `--scenario-set`, `--scenario` | A scenario set saved in the console, and optionally only some of its scenarios (repeatable). |
+| `--max-turns N` | Caller lines after the opening of each caller with a goal that sets none, 1 to 20 (8 by default). With `--about` or `--scenarios`. |
+| `--caller-provider`, `--caller-model`, `--caller-key-env` | The caller's model with your own key, read from the environment ([The caller's model](#the-callers-model)). |
 | `--repeats` | Calls per scenario (1 by default). |
 | `--agent` | Score the run under a registered agent. |
 | `--name` | The run's name. The default is `voice test <time>`. |
-| `--voice PROVIDER:MODEL:VOICE` | The caller's voice, for example `openai:tts-1:alloy`. The default is your organisation's. |
+| `--voice PROVIDER:MODEL:VOICE` | The caller's voice, for example `openai:tts-1:alloy`, synthesized with your organization's connection for the provider. The default is your organization's Text-to-Speech model. |
+| `--tts-provider`, `--tts-model`, `--tts-voice`, `--tts-key-env` | The caller's voice with your own provider key, read from the environment; the model and voice are optional ([The caller's voice](#the-callers-voice)). |
 | `--timing-only` | Upload no audio. Only the timings and the scorecards are sent. |
-| `--first-speaker` | Who opens each call, which sets how long the caller waits before its first line. `auto` (the API's default) hears out a greeting that starts within 3 s and otherwise speaks at 3 s; `bot` waits up to 15 s for the greeting to start; `caller` speaks at once. Use `caller` for a bot that waits to be spoken to, so no call starts with silence. |
+| `--first-speaker` | Who opens each call, which sets how long the caller waits before its first line. `auto` (the API's default) hears out a greeting that starts within 3 s and otherwise speaks at 3 s; `bot` waits for the greeting however late it starts; with either, the caller speaks 15 s after the call opens if the greeting has not ended by then. `caller` speaks at once. Use `caller` for a bot that waits to be spoken to, so no call starts with silence. |
 | `--out DIR` | Keep each call's recording, events and scorecard under `DIR/<runId>/call-NNN/`, and the run's summary in `DIR/<runId>/run.json`. Without it, they are deleted when the run ends. |
 | `--json` | Print one JSON object instead of the summary. |
 | `--key`, `--api-url` | The subscription key and API base. They are resolved like `evalkit eval`'s: `EVALKIT_API_KEY`, then `EVALKIT_SUBSCRIPTION_KEY`, then the stored coding config; and `EVALKIT_API_URL`, then `https://api.syntropylabs.ai`. |
@@ -453,17 +579,27 @@ The bot's headers and the URL's query are sent to the bot only. SyntropyLabs rec
 
 ### What it prints, and the exit code
 
-Each call's figures are printed as it ends. They are the response delay (p50, p95 and per turn), talk-over, planned interruptions and how fast the bot stopped, the longest silence, and the caller's own health. A turn where the caller itself ran late is left out of the scores, and the summary says so. After the last call come the evaluators' results, the console link and the verdict:
+Each call's figures are printed as it ends. They are the response delay (p50, p95 and per turn), talk-over, planned interruptions and how fast the bot stopped, the longest silence, and the caller's own health. A caller with a goal also shows how many turns it took and the start and end of its conversation, and its health includes how long it took to decide its lines. A turn where the caller itself ran late is left out of the scores, and the summary says so. After the last call come the caller's model and the SyntropyLabs model minutes left, the evaluators' results, Voice Task Success per call, the console link and the verdict:
 
 ```
-call 0: refund for a duplicate charge (repeat 0), 6.2 s: ok
-  response delay   p50 646 ms, p95 646 ms; 2 of 2 turns answered; per turn 646 ms / 646 ms
+call 0: Refund for a duplicate charge (repeat 0), 24.8 s: ok
+  response delay   p50 646 ms, p95 812 ms; 4 of 4 turns answered; per turn 646 ms / 702 ms / 812 ms / 590 ms
   talk-over        none
-  interruptions    none planned
+  interruptions    1 planned; the bot stopped in p50 240 ms, p95 240 ms
   longest silence  0 ms
-  caller           healthy (no late frames)
-  recording        uploaded (390 kB)
+  conversation     3 turns after the opening
+    caller: Hi, I was charged twice for order 4471 and I need the second charge back.
+    bot:    I'm sorry about that. Let me look up order 4471.
+    ...
+    caller: Great. When will the money be back on my card?
+    bot:    The refund is issued now and arrives in three to five working days.
+  caller           healthy (no late frames; deciding p50 1,640 ms, max 2,210 ms)
+  recording        uploaded (1.5 MB)
 ...
+caller model: google/gemini-2.5-flash (your organization's key)
+...
+task success:
+  call 0: 1.00 passed Met: the agent refunds the second charge; the agent says when the refund will arrive.
 verdict: passed (exit 0)
 ```
 
@@ -471,35 +607,46 @@ verdict: passed (exit 0)
 |---|---|
 | `0` | The run passed. |
 | `1` | The run failed: the evaluators' `passed` is false. |
-| `2` | A setup or network failure: a bad option, a missing key or extra, a run the API refused to create, a result that could not be sent, caller audio that could not be fetched or did not match its sha256, or a verdict that could not be read in time. |
+| `2` | A setup or network failure: a bad option, a scenarios file that breaks a limit, a missing key or extra, a run the API refused to create (its reason is printed), a result that could not be sent, caller audio that could not be fetched or did not match its sha256, a caller with a goal whose next line could not be had (`caller_turn_failed`), or a verdict that could not be read in time. |
 | `130` | The run was interrupted. |
 
-A call that fails does not stop the run. If the bot refuses the connection, hangs up before the script ends, or the call runs past the plan's `maxCallMs`, the call is reported with an `error` and the run goes on to the next call. `--json` prints `runId`, `consoleUrl`, `passed`, `verdict`, `exitCode`, `interrupted`, `problems`, `calls` (each with its `error`, its `figures` and its `recording`) and `run` (the API's own summary). Calls to the SyntropyLabs API that fail on the network or with a 5xx are retried with backoff. Creating the run is retried only when the server cannot have received it.
+A call that fails does not stop the run. If the bot refuses the connection, hangs up before the script ends, or the call runs past the plan's `maxCallMs`, the call is reported with an `error` and the run goes on to the next call. `--json` prints `runId`, `consoleUrl`, `passed`, `verdict`, `exitCode`, `interrupted`, `problems`, `caller` and `platformMinutesLeft`, `calls` (each with its `error`, `mode`, `figures`, `turnsTaken`, `transcript` and `recording`) and `run` (the API's own summary). Calls to the SyntropyLabs API that fail on the network or with a 5xx are retried with backoff. Creating the run is retried only when the server cannot have received it.
 
 Pressing Ctrl-C once stops new calls, and the calls in progress finish. Pressing it again, or sending SIGTERM, ends those calls at once. Either way each call is reported, with what was recorded, and calls that never started are reported as `not_run`. The run is then completed, so it does not stay open.
 
 ### From Python
 
 ```python
+import os
 import sys
 import evalkit.voicetest
 
 result = evalkit.voicetest.run(
     "ws://localhost:8765/ws", format="pcm16", sample_rate=16000,
-    scenario_set="<scenarioSetId>", headers={"Authorization": "Bearer ..."},
+    about="A refund desk for an online shop: it finds orders, refunds duplicate charges "
+          "and explains the 30-day return policy.",
+    callers=5,
+    caller={"provider": "google", "api_key": os.environ["GOOGLE_API_KEY"]},
+    voice={"provider": "openai", "api_key": os.environ["OPENAI_API_KEY"]},
+    headers={"Authorization": "Bearer ..."},
 )
+for call in result.calls:
+    print(call.scenario_name, call.turns_taken, call.transcript)
 print(result.verdict, result.console_url)
 sys.exit(result.exit_code)
 ```
 
-`run()` takes its key from `subscription_key=`, else from the client `evalkit.init()` made, else from `EVALKIT_API_KEY` or `EVALKIT_SUBSCRIPTION_KEY`, and its API base from `api_url=`, `EVALKIT_API_URL`, then that client's `api_url`. The `voice.call` traces go through the `evalkit.init()` client when it sends under the run's key, and otherwise through a client of the run's own, which leaves your process's tracing as it was. It raises `VoiceTestSetupError` when the run cannot start. It returns a `VoiceTestRun` with `calls` (one `CallOutcome` each), `passed`, `verdict` and `exit_code`. `run_async()` is the same for code already inside an event loop. `evalkit.voicetest.check(url, format=...)` is the `check` command.
+Exactly one of `about`, `scenarios` and `scenario_set` is required. `about` has SyntropyLabs write `callers` callers (1 to 20, 5 by default). `scenarios` takes the scenarios file's shape (callers with a `goal` or with `lines`), or the path of such a file (`evalkit.voicetest.load_scenarios(path)` reads one and raises `ScenarioError` naming the field at fault), or what `evalkit.generate_scenarios(...)` returns: scenarios written with `scripted_turns=True` play their `turns` as lines, and the others play as callers with a goal. `scenario_set="<scenarioSetId>"` plays a set saved in the console, and `scenario_ids=[...]` a subset of it (as does a list of ids in `scenarios` with `scenario_set`, as before). `max_turns` sets `maxTurns` where a caller with a goal sets none. `caller` takes `provider` (default `google`), `model` and `api_key`, all optional ([The caller's model](#the-callers-model)). `voice` takes `provider` (`model` and `voice` are optional, as with `--tts-provider`), and `api_key` to synthesize with your own key ([The caller's voice](#the-callers-voice)); without it your organization's stored key for the provider is used, and without `voice` your Text-to-Speech model. Each `CallOutcome` has `mode` (`scripted` or `dynamic`), `turns_taken` and `transcript`, and the `VoiceTestRun` has `caller` and `platform_minutes_left`.
+
+`run()` takes its subscription key from `subscription_key=`, else from the client `evalkit.init()` made, else from `EVALKIT_API_KEY` or `EVALKIT_SUBSCRIPTION_KEY`, and its API base from `api_url=`, `EVALKIT_API_URL`, then that client's `api_url`. The `voice.call` traces go through the `evalkit.init()` client when it sends under the run's key, and otherwise through a client of the run's own, which leaves your process's tracing as it was. It raises `VoiceTestSetupError` when the run cannot start. It returns a `VoiceTestRun` with `calls` (one `CallOutcome` each), `passed`, `verdict` and `exit_code`. `run_async()` is the same for code already inside an event loop. `evalkit.voicetest.check(url, format=...)` is the `check` command.
 
 ### Local tools
 
 These need no backend:
 
+- `evalkit voice-test init [PATH]` writes the starter scenarios file, `voice-tests.yaml` by default (JSON for a `.json` path), and refuses to overwrite one without `--force`.
 - `evalkit voice-test check` makes one short call. It reports whether the bot connected, whether it answered the line and how fast, the frames it sent that the format does not define, and hints such as "try `--format twilio`". `--first-speaker` sets the wait before the line, as for `run` (`auto` by default). It exits with `0` when the bot answered with no format errors, and `1` otherwise.
-- `evalkit voice-test call --script script.json --out DIR` runs one scripted call and writes `recording.wav` (two channels at 16 kHz: the caller as sent, the bot as heard), `events.jsonl` and `call.json`. `--analyse` also writes `scorecard.json`. A line's audio is a WAV file, the deterministic synthetic speech signal, or a plan's `audio`.
+- `evalkit voice-test call --script script.json --out DIR` runs one scripted call (a caller with a goal needs the run's turn endpoint, so it runs only within `run`) and writes `recording.wav` (two channels at 16 kHz: the caller as sent, the bot as heard), `events.jsonl` and `call.json`. `--analyse` also writes `scorecard.json`. A line's audio is a WAV file, the deterministic synthetic speech signal, or a plan's `audio`.
 - `evalkit voice-test refbot --format pcm16 --port 19500` runs the reference bot. Its delays, talk-over and interruptions are known, and it logs the ground truth, so you can try the caller with no bot of your own.
 
 `python -m evalkit.voicetest` takes the same commands.
@@ -696,6 +843,10 @@ evalkit.clear_error_fingerprint(token)
 @evalkit.trace_function(error_fingerprint="payments-declined")
 def charge(card): ...
 ```
+
+A call to the SyntropyLabs API that the server refuses (`generate_scenarios`, `feedback`, `prompts.get`, `Eval`, `evaluate_simulation`) raises `evalkit.ApiError`; the simulated user's `SimulatedUserError` carries the same status and reason. Its message names the call, the status and the server's own reason, such as `POST /scenarios/generate: HTTP 400: No model to generate scenarios with. ...`; `status` (also `code`), `server_message`, `response_text` and `retry_after` (the seconds a 429 or 503 asked to wait, or None) carry the parts. It is an `urllib.error.HTTPError`, so code that catches that keeps working. Neither your subscription key nor a provider key the call carried appears in it.
+
+Every call the SDK and the `evalkit` CLI make with your key (span export, these API calls, the voice test API, the coding-agent hooks) follows a redirect only within the same origin, or from http to https on the same host. A redirect anywhere else is refused and raises (or, for the exporter, reports) its own 30x status with the message `refused a redirect to <origin>: ...`, so the key never reaches a server a redirect names. A signed storage URL, which carries no key of yours, follows its redirects as before.
 
 Model calls record the exception the provider raised, including one that ends a stream part way. To also record exceptions nothing in your app caught, pass `capture_unhandled=True` to `init()`. EvalKit then records each uncaught exception of the main thread (`sys.excepthook`), of another thread (`threading.excepthook`) and of an asyncio task or callback (the event loop's exception handler) as an error span, and hands it on to the hook that was installed before, so your own handler, or Python's default output, runs as it did.
 
@@ -1075,7 +1226,7 @@ with prompt.stamped():
 evalkit.Eval("support-golden", data=rows, evaluators=[RULE_ID], hyperparameters=prompt.hyperparameters())
 ```
 
-- `evalkit.prompts.get(name, *, label=None, version=None, variables=None, api_url=None, cache_ttl=60.0, timeout=30.0)` fetches a prompt. Pass `label` or `version`, not both, or it raises `ValueError`. The server picks the version: the given `version`, else the given `label`, else the `production` label, else the latest version. With `variables`, the server compiles the template, and the SDK compiles it locally if the server did not.
+- `evalkit.prompts.get(name, *, label=None, version=None, variables=None, api_url=None, cache_ttl=60.0, timeout=30.0, stale_if_error=86400.0)` fetches a prompt. Pass `label` or `version`, not both, or it raises `ValueError`. The server picks the version: the given `version`, else the given `label`, else the `production` label, else the latest version. With `variables`, the server compiles the template, and the SDK compiles it locally if the server did not. Calls for one prompt that arrive while it is being fetched, from any thread, share that fetch. When a refresh gets no answer, a 408, a 429 or a 5xx, the cached copy is served, with a warning on the `evalkit` logger, for up to `stale_if_error` seconds past its TTL, and the next try is 10 seconds later; `stale_if_error=0` raises instead. A refusal (401, 403, 404, 400) is always raised.
 - `prompt.template`, `prompt.variables`, `prompt.config`, `prompt.semver` and `prompt.labels` are what the registry stores.
 - `prompt.compile(variables)` substitutes Mustache-style variables locally. Strings go in as they are, numbers and booleans as text, and objects as JSON. A missing variable raises `ValueError`, which names every missing one.
 - `with prompt.stamped():`, or `prompt.stamp()` and then `prompt.unstamp()`, stamps every `llm_call` span created in that context. The span gets `prompt.ref` (`name@version`), `prompt.name` and `prompt.version`. Attributes you set yourself win.
@@ -1090,7 +1241,7 @@ Simulation tests your agent against simulated users in three steps. You generate
 
 ### Generate scenarios
 
-`generate_scenarios()` has the server write test scenarios. Pass `provider`, `api_key` and `model` to generate with your own provider key; without them the server uses its default model:
+`generate_scenarios()` has the server write test scenarios. Pass `provider`, `api_key` and `model` to generate with your own provider key, used for that request only and never stored (`provider="gemini"` and `"google"` are the same). `provider` and `model` without a key use your organization's connection for that provider; with none of them, your organization's text model under Models in the console is used. With none of those the API answers 400 naming both ways to fix it (add a model in the console, or pass a key), raised as `evalkit.ApiError` with that message:
 
 ```python
 scenarios = evalkit.generate_scenarios(
@@ -1103,7 +1254,7 @@ scenarios = evalkit.generate_scenarios(
 )
 ```
 
-It returns a list of scenario dicts, and `count` defaults to 5. It also accepts `function_schemas`, `context`, `rag`, `categories`, `temperature`, `reasoning_effort`, `max_completion_tokens`, `max_tokens`, `api_url` and `scripted_turns`.
+It returns a list of scenario dicts, and `count` defaults to 5. Nothing is saved on the server and no set id comes back: keep the list, or pass it on. To voice-test generated scenarios, write their turns out and play them inline: `evalkit.voicetest.run(url, format="pcm16", scenarios=evalkit.generate_scenarios(..., scripted_turns=True))` (see [Testing your voice bot](#testing-your-voice-bot)). It also accepts `function_schemas`, `context`, `rag`, `categories`, `temperature`, `reasoning_effort`, `max_completion_tokens`, `max_tokens`, `api_url` and `scripted_turns`.
 
 By default each scenario is a brief for the live simulated user: its `persona`, `user_goal` (what the user wants and what would satisfy them), `hidden_info` (facts the user knows but shares only once the agent asks about them, as `{"key": {"value", "reveal_trigger"}}`), `success_criteria` (what a correct agent does) and its opening message in `starting_prompt`, with no later turns. `scripted_turns=True` writes every user turn out in `turns` instead, for replaying a conversation verbatim. Either way a scenario also carries `expected_tools`, `constraints`, `target_keywords` and `tool_fixtures`.
 

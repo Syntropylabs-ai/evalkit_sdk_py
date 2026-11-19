@@ -5,7 +5,12 @@ Needs the ``voice`` extra (``pip install 'syntropylabs-evalkit[voice]'``: numpy,
 webrtcvad). Importing this package loads none of them and starts nothing; each is imported by the code
 that uses it. Logging goes to the ``evalkit.voicetest`` loggers.
 
-- `run(url, format=..., scenario_set=...)`: the SDK run (``evalkit voice-test run``).
+- `run(url, format=..., about="what the bot does")`: the SDK run (``evalkit voice-test run``) with callers
+  written for it, each with a goal, who answer what the bot actually says; or `run(..., scenarios=[...])`
+  with inline scenarios (exact lines, or goals), or `run(..., scenario_set=...)` with a set saved in the
+  console.
+- `load_scenarios(path)`: the inline scenarios of a YAML or JSON file (``evalkit voice-test init``
+  writes a starter one).
 - `check(url, format=...)`: one short call to see whether the bot answers and speaks the format.
 - `run_planned_call(...)`: one plan call placed and reported, shared with the hosted runner.
 - `script_from_plan_call(call)`: a plan call as a `Script` and its line sources.
@@ -34,6 +39,9 @@ _EXPORTS = {
     "PlannedCall": ".plan",
     "PlanError": ".plan",
     "target_from_settings": ".plan",
+    "load_scenarios": ".scenarios",
+    "normalize_scenarios": ".scenarios",
+    "ScenarioError": ".scenarios",
     "VoiceTestApi": ".api",
     "VoiceTestApiError": ".api",
     "AudioCache": ".audio_cache",

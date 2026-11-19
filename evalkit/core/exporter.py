@@ -12,6 +12,8 @@ import urllib.request
 from datetime import timezone
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
+from evalkit_cli.redirects import urlopen
+
 from .health import ExportHealth, clip
 from .limits import fit_dict
 from .redact import _resolve_flag
@@ -385,7 +387,7 @@ class _Exporter:
             # cannot hold a flush at exit for the full socket timeout.
             timeout = min(10.0, max(0.05, deadline - _clock()))
             try:
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                with urlopen(req, timeout=timeout) as resp:
                     return resp.status, _text(resp) if self._debug else "", None
             except urllib.error.HTTPError as e:
                 if not _retryable(e.code):

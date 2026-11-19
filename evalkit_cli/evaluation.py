@@ -300,6 +300,9 @@ def _client(key: str, api_url: str) -> Any:
 
 
 def _http_detail(exc: urllib.error.HTTPError) -> str:
+    carried = getattr(exc, "server_message", None)
+    if carried:
+        return f"HTTP {exc.code}: {carried}"
     text = getattr(exc, "response_text", None) or ""
     try:
         body = json.loads(text)

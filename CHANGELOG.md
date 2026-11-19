@@ -1,5 +1,144 @@
 # Changelog
 
+## 0.3.9 — unreleased (set the date at publish)
+
+Voice tests need nothing saved in the console: the callers can be written for you from what your bot
+does, or come from a file, and the caller's voice and model can run on your own provider keys. A caller
+with a goal hears your bot and answers what it actually says.
+
+### Added
+- Dynamic callers (RUN_API sections 3.1.1 and 3.4, CONTRACT section 4.1). `evalkit voice-test run --about
+  "what your bot does"` (or `--about-file FILE`) has SyntropyLabs write `--callers N` callers (1 to 20,
+  default 5), each with a goal; no file and no console set are needed. A scenario in `--scenarios` may
+  give a `goal` instead of `lines`, with `persona`, `facts` (kept back until asked), `opening`,
+  `successCriteria`, `maxTurns` (1 to 20, default 8) and `interrupt: {turn, afterBotMs}`; the parser
+  checks the API's limits and names the file, scenario and field. `--max-turns N` sets `maxTurns` where a
+  scenario sets none. In Python, `evalkit.voicetest.run(url, format=..., about=..., callers=5,
+  max_turns=..., caller=...)`, and a scenario from `generate_scenarios()` without scripted turns plays as
+  a goal scenario (its `user_goal`, `hidden_info` and opening).
+- The live caller loop. After each bot answer the caller sends the answer as heard (a 16 kHz mono WAV,
+  its last 60 s at most) to `POST /v1/voice-tests/:runId/calls/:callIndex/turns`, keeps sending silence
+  while it waits, and says the line that comes back. If the bot speaks again while the line is decided,
+  the caller waits for it, and drops the line and asks once more (`retake`) when the bot spoke 1,000 ms
+  or more. A planned interruption cuts into the bot's answer with the line written the turn before (and
+  is `not_reached` when the answer ends first). `done` ends the call after an optional last line; after
+  the last line the bot's answer is still sent, after the hang-up, so the transcript ends with it.
+  Rate limits and overloads are asked again after `Retry-After` while the call's budget lasts; any other
+  refusal ends the call at once as `caller_turn_failed`, which exits `2` like the other failures of the
+  testing side. The 20 ms pacing and the speech detection are unchanged.
+- The caller's model from your own key: `--caller-provider` (default `google`), `--caller-model` and
+  `--caller-key-env` (default `GOOGLE_API_KEY`, then `GEMINI_API_KEY`, for google; `<PROVIDER>_API_KEY`
+  otherwise), the key read from the environment only. It is sent as `caller.apiKey` with the create and
+  again in every turn request's `keys`, with `voice.apiKey`, since the API keeps neither, and it is kept
+  out of every message, log line and file the SDK writes. Without it, the organization's audio-capable
+  model decides the lines, else the SyntropyLabs model on a plan with platform minutes.
+- The scorecard of a dynamic call (CONTRACT section 5): each turn's `heard` and `caller_text`, the call's
+  `mode` and `transcript` (`[{turn, role, text}]`, with `think_ms` on the caller's decided lines), and in
+  caller health `think_ms_p50`, `turn_requests`, `turn_failures` and `retakes`. The caller's think time is
+  never silence or lateness, and a scripted call's figures are unchanged. `prosody.stock_phrases` is
+  measured from `heard`. The trace carries `evalkit.voice.v1.call.mode`, `transcript.bot` and
+  `turn.think_ms`.
+- The run's summary shows each dynamic call's turns and a short excerpt of its conversation, Voice Task
+  Success per call, the caller's model and whose key it ran on, and the SyntropyLabs model minutes left
+  this month. `--json` adds `mode`, `turnsTaken` and `transcript` to each call, and `caller` and
+  `platformMinutesLeft` to the run.
+- The hosted runner places dynamic calls through the same `run_planned_call`, asking the turn endpoint
+  with its run token and no request keys.
+- `evalkit voice-test run --scenarios FILE`: scripted scenarios from a YAML or JSON file, sent with the
+  run as `POST /v1/voice-tests` `scenarios`, instead of `--scenario-set`. Each scenario has a `name`,
+  `lines` (a line is its text, or `text` with a `wait` and a planned interruption, `interruptAfterBotMs`)
+  and optional `successCriteria`. The API's limits (50 scenarios, 40 lines each, 500 characters a line,
+  50 calls a run) are checked first, and a mistake names the file, the scenario and the line.
+  `evalkit.voicetest.run(scenarios=[...])` takes the same, a file path, or what
+  `generate_scenarios(..., scripted_turns=True)` returns; `evalkit.voicetest.load_scenarios(path)` reads
+  a file. The ids of a set's subset are now `scenario_ids=` (a list of ids in `scenarios` with
+  `scenario_set` still means the subset).
+- `evalkit voice-test init [PATH]`: writes a starter `voice-tests.yaml` (three refund-desk callers: two
+  with a goal, one of them cutting in on the bot, and one with exact lines), or JSON for a `.json` path;
+  `--force` overwrites.
+- The caller's voice from your own key: `--tts-provider PROVIDER`, with optional `--tts-model` and
+  `--tts-voice` (the API picks what they leave out) and `--tts-key-env`, the key read from the
+  environment (`OPENAI_API_KEY`, `GOOGLE_API_KEY` or `GEMINI_API_KEY`, `ELEVENLABS_API_KEY`,
+  `CARTESIA_API_KEY`, else `<PROVIDER>_API_KEY`), never from the command line; unset, no key is sent and
+  the organization's stored key is used. In Python, `voice={"provider", "model"?, "voice"?, "api_key"?}`. It is sent as `voice.apiKey` in the
+  create request only and kept out of every message, log line and file the SDK writes. When the API
+  refuses to create a run, the command prints its reason on its own line and exits with `2`.
+- `evalkit.ApiError`: a call to the SyntropyLabs API that the server refuses raises it, an
+  `urllib.error.HTTPError` whose message is the call, the status and the server's own reason
+  (`POST /scenarios/generate: HTTP 400: ...`), with `status`, `server_message`, `response_text` and
+  `retry_after`. Your subscription key and a provider key the call carried are kept out of it.
+- PyYAML joins the `voice` extra, for YAML scenario files.
+- The scorecard's `prosody` section (CONTRACT section 5.1, `prosody-v1`): the bot channel's pitch (F0
+  by YIN: median, range and variation in semitones), speaking rate (syllable nuclei a second), pauses
+  inside its speech (count, longest, regularity), loudness variation and clipping, per bot turn, for the
+  greeting and for the call. numpy only, imported when a recording is analysed. A repeated stock phrase
+  count is reported as skipped until a bot transcript exists. The `voice_prosody` evaluator reads it.
+
+### Changed
+- `evalkit voice-test run` takes exactly one of `--about`, `--about-file`, `--scenarios` and
+  `--scenario-set`, and says so when none is given.
+- `generate_scenarios()` documents that the server saves nothing and returns no set id, and that a
+  keyless call uses the organization's text model.
+- `evalkit coding doctor` reports the receiver's own message with a refused request's status.
+- Voice silence counts only the bot going quiet mid-answer: gaps over 3,000 ms inside the bot's reply,
+  from its first speech after the caller's line to its last in the turn, where neither side speaks. The
+  caller's own waits (a fixed wait, a long `silenceMs`, the wait before hanging up) no longer fail Voice
+  Silence; the wait for the bot's first word is still the response delay, and an unanswered turn is still
+  over its limit. The scorecard names its definitions as `analysis.version`, `timing-v2` (a scorecard
+  without it is `timing-v1`), and the `voice.call` span carries it as `evalkit.voice.v1.analysis_version`.
+
+### Security
+- A captured form-encoded body (`username=alice&password=...`, an OAuth token request with
+  `client_secret=...` and `refresh_token=...`) has its secret-named fields masked, as a query string's
+  are, bracketed names included (`user[password]`, `user%5Bpassword%5D`, as Rails, Laravel and PHP
+  forms send them). These bodies were exported with the password or client secret in clear.
+- Every request the SDK and the `evalkit` CLI send with a credential (span export, `prompts.get()`,
+  `feedback()`, `Eval()`, the simulation calls, the voice test API with the subscription key or a run
+  token, the coding-agent hooks and `doctor`) follows a redirect only within the same origin, or from
+  http to https on the same host. urllib followed any redirect with the key in its headers, so a
+  misconfigured proxy or a compromised host could send it to a server of its choosing. A redirect
+  anywhere else now raises (or, for the exporter, reports) its own 30x status with the message
+  `refused a redirect to <origin>: ...`. A signed storage URL, which carries no key, follows its
+  redirects as before. The OpenCode plugin that `evalkit coding install` writes refuses every redirect;
+  run `evalkit coding install --vendor opencode` again to update an installed one.
+
+### Fixed
+- `prompts.get()` serves the copy it has cached when a refresh gets no answer, a 408, a 429 or a 5xx,
+  for up to `stale_if_error` seconds (24 hours by default; 0 raises instead) past `cache_ttl`, with a
+  warning on the `evalkit` logger, and tries again 10 seconds later. A refusal (401, 403, 404, 400) is
+  still raised. Calls for one prompt that arrive, from any thread, while it is being fetched wait for
+  that fetch instead of each sending their own.
+- With more than one of the function tracer's import finders installed (a tracer reset and installed
+  again), each asked the others and an import recursed until it failed. A finder now skips every finder
+  of its kind, which it knows by an attribute: the published wheel is minified, and renames the class
+  name they were told apart by.
+- `evalkit.init()` skips quietly an installed OpenTelemetry instrumentor whose library version it does
+  not support (`raise_exception_on_conflict=True`), instead of the instrumentor logging an error into
+  the host app's logs.
+- The test caller's `voice.turn` spans are `agent` spans, as the bot's own are, so the trace waterfall
+  shows them; as `log` rows they were hidden by its default log filter.
+- A line with `interruptAfterBotMs` whose bot finished its answer before that point waited out the wait's
+  `maxMs` (15 s by default) and then spoke, leaving dead air that failed Voice Silence and an interruption
+  nothing scored. The caller now says the line as a normal turn once the bot has been quiet for the wait's
+  `silenceMs` (700 ms by default), and logs `interrupt_not_reached` `{index, bot_spoke_ms}`. The turn's
+  new `interruption_status` is `not_reached` (else `reached` or `max_wait`, with
+  `interruption_bot_spoke_ms`, the call's `interruption_not_reached_count` and the span's
+  `evalkit.voice.v1.interruption.status`), and Voice Interruption Stop leaves it out with the reason "the
+  bot finished before the planned interruption point". The run's summary names how many were not reached.
+- A create gets 120 s before it is retried (other calls keep 30 s): a run with many new lines to
+  synthesize took longer than 30 s to answer, and each retry synthesized the lines again. The API now
+  answers a retry of a create still in progress with that run, or a `503` with `Retry-After`.
+- `evalkit.instrument_pipecat` and `evalkit.instrument_livekit_agents` in a bot that never called
+  `evalkit.init()` (no key where it runs) return None with one warning, so the bot takes its calls
+  untraced. They raised, and the bot dropped every call at connect.
+- `evalkit.voicetest.run(scenarios=...)` takes a loaded scenarios file as it is, `{"scenarios": [...]}`.
+  It was read as a list of set ids.
+- A stretch of constant level in the bot's audio (DC, digital silence at an offset) read as a 395 Hz
+  pitch and widened its pitch range; it now has no pitch.
+- `evalkit voice-test check` against a bot that answers nothing usable (no audio, or audio with no speech)
+  now hints the other `--format` first, with the `pcm16` sample rates to try and the endpoint path, before
+  the URL and headers; it read "the bot sent no audio", although the usual cause is the format.
+
 ## 0.3.8 — 2026-11-01
 
 Voice bots built on Pipecat or LiveKit Agents report each turn's timing, and join the session of a

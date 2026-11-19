@@ -221,10 +221,12 @@ pip install "syntropylabs-evalkit[voice]"
 
 evalkit voice-test check --url ws://localhost:8765/ws --format pcm16            # reachable? answers? (no backend)
 evalkit voice-test run --url ws://localhost:8765/ws --format pcm16 \
-    --scenario-set <scenarioSetId> --header "Authorization=Bearer $BOT_TOKEN"   # exit 0 passed, 1 failed
+    --about "A refund desk for an online shop." --header "Authorization=Bearer $BOT_TOKEN"   # exit 0 passed, 1 failed
 ```
 
-`run` creates the run with your subscription key, downloads the caller's synthesized lines (checked by sha256 and cached), calls the bot once per scripted scenario and repeat, and measures each call from its recording: the response delay, talk-over, interruptions and silences. It then uploads each recording (unless `--timing-only`), sends each call's `voice.call` trace with the call's session token as `session.id`, posts each result, and waits for the voice evaluators' verdict. It exits with `0` when the run passed, `1` when it failed, `2` on a setup or network failure, and `130` when it was interrupted. A call that fails is reported with its error and the run goes on. The bot's `--header` values and the URL's query are sent to the bot only. From Python, `evalkit.voicetest.run(url, format=..., scenario_set=...)` returns the run, and its `exit_code`. The README section [Testing your voice bot](README.md#testing-your-voice-bot) lists every option, the output and the local tools (`check`, `call`, `refbot`).
+The callers come from exactly one of `--about` (SyntropyLabs writes callers with goals from what your bot does), `--scenarios FILE` (callers with goals or exact lines; `evalkit voice-test init` writes a starter) and `--scenario-set <scenarioSetId>`. A caller with a goal sends each bot answer to SyntropyLabs during the call and says the line it gets back, so it answers what your bot actually says.
+
+`run` creates the run with your subscription key, downloads the caller's synthesized lines (checked by sha256 and cached), calls the bot once per scenario and repeat, and measures each call from its recording: the response delay, talk-over, interruptions and silences. It then uploads each recording (unless `--timing-only`), sends each call's `voice.call` trace with the call's session token as `session.id`, posts each result, and waits for the voice evaluators' verdict. It exits with `0` when the run passed, `1` when it failed, `2` on a setup or network failure, and `130` when it was interrupted. A call that fails is reported with its error and the run goes on. The bot's `--header` values and the URL's query are sent to the bot only. From Python, `evalkit.voicetest.run(url, format=..., about=...)` (or `scenarios=...`, or `scenario_set=...`) returns the run, and its `exit_code`. The README section [Testing your voice bot](README.md#testing-your-voice-bot) lists every option, the output and the local tools (`check`, `call`, `refbot`).
 
 ## Web frameworks
 

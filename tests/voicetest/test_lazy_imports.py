@@ -24,7 +24,9 @@ MODULES = [
     "evalkit.voicetest.transport.pcm16",
     "evalkit.voicetest.recording",
     "evalkit.voicetest.script",
+    "evalkit.voicetest.scenarios",
     "evalkit.voicetest.sources",
+    "evalkit.voicetest.turns",
     "evalkit.voicetest.caller",
     "evalkit.voicetest.refbot",
     "evalkit.voicetest.analysis",
@@ -45,7 +47,7 @@ def test_importing_loads_no_optional_dependency():
     _run(
         "import sys, threading\n"
         f"for m in {MODULES!r}: __import__(m)\n"
-        "heavy = sorted(m for m in ('numpy', 'websockets', 'webrtcvad') if m in sys.modules)\n"
+        "heavy = sorted(m for m in ('numpy', 'websockets', 'webrtcvad', 'yaml') if m in sys.modules)\n"
         "assert not heavy, heavy\n"
         "assert threading.active_count() == 1\n"
     )

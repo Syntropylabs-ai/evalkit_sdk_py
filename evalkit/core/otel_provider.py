@@ -802,7 +802,9 @@ def _register_all_instrumentors(provider: Any) -> None:
         try:
             if ep.name in _SKIP_INSTRUMENTORS:
                 continue
-            ep.load()().instrument(tracer_provider=provider)
+            # An instrumentor for a library version it does not support raises (and is skipped)
+            # rather than logging an error into the host app's logs, which init() leaves alone.
+            ep.load()().instrument(tracer_provider=provider, raise_exception_on_conflict=True)
         except Exception:
             pass
 

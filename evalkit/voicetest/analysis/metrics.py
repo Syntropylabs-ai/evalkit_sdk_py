@@ -7,6 +7,11 @@ Who caused an overlap is decided by who started second: a bot segment that start
 speaking is the bot talking over the caller (``talk_over_*``); caller speech that starts while a bot
 segment is already in progress is the caller's doing, either a planned interruption (scored by
 ``interruption_stop_ms``) or an unplanned one (``caller_overlap_ms``, never the bot's score).
+
+Silence is the bot's only: a gap counts when it falls inside the bot's reply, from its first speech after
+the caller's line to its last in the turn. Before and after the reply the caller is the one waiting, by
+its script's rules, and the response delay already measures the wait for the bot's first word. A dynamic
+call's think time (the caller deciding its next line) is the caller's too, so no gap inside it counts.
 """
 
 from __future__ import annotations
@@ -14,11 +19,20 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from .intervals import Interval, clip, gaps, normalize, overlap, percentile, subtract, total_overlap
+from .intervals import Interval, clip, gaps, normalize, overlap, percentile, total_overlap
 
+# The definitions below, as the scorecard's `analysis.version` names them. A scorecard with no `analysis`
+# section was made by `timing-v1`, which counted any gap over 3 s in the turn as silence, the caller's
+# own waits after the bot finished included, and gave a planned interruption no status.
+ANALYSIS_VERSION = "timing-v2"
 SILENCE_MIN_MS = 3000
 CALLER_ERROR_BUDGET_MS = 50
 CALLER_FRAME_MS = 20
+
+# A planned interruption's `interruption_status`, from the caller's events (CONTRACT section 4).
+INTERRUPTION_REACHED = "reached"  # the caller cut in at the planned point
+INTERRUPTION_NOT_REACHED = "not_reached"  # the bot finished first, so the line was a normal turn
+INTERRUPTION_MAX_WAIT = "max_wait"  # the wait ran out first: the bot never spoke, or never paused
 
 
 @dataclass
@@ -31,6 +45,10 @@ class CallerLine:
     after_bot_ms: Optional[int] = None
     # The call ended before the line's line_end: its end is the call end.
     truncated: bool = False
+    # A planned interruption's outcome (INTERRUPTION_*); None when unknown, which is scored as reached.
+    interruption_status: Optional[str] = None
+    # From `interrupt_not_reached`: how far into its speech the bot got before it finished.
+    bot_spoke_ms: Optional[int] = None
 
 
 @dataclass
@@ -39,6 +57,7 @@ class Wait:
     end_ms: int
     index: Optional[int] = None
     reason: Optional[str] = None
+    end_reason: Optional[str] = None
 
 
 @dataclass
@@ -56,6 +75,16 @@ class CallTimeline:
     bot_chunk_bytes: int = 0
     clears: List[Tuple[int, int]] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
+    # "scripted" or "dynamic" (CONTRACT section 4.1), from call.json's script.
+    mode: str = "scripted"
+    # A dynamic call's turn answers: what the bot said before line `index`, as the turn endpoint heard
+    # it (the last answer for the index, so a retake's replaces the first).
+    heard: Dict[int, Optional[str]] = field(default_factory=dict)
+    # Where the caller was deciding a line: [line_start - think ms, line_start].
+    think_spans: List[Tuple[int, int]] = field(default_factory=list)
+    turn_requests: int = 0
+    turn_failures: int = 0
+    retakes: int = 0
 
 
 def _int(value: Any, default: Optional[int] = None) -> Optional[int]:
@@ -69,11 +98,13 @@ def _int(value: Any, default: Optional[int] = None) -> Optional[int]:
 _DROP_EVENT_TYPES = ("dropped", "frame_dropped", "drop", "dropped_frames")
 
 
-def timeline_from_events(events: Iterable[Dict[str, Any]], duration_ms: int) -> CallTimeline:
-    timeline = CallTimeline(duration_ms=int(duration_ms))
+def timeline_from_events(events: Iterable[Dict[str, Any]], duration_ms: int, mode: str = "scripted") -> CallTimeline:
+    timeline = CallTimeline(duration_ms=int(duration_ms), mode="dynamic" if mode == "dynamic" else "scripted")
     starts: Dict[int, Dict[str, Any]] = {}
     ends: Dict[int, int] = {}
     planned: Dict[int, Optional[int]] = {}
+    not_reached: Dict[int, Optional[int]] = {}
+    wait_ends: Dict[int, str] = {}
     open_waits: List[Tuple[Optional[int], int, Optional[str]]] = []
     for event in events:
         kind = event.get("type")
@@ -85,10 +116,15 @@ def timeline_from_events(events: Iterable[Dict[str, Any]], duration_ms: int) -> 
             ends[index] = t
         elif kind == "interrupt_planned" and index is not None:
             planned[index] = _int(event.get("after_bot_ms"))
+        elif kind == "interrupt_not_reached" and index is not None:
+            not_reached[index] = _int(event.get("bot_spoke_ms"))
         elif kind == "wait_start":
             reason = event.get("reason")
             open_waits.append((index, t, reason if isinstance(reason, str) else None))
         elif kind == "wait_end":
+            end_reason = event.get("reason") if isinstance(event.get("reason"), str) else None
+            if index is not None and end_reason is not None:
+                wait_ends.setdefault(index, end_reason)
             # The wait with the same index, else the most recent one still open.
             match = next(
                 (k for k in range(len(open_waits) - 1, -1, -1) if index is not None and open_waits[k][0] == index),
@@ -96,9 +132,22 @@ def timeline_from_events(events: Iterable[Dict[str, Any]], duration_ms: int) -> 
             )
             if match is not None:
                 w_index, w_start, w_reason = open_waits.pop(match)
-                timeline.waits.append(Wait(w_start, max(w_start, t), w_index, w_reason))
+                timeline.waits.append(Wait(w_start, max(w_start, t), w_index, w_reason, end_reason))
         elif kind == "think" and index is not None:
-            timeline.think_ms[index] = timeline.think_ms.get(index, 0) + max(0, _int(event.get("ms"), 0) or 0)
+            think = max(0, _int(event.get("ms"), 0) or 0)
+            timeline.think_ms[index] = timeline.think_ms.get(index, 0) + think
+            if think:
+                timeline.think_spans.append((max(0, t - think), t))
+        elif kind == "turn_answer" and index is not None:
+            heard = event.get("heard")
+            timeline.heard[index] = heard.strip() if isinstance(heard, str) and heard.strip() else None
+        elif kind == "turn_request":
+            if not event.get("attempt"):
+                timeline.turn_requests += 1
+        elif kind == "turn_failed":
+            timeline.turn_failures += 1
+        elif kind == "retake":
+            timeline.retakes += 1
         elif kind == "pacing":
             late = _int(event.get("late_ms"), 0) or 0
             timeline.pacing.append((t, late))
@@ -134,36 +183,39 @@ def timeline_from_events(events: Iterable[Dict[str, Any]], duration_ms: int) -> 
                 planned_interruption=index in planned,
                 after_bot_ms=planned.get(index),
                 truncated=truncated,
+                interruption_status=_interruption_status(index, planned, not_reached, wait_ends),
+                bot_spoke_ms=not_reached.get(index),
             )
         )
     timeline.lines.sort(key=lambda line: (line.start_ms, line.index))
     return timeline
 
 
-def _first_word_after(bot: Sequence[Interval], t: int) -> Optional[int]:
-    """The earliest instant at or after ``t`` at which the bot is speaking."""
-    for start, end in bot:
-        if end > t:
-            return max(start, t)
-    return None
+def _interruption_status(
+    index: int, planned: Dict[int, Optional[int]], not_reached: Dict[int, Optional[int]], wait_ends: Dict[int, str]
+) -> Optional[str]:
+    """What became of a planned interruption, by the caller's own record of why its wait ended."""
+    if index not in planned:
+        return None
+    if index in not_reached:
+        return INTERRUPTION_NOT_REACHED
+    reason = wait_ends.get(index)
+    if reason == "interrupt":
+        return INTERRUPTION_REACHED
+    return INTERRUPTION_MAX_WAIT if reason is not None else None
 
 
-def _excluded_from_silence(
-    timeline: CallTimeline, bot: Sequence[Interval], lines_by_index: Dict[int, CallerLine]
-) -> List[Interval]:
-    """Caller think time, and the caller's waiting before the bot's first word (that gap is the response
-    delay, which is scored on its own)."""
-    excluded: List[Interval] = []
-    for index, ms in timeline.think_ms.items():
-        line = lines_by_index.get(index)
-        if line is not None and ms > 0:
-            excluded.append((line.start_ms - ms, line.start_ms))
-    for wait in timeline.waits:
-        first = _first_word_after(bot, wait.start_ms)
-        end = wait.end_ms if first is None else min(wait.end_ms, first)
-        if end > wait.start_ms:
-            excluded.append((wait.start_ms, end))
-    return normalize(excluded)
+def _reply_silences(caller: Interval, reply: Sequence[Interval], bot: Sequence[Interval], lo: int, hi: int,
+                    thinking: Sequence[Interval] = ()) -> List[Interval]:
+    """Gaps over SILENCE_MIN_MS inside the bot's reply, from its first speech after the caller's line to
+    its last in the turn, where neither side speaks and the caller is not deciding its next line. A turn
+    with no reply has none: its wait is the response delay's, and an unanswered turn is already over that
+    limit."""
+    if not reply:
+        return []
+    start, end = max(lo, reply[0][0]), min(hi, max(e for _, e in reply))
+    speech = normalize(clip([caller], lo, hi) + clip(bot, lo, hi) + clip(list(thinking), lo, hi))
+    return [g for g in gaps(speech, start, end) if g[1] - g[0] > SILENCE_MIN_MS]
 
 
 def compute_turns(
@@ -174,8 +226,6 @@ def compute_turns(
     tol = max(0, int(onset_tolerance_ms))
     bot: List[Interval] = sorted((int(s), int(e)) for s, e in bot_segments)
     lines = timeline.lines
-    lines_by_index = {line.index: line for line in lines}
-    excluded = _excluded_from_silence(timeline, bot, lines_by_index)
     turns: List[Dict[str, Any]] = []
     for n, line in enumerate(lines):
         lo = line.start_ms
@@ -184,21 +234,24 @@ def compute_turns(
         caller = (line.start_ms, line.end_ms)
 
         assigned = [s for s in bot if lo <= s[0] < hi]
-        response = next((max(0, s[0] - line.end_ms) for s in assigned if s[0] >= line.end_ms - tol), None)
+        # The bot's reply: from the speech the response delay is measured to, on through the turn.
+        reply = [s for s in assigned if s[0] >= line.end_ms - tol]
+        response = max(0, reply[0][0] - line.end_ms) if reply else None
 
         bot_started = [s for s in bot if line.start_ms <= s[0] < line.end_ms - tol]
         talk_over_ms = sum(overlap(s, caller) for s in bot_started)
         in_progress = [s for s in bot if s[0] < line.start_ms < s[1]]
         caller_started_ms = sum(overlap(s, caller) for s in in_progress)
-        if line.planned_interruption:
+        status = line.interruption_status if line.planned_interruption else None
+        # A line whose interruption point the bot never reached was said as a normal turn, so it is
+        # scored as one: no stop time, and any overlap is the caller's own.
+        if line.planned_interruption and status != INTERRUPTION_NOT_REACHED:
             stop = in_progress[-1][1] - line.start_ms if in_progress else None
             interruption_overlap, caller_overlap = caller_started_ms, 0
         else:
             stop, interruption_overlap, caller_overlap = None, 0, caller_started_ms
 
-        speech = normalize(clip([caller], lo, hi) + clip(bot, lo, hi))
-        silent = subtract(gaps(speech, lo, hi), excluded)
-        silences = [g for g in silent if g[1] - g[0] > SILENCE_MIN_MS]
+        silences = _reply_silences(caller, reply, bot, lo, hi, timeline.think_spans)
 
         late = max((ms for t, ms in timeline.pacing if lo <= t < hi), default=0)
         late_count = sum(1 for t, ms in timeline.pacing if lo <= t < hi)
@@ -209,6 +262,10 @@ def compute_turns(
             {
                 "index": line.index,
                 "text": line.text,
+                "caller_text": line.text,
+                # What the bot said in the turn, as the turn endpoint heard it: the answer sent with the
+                # request for the next line (CONTRACT section 5). None for a scripted call.
+                "heard": timeline.heard.get(line.index + 1) if timeline.mode == "dynamic" else None,
                 "window": {"start_ms": lo, "end_ms": hi},
                 "caller": {
                     "speech_start_ms": line.start_ms,
@@ -227,6 +284,8 @@ def compute_turns(
                 "caller_overlap_ms": caller_overlap,
                 "interruption_planned": line.planned_interruption,
                 "interruption_after_bot_ms": line.after_bot_ms,
+                "interruption_status": status,
+                "interruption_bot_spoke_ms": line.bot_spoke_ms if status == INTERRUPTION_NOT_REACHED else None,
                 "interruption_stop_ms": stop,
                 "interruption_overlap_ms": interruption_overlap,
                 "silence_ms": sum(g[1] - g[0] for g in silences),
@@ -284,18 +343,42 @@ def compute_call(
         "silence_ms": sum(t["silence_ms"] for t in scored),
         "caller_overlap_ms": sum(t["caller_overlap_ms"] for t in scored),
         "interruption_count": sum(1 for t in turns if t["interruption_planned"]),
+        "interruption_not_reached_count": sum(
+            1 for t in turns if t.get("interruption_status") == INTERRUPTION_NOT_REACHED
+        ),
         "interruption_stop_p50_ms": _pct(stops, 50),
         "interruption_stop_p95_ms": _pct(stops, 95),
         "bot_speech_ms": sum(e - s for s, e in bot),
         "turn_count": len(turns),
         "scored_turn_count": len(scored),
         "unscored_turns": [t["index"] for t in turns if t["caller_unhealthy"]],
+        "mode": timeline.mode,
+        "transcript": compute_transcript(timeline, turns),
     }
+
+
+def compute_transcript(timeline: CallTimeline, turns: Sequence[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
+    """A dynamic call's conversation in order: each caller line, then what the bot said after it as the
+    turn endpoint heard it. A caller entry carries `think_ms` when its line was decided during the call.
+    None for a scripted call, which has no transcript of the bot."""
+    if timeline.mode != "dynamic":
+        return None
+    out: List[Dict[str, Any]] = []
+    for turn in turns:
+        entry: Dict[str, Any] = {"turn": turn["index"], "role": "caller", "text": turn.get("caller_text") or ""}
+        think = (turn.get("caller") or {}).get("think_ms") or 0
+        if think:
+            entry["think_ms"] = think
+        out.append(entry)
+        if turn.get("heard"):
+            out.append({"turn": turn["index"], "role": "bot", "text": turn["heard"]})
+    return out
 
 
 def compute_caller_health(timeline: CallTimeline, turns: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     """The caller's own figures, reported apart from the bot's scores."""
     think = list(timeline.think_ms.values())
+    decided = sorted(ms for ms in think if ms > 0)
     late = [ms for _, ms in timeline.pacing]
     depths = timeline.queue_depths_ms
     unhealthy = [t["index"] for t in turns if t["caller_unhealthy"]]
@@ -303,6 +386,11 @@ def compute_caller_health(timeline: CallTimeline, turns: Sequence[Dict[str, Any]
         "healthy": not unhealthy and not timeline.errors,
         "think_ms_total": sum(think),
         "think_ms_max": max(think, default=0),
+        # Over the lines decided during a dynamic call; None when every line was planned before it.
+        "think_ms_p50": _pct(decided, 50),
+        "turn_requests": timeline.turn_requests,
+        "turn_failures": timeline.turn_failures,
+        "retakes": timeline.retakes,
         "late_frames": len(late),
         "late_max_ms": max(late, default=0),
         "dropped_frames": sum(frames for _, frames in timeline.dropped_frames),
