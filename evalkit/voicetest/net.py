@@ -20,6 +20,8 @@ from email.utils import parsedate_to_datetime
 from typing import Any, BinaryIO, Callable, Dict, Mapping, Optional, Tuple, TypeVar, Union
 from urllib.parse import urlsplit, urlunsplit
 
+from evalkit_cli.redirects import urlopen
+
 log = logging.getLogger("evalkit.voicetest.net")
 
 T = TypeVar("T")
@@ -157,7 +159,7 @@ def request(
     """
     req = urllib.request.Request(url, data=body, method=method, headers=dict(headers or {}))
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urlopen(req, timeout=timeout) as resp:
             status = resp.getcode()
             if sink is None:
                 data = resp.read() if max_bytes is None else resp.read(max_bytes + 1)

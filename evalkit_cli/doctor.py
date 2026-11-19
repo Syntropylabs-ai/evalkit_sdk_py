@@ -95,7 +95,7 @@ def _read(cfg: SharedConfig, tenant: str, trace: str) -> Tuple[bool, str]:
                 return False, f"read back forbidden at {url}: this receiver predates the '{DEFAULT_TENANT}' alias; pass --tenant <your tenant id> or update the receiver"
             return False, f"read back forbidden at {url}: the key belongs to a different tenant than {tenant!r}"
         if code is None or not 200 <= code < 300:
-            detail = f"HTTP {code}" if code is not None else (error or "no response")
+            detail = _status_text(code, error)
             continue
         rows = _spans_of(body)
         prompt = any(str(row.get("prompt") or "") for row in rows)
@@ -105,14 +105,21 @@ def _read(cfg: SharedConfig, tenant: str, trace: str) -> Tuple[bool, str]:
     return False, f"{detail} at {url}"
 
 
+def _status_text(code: Optional[int], error: Optional[str]) -> str:
+    """The status with the receiver's message, which says what to fix where the status does not."""
+    if code is None:
+        return error or "no response"
+    return f"HTTP {code}: {error}" if error else f"HTTP {code}"
+
+
 def run(cfg: SharedConfig, tenant: Optional[str]) -> Tuple[bool, str]:
     now_ns = time.time_ns()
     trace, root, spans = synthetic_turn(now_ns)
     code, error = send_traces(cfg.endpoint, cfg.key, trace_payload(VENDOR, spans))
     if code is None or not 200 <= code < 300:
-        return False, f"posting spans failed ({f'HTTP {code}' if code is not None else error or 'no response'})"
+        return False, f"posting spans failed ({_status_text(code, error)})"
     code, error = send_logs(cfg.endpoint, cfg.key, enrichment(trace, root, now_ns))
     if code is None or not 200 <= code < 300:
-        return False, f"posting the enrichment failed ({f'HTTP {code}' if code is not None else error or 'no response'})"
+        return False, f"posting the enrichment failed ({_status_text(code, error)})"
     ok, detail = _read(cfg, tenant or DEFAULT_TENANT, trace)
     return ok, f"trace {trace}: {detail}"

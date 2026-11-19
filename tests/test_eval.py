@@ -491,7 +491,11 @@ class TestEval(unittest.TestCase):
                 self._run(server, name="missing-rule", data=[{"input": "q1", "output": "a1"}], evaluators=[RULE_A])
         self.assertEqual(cm.exception.code, 404)
         self.assertIn("Evaluation rule(s) not found", cm.exception.response_text)
-        self.assertEqual(str(cm.exception), "HTTP Error 404: Evaluation rule(s) not found: 665f0c1234567890abcdef12")
+        self.assertEqual(
+            str(cm.exception), "POST /evaluation-runs: HTTP 404: Evaluation rule(s) not found: 665f0c1234567890abcdef12"
+        )
+        self.assertIsInstance(cm.exception, evalkit.ApiError)
+        self.assertEqual(cm.exception.server_message, "Evaluation rule(s) not found: 665f0c1234567890abcdef12")
         self.assertEqual(server.paths(), ["/evaluation-runs"])
         self.assertIsNone(_rows_endpoint_support.get(self.client))
 

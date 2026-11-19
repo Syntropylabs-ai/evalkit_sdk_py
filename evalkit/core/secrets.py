@@ -160,9 +160,20 @@ def is_secret_name(name: str) -> bool:
     return any(word.lower() in _SECRET_NAME_WORDS for word in _NAME_WORD_RE.findall(name))
 
 
+# Rails, Laravel and PHP name a form's nested fields with brackets (user[password],
+# items[0][api_key]): each bracketed part is a field name of its own.
+_BRACKET_PARTS_RE = re.compile(r"[^\[\]]+")
+
+
+def _is_secret_query_name(name: str) -> bool:
+    return is_secret_key(name, True) or bool(SECRET_QUERY_KEY_RE.search(name))
+
+
 def is_secret_query_key(key: str) -> bool:
     decoded = unquote_plus(key)
-    return is_secret_key(decoded, True) or bool(SECRET_QUERY_KEY_RE.search(decoded))
+    if _is_secret_query_name(decoded):
+        return True
+    return "[" in decoded and any(_is_secret_query_name(part) for part in _BRACKET_PARTS_RE.findall(decoded))
 
 
 def is_url(value: str) -> bool:
@@ -224,8 +235,18 @@ def scrub_url(value: str) -> str:
     return scrub_string(out)
 
 
+# A form-encoded body (`username=alice&password=...`), as a login form or an OAuth token request
+# sends it: its secret-named fields are masked as a query string's are. The separators are outside
+# both classes, so a match is linear in the length.
+_FORM_BODY_RE = re.compile(r"^[^=&\s]+=[^&\s]*(?:&[^=&\s]+=[^&\s]*)*$")
+
+
 def _scrub_text(value: str) -> str:
-    return scrub_url(value) if is_url(value) else scrub_string(value)
+    if is_url(value):
+        return scrub_url(value)
+    if _FORM_BODY_RE.match(value):
+        return scrub_string(scrub_query(value))
+    return scrub_string(value)
 
 
 def _scrub_json_string(value: str, header_like: bool, depth: int) -> Optional[str]:

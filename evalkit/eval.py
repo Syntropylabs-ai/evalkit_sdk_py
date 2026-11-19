@@ -476,6 +476,9 @@ class _RunApi:
 
 
 def _server_message(exc: urllib.error.HTTPError) -> Optional[str]:
+    carried = getattr(exc, "server_message", None)
+    if carried:
+        return str(carried)
     try:
         body = json.loads(getattr(exc, "response_text", None) or "")
     except ValueError:

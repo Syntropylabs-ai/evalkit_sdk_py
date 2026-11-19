@@ -322,6 +322,9 @@ class Conversation:
 
 
 def _platform_message(exc: urllib.error.HTTPError) -> str:
+    carried = getattr(exc, "server_message", None)
+    if carried:
+        return str(carried)
     text = getattr(exc, "response_text", None) or ""
     try:
         body = json.loads(text)

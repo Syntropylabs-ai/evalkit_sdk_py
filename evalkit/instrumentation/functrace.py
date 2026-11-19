@@ -67,11 +67,14 @@ def install_function_tracer(
             pass
 
     class _EvalKitTracingFinder:
+        # Marked by an attribute rather than told by its class name, which a minified build renames:
+        # a finder that asked another of its kind would recurse on the next import.
+        _evalkit_finder = True
 
         def find_spec(self, fullname, path=None, target=None):
             try:
                 for finder in list(sys.meta_path):
-                    if finder is self:
+                    if finder is self or getattr(finder, "_evalkit_finder", False):
                         continue
                     find = getattr(finder, "find_spec", None)
                     if find is None:

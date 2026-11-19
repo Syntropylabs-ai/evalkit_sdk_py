@@ -458,6 +458,53 @@ class UrlScrubTest(unittest.TestCase):
         self.assertEqual(event.attributes["http.url"], "https://api.example.com/v1/x?api_key=***")
 
 
+class FormBodyTest(unittest.TestCase):
+    def test_a_form_login_body_keeps_the_user_and_masks_the_password(self):
+        self.assertEqual(
+            scrub_value("username=alice&password=DUMMY-hunter2-pw"),
+            "username=alice&password=***",
+        )
+
+    def test_an_oauth_token_request_masks_its_client_secret_and_refresh_token(self):
+        body = "grant_type=refresh_token&client_id=app1&client_secret=dummy-secret&refresh_token=dummy-refresh"
+        scrubbed = scrub_value(body)
+        self.assertNotIn("dummy-secret", scrubbed)
+        self.assertNotIn("dummy-refresh", scrubbed)
+        self.assertIn("grant_type=refresh_token", scrubbed)
+        self.assertIn("client_id=app1", scrubbed)
+
+    def test_prose_with_an_equals_sign_is_left_as_it_is(self):
+        self.assertEqual(scrub_value("set x=1 and y=2"), "set x=1 and y=2")
+        self.assertEqual(scrub_value("a=b"), "a=b")
+
+    def test_a_bracketed_field_name_is_matched_by_its_parts(self):
+        cases = [
+            ("user%5Bemail%5D=a%40b.c&user%5Bpassword%5D=DUMMY-pw", "user%5Bemail%5D=a%40b.c&user%5Bpassword%5D=***"),
+            ("session%5Bpassword%5D=DUMMY-pw&commit=Log+in", "session%5Bpassword%5D=***&commit=Log+in"),
+            ("user[password]=DUMMY-pw&user[remember_me]=1", "user[password]=***&user[remember_me]=1"),
+            ("items[0][api_key]=DUMMY-k&items[0][name]=a", "items[0][api_key]=***&items[0][name]=a"),
+            ("user[password][confirmation]=DUMMY-pw", "user[password][confirmation]=***"),
+        ]
+        for raw, expected in cases:
+            with self.subTest(raw):
+                self.assertEqual(scrub_value(raw), expected)
+
+    def test_a_bracketed_field_that_names_no_secret_keeps_its_value(self):
+        self.assertEqual(scrub_value("user[max_tokens]=5&user[name]=alice"), "user[max_tokens]=5&user[name]=alice")
+
+    def test_a_bracketed_query_parameter_in_a_url_is_masked(self):
+        self.assertEqual(
+            scrub_value("https://example.com/login?user[password]=DUMMY-pw&next=/home"),
+            "https://example.com/login?user[password]=***&next=/home",
+        )
+
+    def test_the_body_attribute_of_a_captured_request_is_scrubbed(self):
+        envelope = TraceEnvelope(trace_id="t", span_id="s", created_at="2026-11-19T00:00:00Z", operation="POST /token",
+                                 attributes={"http.request.body": "username=a&password=p1"})
+        scrub_secrets(envelope)
+        self.assertEqual(envelope.attributes["http.request.body"], "username=a&password=***")
+
+
 class EnvelopeScrubTest(unittest.TestCase):
     def test_the_operation_is_pattern_scrubbed_only(self):
         for name, raw, expected in OPERATION_CASES:

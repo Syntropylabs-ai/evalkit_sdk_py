@@ -1,6 +1,7 @@
-"""``evalkit voice-test``: `run` tests a bot against a scenario set through SyntropyLabs; `check`, `call`
-and `refbot` are local tools that need no backend (a quick reachability and format check, one scripted
-call, and the reference bot).
+"""``evalkit voice-test``: `run` tests a bot through SyntropyLabs, against callers written from what the bot
+does (``--about``), the scenarios of a YAML or JSON file, or a scenario set; `init` writes a starter
+scenarios file; `check`, `call` and `refbot` are local tools that need no backend (a quick reachability and
+format check, one scripted call, and the reference bot).
 
 `main(argv, prog)` is the entry point (``evalkit voice-test ...`` and ``python -m evalkit.voicetest``);
 `add_subcommands(subparsers)` mounts the commands under another parser. Importing this module loads
@@ -13,8 +14,10 @@ import argparse
 import asyncio
 import json
 import logging
+import os
+import re
 import sys
-from typing import Any, Dict, List, Optional, TextIO
+from typing import Any, Dict, List, Mapping, Optional, TextIO, Tuple
 
 log = logging.getLogger("evalkit.voicetest.cli")
 
@@ -49,12 +52,135 @@ def _voice(value: Optional[str]) -> Optional[Dict[str, str]]:
     return {"provider": parts[0].strip(), "model": parts[1].strip(), "voice": parts[2].strip()}
 
 
+# The environment variables a text-to-speech provider's key is read from, as the console's run commands
+# name them: the variable the provider's own SDK reads. A provider not listed reads <PROVIDER>_API_KEY.
+TTS_KEY_ENV: Mapping[str, Tuple[str, ...]] = {
+    "openai": ("OPENAI_API_KEY",),
+    "google": ("GOOGLE_API_KEY", "GEMINI_API_KEY"),
+    "gemini": ("GOOGLE_API_KEY", "GEMINI_API_KEY"),
+    "elevenlabs": ("ELEVENLABS_API_KEY",),
+    "cartesia": ("CARTESIA_API_KEY",),
+}
+# A variable's name, never its value: a key on the command line would be kept in the shell's history.
+_ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]{0,99}$")
+
+
+def tts_key_env(provider: str) -> Tuple[str, ...]:
+    """Where `provider`'s key is read from: its usual variables, else `<PROVIDER>_API_KEY`."""
+    known = TTS_KEY_ENV.get(provider.lower())
+    if known:
+        return known
+    word = re.sub(r"[^A-Z0-9]+", "_", provider.upper()).strip("_")
+    return (f"{word or 'TTS'}_API_KEY",)
+
+
+def _tts_voice(args, env: Mapping[str, str], err: TextIO) -> Optional[Dict[str, str]]:
+    """The caller's voice from --tts-provider (with --tts-model and --tts-voice when given), and the
+    provider's key read from the environment (--tts-key-env, else the provider's usual variable). The
+    API picks the model and voice the flags leave out. With no variable set, no key is sent, and the
+    organization's stored key for the provider is used."""
+    given = [flag for flag, value in (("--tts-model", args.tts_model), ("--tts-voice", args.tts_voice),
+                                      ("--tts-key-env", args.tts_key_env)) if value]
+    if not args.tts_provider:
+        if given:
+            raise UsageError(f"{', '.join(given)} needs --tts-provider")
+        return None
+    if args.voice:
+        raise UsageError("pass either --voice or --tts-provider, not both")
+    provider = args.tts_provider.strip().lower()
+    # Refused without echoing it: a key pasted here by mistake must not reach the terminal or a CI log.
+    if not re.match(r"^[a-z][a-z0-9_.-]{0,39}$", provider) or provider.startswith(("sk-", "sk_", "aiza")):
+        raise UsageError("--tts-provider takes a provider name, such as openai, google, elevenlabs or cartesia; "
+                         "the key itself is read from the environment")
+    if args.tts_key_env:
+        if not _ENV_NAME.match(args.tts_key_env):
+            raise UsageError("--tts-key-env takes the name of an environment variable in capitals, such as "
+                             "MY_TTS_KEY; the key itself is never taken on the command line")
+        names: Tuple[str, ...] = (args.tts_key_env,)
+    else:
+        names = tts_key_env(provider)
+    spec = {"provider": provider}
+    for flag, value in (("model", args.tts_model), ("voice", args.tts_voice)):
+        if value and value.strip():
+            spec[flag] = value.strip()
+    shown = " ".join(spec.values())
+    for name in names:
+        value = (env.get(name) or "").strip()
+        if value:
+            spec["api_key"] = value
+            print(f"evalkit voice-test: the caller's voice is {shown}, synthesized with the key in {name}",
+                  file=err)
+            return spec
+    print(f"evalkit voice-test: {' and '.join(names)} {'is' if len(names) == 1 else 'are'} not set, so no key is "
+          f"sent; the organization's stored {provider} key will be used", file=err)
+    return spec
+
+
+def _provider_name(value: str, flag: str) -> str:
+    provider = value.strip().lower()
+    # Refused without echoing it: a key pasted here by mistake must not reach the terminal or a CI log.
+    if not re.match(r"^[a-z][a-z0-9_.-]{0,39}$", provider) or provider.startswith(("sk-", "sk_", "aiza")):
+        raise UsageError(f"{flag} takes a provider name, such as google or openai; the key itself is read from "
+                         "the environment")
+    return provider
+
+
+def _caller_model(args, env: Mapping[str, str], err: TextIO) -> Optional[Dict[str, str]]:
+    """The model that decides a dynamic call's lines, from --caller-provider (google when only
+    --caller-model or --caller-key-env is given), --caller-model, and the key read from the environment
+    (--caller-key-env, else the provider's usual variable). With none of the flags no caller is sent, and
+    the API takes the organization's own audio-capable model, else the SyntropyLabs model."""
+    if not (args.caller_provider or args.caller_model or args.caller_key_env):
+        return None
+    from .runner import DEFAULT_CALLER_PROVIDER
+
+    provider = _provider_name(args.caller_provider or DEFAULT_CALLER_PROVIDER, "--caller-provider")
+    if args.caller_key_env:
+        if not _ENV_NAME.match(args.caller_key_env):
+            raise UsageError("--caller-key-env takes the name of an environment variable in capitals, such as "
+                             "GOOGLE_API_KEY; the key itself is never taken on the command line")
+        names: Tuple[str, ...] = (args.caller_key_env,)
+    else:
+        names = tts_key_env(provider)
+    spec = {"provider": provider}
+    if args.caller_model and args.caller_model.strip():
+        spec["model"] = args.caller_model.strip()
+    shown = " ".join(spec.values())
+    for name in names:
+        value = (env.get(name) or "").strip()
+        if value:
+            spec["api_key"] = value
+            print(f"evalkit voice-test: the caller's lines are decided by {shown}, with the key in {name}", file=err)
+            return spec
+    print(f"evalkit voice-test: {' and '.join(names)} {'is' if len(names) == 1 else 'are'} not set, so no caller "
+          f"key is sent; the organization's stored {provider} key will be used", file=err)
+    return spec
+
+
+def _about(args) -> Optional[str]:
+    if args.about is not None:
+        if not args.about.strip():
+            raise UsageError("--about needs a few sentences on what your bot does")
+        return args.about
+    if args.about_file is None:
+        return None
+    try:
+        with open(args.about_file, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise UsageError(f"--about-file {args.about_file}: {getattr(exc, 'strerror', None) or exc}") from None
+    if not text.strip():
+        raise UsageError(f"--about-file {args.about_file} is empty; it should say what your bot does")
+    return text
+
+
 def _first_speaker_flag(p: argparse.ArgumentParser, default: Optional[str]) -> None:
     from .script import FIRST_SPEAKERS  # standard library only, like this module
 
     p.add_argument("--first-speaker", choices=FIRST_SPEAKERS, default=default,
                    help="who opens the call: auto (the default) waits up to 3 s for a greeting to start, "
-                        "bot waits up to 15 s for it, caller speaks at once")
+                        "then for it to end; bot waits for the greeting to end; caller speaks at once. "
+                        "Either wait gives up 15 s after the call opens, even mid-greeting")
 
 
 def _target_flags(p: argparse.ArgumentParser, format_required: bool = True) -> None:
@@ -71,19 +197,54 @@ def _target_flags(p: argparse.ArgumentParser, format_required: bool = True) -> N
 
 
 def _add_run(sub) -> None:
-    p = sub.add_parser("run", help="test the bot against a scenario set and report to SyntropyLabs",
+    p = sub.add_parser("run", help="test the bot with callers and report to SyntropyLabs",
                        description="Creates a voice test run, calls the bot once per planned call, "
-                                   "reports each call and waits for the evaluators. Exit 0 passed, "
-                                   "1 failed, 2 setup or network failure, 130 interrupted.")
+                                   "reports each call and waits for the evaluators. The callers come from "
+                                   "exactly one of --about (we write them from what your bot does), "
+                                   "--scenarios FILE or --scenario-set ID. Exit 0 passed, 1 failed, 2 setup or "
+                                   "network failure, 130 interrupted.")
     _target_flags(p)
-    p.add_argument("--scenario-set", required=True, help="the scenario set id")
+    source = p.add_mutually_exclusive_group()
+    source.add_argument("--about", default=None, metavar="TEXT",
+                        help="what your bot does, in a few sentences: SyntropyLabs writes callers with goals from "
+                             "it, who answer what your bot actually says")
+    source.add_argument("--about-file", default=None, metavar="FILE", help="--about, read from a text file")
+    source.add_argument("--scenarios", default=None, metavar="FILE",
+                        help="a YAML or JSON file of scenarios, with goals or exact lines (evalkit voice-test init "
+                             "writes one)")
+    source.add_argument("--scenario-set", default=None, metavar="ID",
+                        help="the id of a scenario set saved in the console")
+    p.add_argument("--callers", type=int, default=None, metavar="N",
+                   help="with --about: how many callers to write, 1 to 20 (default 5)")
+    p.add_argument("--max-turns", type=int, default=None, metavar="N",
+                   help="caller lines after the opening of each caller with a goal, 1 to 20, where the scenario "
+                        "sets none (default 8)")
+    p.add_argument("--caller-provider", default=None, metavar="PROVIDER",
+                   help="the model provider that hears your bot and decides the caller's lines (default google), "
+                        "with your own key read from the environment")
+    p.add_argument("--caller-model", default=None, metavar="MODEL",
+                   help="the caller's model (default: the API's, gemini-2.5-flash on google)")
+    p.add_argument("--caller-key-env", default=None, metavar="VAR",
+                   help="the environment variable holding the caller's key (default GOOGLE_API_KEY, else "
+                        "GEMINI_API_KEY, for google; <PROVIDER>_API_KEY otherwise)")
     p.add_argument("--scenario", action="append", default=[], metavar="ID",
-                   help="only this scenario of the set (repeatable)")
+                   help="only this scenario of the set (repeatable; with --scenario-set)")
     p.add_argument("--repeats", type=int, default=1, help="calls per scenario (default 1)")
     p.add_argument("--agent", default=None, help="score the run under this registered agent id")
     p.add_argument("--name", default=None, help="the run's name (default: 'voice test <time>')")
     p.add_argument("--voice", default=None, metavar="PROVIDER:MODEL:VOICE",
-                   help="the caller's voice (default: the organisation's)")
+                   help="the caller's voice, synthesized with the organization's connection for the provider "
+                        "(default: the organization's Text-to-Speech model)")
+    p.add_argument("--tts-provider", default=None, metavar="PROVIDER",
+                   help="the caller's voice from your own provider key, read from the environment "
+                        "(OPENAI_API_KEY, GOOGLE_API_KEY or GEMINI_API_KEY, ELEVENLABS_API_KEY, CARTESIA_API_KEY, "
+                        "else <PROVIDER>_API_KEY); unset, the organization's stored key is used")
+    p.add_argument("--tts-model", default=None,
+                   help="the text-to-speech model (default: the project's Text-to-Speech model on the provider, "
+                        "else the API's default for it)")
+    p.add_argument("--tts-voice", default=None, help="the voice (default: as for --tts-model)")
+    p.add_argument("--tts-key-env", default=None, metavar="VAR",
+                   help="the environment variable holding the key, when not the provider's usual one")
     p.add_argument("--timing-only", action="store_true", help="upload no audio; send timings only")
     # Left out unless given, so the API's own default applies.
     _first_speaker_flag(p, None)
@@ -99,6 +260,19 @@ def _add_run(sub) -> None:
                    help="how long to wait for the evaluators after the last call (default 600)")
     p.add_argument("--cache-dir", default=None, help="where downloaded caller audio is kept")
     p.set_defaults(func=_run_run)
+
+
+def _add_init(sub) -> None:
+    from .scenarios import DEFAULT_FILE
+
+    p = sub.add_parser("init", help="write a starter scenarios file for evalkit voice-test run --scenarios",
+                       description="Writes three callers for a refund desk, to edit into your bot's: two with a "
+                                   "goal (one cuts in on the bot) and one with exact lines. YAML unless PATH ends "
+                                   "in .json.")
+    p.add_argument("path", nargs="?", default=DEFAULT_FILE, metavar="PATH",
+                   help=f"where to write it (default {DEFAULT_FILE})")
+    p.add_argument("--force", action="store_true", help="overwrite PATH if it exists")
+    p.set_defaults(func=_run_init)
 
 
 def _add_check(sub) -> None:
@@ -140,6 +314,7 @@ def _add_refbot(sub) -> None:
 
 def add_subcommands(subparsers) -> None:
     _add_run(subparsers)
+    _add_init(subparsers)
     _add_check(subparsers)
     _add_call(subparsers)
     _add_refbot(subparsers)
@@ -170,12 +345,34 @@ def _missing_extra() -> Optional[str]:
 
 def _run_run(args, out: TextIO) -> int:
     from .runner import VoiceTestSetupError, run_async
+    from .scenarios import ScenarioError, load_scenarios
     from .summary import call_lines, run_lines
+
+    from .runner import MAX_CALLERS
 
     try:
         headers = _headers(args.header)
-        voice = _voice(args.voice)
-    except UsageError as exc:
+        if not (args.about is not None or args.about_file or args.scenarios or args.scenario_set):
+            raise UsageError("say who calls your bot: --about \"what your bot does\" (we write the callers), "
+                             "--scenarios FILE (evalkit voice-test init writes one) or --scenario-set ID")
+        if args.scenario and not args.scenario_set:
+            raise UsageError("--scenario picks from a scenario set; with --scenarios, list only the ones to play")
+        about = _about(args)
+        if args.callers is not None:
+            if about is None:
+                raise UsageError("--callers goes with --about or --about-file")
+            if not 1 <= args.callers <= MAX_CALLERS:
+                raise UsageError(f"--callers takes 1 to {MAX_CALLERS}")
+        if args.max_turns is not None:
+            if args.scenario_set:
+                raise UsageError("--max-turns applies to --about and --scenarios; a scenario set's scenarios carry "
+                                 "their own")
+            if not 1 <= args.max_turns <= 20:
+                raise UsageError("--max-turns takes 1 to 20")
+        voice = _tts_voice(args, os.environ, sys.stderr) or _voice(args.voice)
+        caller = _caller_model(args, os.environ, sys.stderr)
+        scenarios = load_scenarios(args.scenarios) if args.scenarios else None
+    except (UsageError, ScenarioError) as exc:
         return _setup_failure(str(exc))
     try:
         from evalkit_cli.config import ConfigStore
@@ -185,8 +382,6 @@ def _run_run(args, out: TextIO) -> int:
         key, api_url = resolve_key(args.key, store), resolve_api_url(args.api_url, store)
     except Exception as exc:  # an unreadable stored config is not worth failing over
         log.debug("the stored config could not be read: %s", exc)
-        import os
-
         key = args.key or os.getenv("EVALKIT_API_KEY") or os.getenv("EVALKIT_SUBSCRIPTION_KEY")
         api_url = args.api_url or os.getenv("EVALKIT_API_URL")
 
@@ -205,7 +400,12 @@ def _run_run(args, out: TextIO) -> int:
             session_query_param=args.session_query_param,
             send_start=not args.no_start,
             scenario_set=args.scenario_set,
-            scenarios=args.scenario,
+            scenarios=scenarios,
+            scenario_ids=args.scenario,
+            about=about,
+            callers=args.callers,
+            caller=caller,
+            max_turns=args.max_turns,
             repeats=args.repeats,
             agent=args.agent,
             name=args.name,
@@ -227,6 +427,31 @@ def _run_run(args, out: TextIO) -> int:
     else:
         _print(out, [""] + run_lines(report))
     return report.exit_code
+
+
+def _run_init(args, out: TextIO) -> int:
+    from .scenarios import describe, starter_scenarios, write_starter
+
+    try:
+        path = write_starter(args.path, force=args.force)
+    except FileExistsError:
+        return _setup_failure(f"{args.path} exists; pass --force to overwrite it")
+    except OSError as exc:
+        return _setup_failure(f"could not write {args.path}: {exc.strerror or exc}")
+    lines = [f"wrote {path}: {describe(starter_scenarios())}",
+             "edit them into your bot's callers, then run them:",
+             f"  evalkit voice-test run --url ws://localhost:8765/ws --format pcm16 --scenarios {path}",
+             "or have the callers written from what your bot does:",
+             "  evalkit voice-test run --url ws://localhost:8765/ws --format pcm16 --about \"a refund desk for an "
+             "online shop\""]
+    if not path.lower().endswith(".json"):
+        try:
+            import yaml  # noqa: F401
+        except ImportError:
+            lines.append("reading YAML needs PyYAML: pip install 'syntropylabs-evalkit[voice]' "
+                         "(or write JSON: evalkit voice-test init voice-tests.json)")
+    _print(out, lines)
+    return EXIT_OK
 
 
 def _run_check(args, out: TextIO) -> int:
@@ -352,7 +577,12 @@ def _configure_logging(verbose: bool) -> None:
 
 def main(argv: Optional[List[str]] = None, prog: str = "evalkit voice-test",
          out: Optional[TextIO] = None) -> int:
-    args = build_parser(prog).parse_args(argv)
+    parser = build_parser(prog)
+    args, unknown = parser.parse_known_args(argv)
+    if unknown:
+        # Named without their values: a value given to an option that does not exist could be a key.
+        flags = sorted({a.split("=", 1)[0] for a in unknown if a.startswith("-")})
+        parser.error(f"unrecognized arguments: {' '.join(flags) or 'extra values'} (values not shown)")
     _configure_logging(args.verbose)
     try:
         return int(args.func(args, out or sys.stdout) or 0)

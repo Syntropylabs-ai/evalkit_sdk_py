@@ -296,3 +296,47 @@ async def test_the_first_line_waits_for_a_greeting_only_if_one_starts(greets, tm
     # Either way the call went on as scripted: the bot answered the line.
     (reply,) = [r for r in truth if r["type"] == "speech_start" and r["kind"] == "reply"]
     assert reply["ms"] > by_type(events, "line_end")[0]["t"]
+
+
+async def test_a_bot_finishing_before_the_interruption_point_is_answered_at_once(tmp_path):
+    from evalkit.voicetest.analysis.scorecard import analyze
+    from evalkit.voicetest.summary import call_lines
+
+    # The bot's answer to line 0 lasts 800 ms; line 1 plans to cut in 2,500 ms into it, with the
+    # default 15 s maxMs. The caller should speak once the bot has been quiet for 700 ms.
+    behaviour = {"default_turn": {"delay_ms": 600, "reply_ms": 800}}
+    script = {
+        "name": "interruption not reached",
+        "lines": [
+            {"text": "first", "synth": {"ms": 700, "seed": 1}, "wait": {"mode": "fixed", "ms": 0}},
+            {"text": "cut in", "synth": {"ms": 600, "seed": 2}, "interrupt_after_bot_ms": 2500},
+        ],
+        "end": {"mode": "bot_done", "silence_ms": 600, "max_ms": 4000},
+    }
+    result, _ = await call("pcm16", 16000, tmp_path, behaviour=behaviour, script=script, hook=None)
+    assert result.ended_by == "script", result.errors
+    events = result.events
+
+    (missed,) = by_type(events, "interrupt_not_reached")
+    assert missed["index"] == 1 and 600 <= missed["bot_spoke_ms"] <= 900
+    (ended,) = [e for e in by_type(events, "wait_end") if e["index"] == 1]
+    assert ended["reason"] == "bot_done" and ended["t"] == missed["t"]
+    (line_end,) = [e for e in by_type(events, "line_end") if e["index"] == 0]
+    (line_start,) = [e for e in by_type(events, "line_start") if e["index"] == 1]
+    # 600 ms to the answer, 800 ms of it, 700 ms of quiet: about 2.1 s, nowhere near the 15 s maxMs.
+    assert 1900 <= line_start["t"] - line_end["t"] <= 2800
+
+    card = analyze(result.out_dir)
+    assert card["analysis"] == {"version": "timing-v2"}
+    first, second = card["turns"]
+    assert second["interruption_planned"] is True and second["interruption_status"] == "not_reached"
+    assert second["interruption_stop_ms"] is None and second["interruption_bot_spoke_ms"] == missed["bot_spoke_ms"]
+    assert second["response_delay_ms"] == pytest.approx(600, abs=60)
+    assert first["silence_ms"] == 0 and card["call"]["max_silence_ms"] == 0
+    assert card["call"]["interruption_not_reached_count"] == 1
+
+    outcome = type("Outcome", (), {"scorecard": card, "error": None, "call_index": 0, "scenario_name": "x",
+                                   "scenario_id": None, "repeat": 0, "duration_ms": None, "problems": [],
+                                   "recording": None})()
+    assert ("  interruptions    1 planned; 1 not reached: the bot finished before the planned interruption "
+            "point") in call_lines(outcome)

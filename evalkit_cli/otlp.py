@@ -9,6 +9,8 @@ import urllib.request
 from datetime import timezone
 from typing import Any, Dict, Iterable, Optional, Tuple
 
+from .redirects import urlopen
+
 _MAX_ATTR = 4096
 MAX_CONTENT = 524288
 SDK_NAME = "evalkit-cli"
@@ -129,15 +131,16 @@ def _retry_wait(attempt: int, header: Optional[str]) -> float:
 
 def _post_once(req: urllib.request.Request, timeout: float) -> Tuple[Optional[int], Optional[str], Optional[str]]:
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urlopen(req, timeout=timeout) as resp:
             return resp.getcode(), None, None
     except urllib.error.HTTPError as exc:
         retry_after = exc.headers.get("Retry-After") if exc.code in (429, 503) and exc.headers is not None else None
+        message = _error_message(exc)
         try:
             exc.close()
         except Exception:
             pass
-        return exc.code, exc.reason, retry_after
+        return exc.code, message, retry_after
     except Exception as exc:
         return None, str(exc), None
 
@@ -188,16 +191,27 @@ def send_traces(
 def get_json(url: str, key: str, timeout: float = 8.0) -> Tuple[Optional[int], Any, Optional[str]]:
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}", "Accept": "application/json"}, method="GET")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", "replace")
             try:
                 return resp.getcode(), json.loads(raw or "{}"), None
             except ValueError:
                 return resp.getcode(), None, "response was not JSON"
     except urllib.error.HTTPError as exc:
-        return exc.code, None, exc.reason
+        return exc.code, None, _error_message(exc)
     except Exception as exc:
         return None, None, str(exc)
+
+
+def _error_message(exc: urllib.error.HTTPError) -> str:
+    """The receiver's own message from an error answer (what to fix), else the reason phrase."""
+    from evalkit.core.api import server_message
+
+    try:
+        text = exc.read(8192).decode("utf-8", "replace")
+    except Exception:
+        text = ""
+    return server_message(text) or str(exc.reason or "")
 
 
 def read_base(endpoint: str) -> str:

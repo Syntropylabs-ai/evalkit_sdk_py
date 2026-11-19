@@ -78,11 +78,14 @@ class TestPrompts(unittest.TestCase):
 
     def test_cache_serves_repeat_reads_until_ttl_expires(self):
         srv, recv, url = _server()
+        clock = [100.0]
         try:
-            with mock.patch("evalkit.prompts.time.monotonic", side_effect=[100.0, 130.0, 170.0]):
+            with mock.patch("evalkit.prompts.time.monotonic", side_effect=lambda: clock[0]):
                 prompts.get("support_agent_system", api_url=url, cache_ttl=60)
+                clock[0] = 130.0
                 prompts.get("support_agent_system", api_url=url, cache_ttl=60)
                 self.assertEqual(recv["count"], 1)
+                clock[0] = 170.0
                 prompts.get("support_agent_system", api_url=url, cache_ttl=60)
                 self.assertEqual(recv["count"], 2)
         finally:
@@ -165,6 +168,232 @@ class TestPrompts(unittest.TestCase):
         prompt = prompts.Prompt(PAYLOAD)
         self.assertEqual(prompt.hyperparameters(), {"promptName": "support_agent_system", "promptVersion": 3})
         self.assertEqual(evalkit.Prompt, prompts.Prompt)
+
+
+def _scripted_server(answers, delay=0.0):
+    """A prompt API that answers each GET with the next (status, body) of `answers`, the last one
+    repeating, after `delay` seconds; a body of None sends PAYLOAD."""
+    import time as _time
+
+    recv = {"count": 0, "paths": []}
+    lock = threading.Lock()
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            with lock:
+                recv["count"] += 1
+                recv["paths"].append(self.path)
+                status, body = answers[min(recv["count"], len(answers)) - 1]
+            if delay:
+                _time.sleep(delay)
+            if callable(body):
+                status, body = body(self.path)
+            raw = json.dumps(PAYLOAD if body is None else body).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def log_message(self, *a):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, recv, f"http://127.0.0.1:{srv.server_address[1]}"
+
+
+class TestPromptCacheResilience(unittest.TestCase):
+    def setUp(self):
+        reset_context()
+        _current_prompt.set(None)
+        prompts.clear_cache()
+        self.captured = []
+        self.client = fresh(self.captured)
+        self.clock = [1000.0]
+        patcher = mock.patch("evalkit.prompts.time.monotonic", side_effect=lambda: self.clock[0])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_failed_refresh_serves_the_cached_copy_and_waits_before_trying_again(self):
+        srv, recv, url = _scripted_server([(200, None), (503, {"message": "down"})])
+        try:
+            first = prompts.get("support_agent_system", api_url=url, cache_ttl=60)
+            self.clock[0] += 61
+            with self.assertLogs("evalkit", level="WARNING") as logs:
+                stale = prompts.get("support_agent_system", api_url=url, cache_ttl=60)
+            self.assertEqual(stale.version, first.version)
+            self.assertIn("serving the cached version 3", logs.output[0])
+            self.assertEqual(recv["count"], 2)
+            # Inside the retry window the cached copy is served without another request.
+            self.clock[0] += 5
+            prompts.get("support_agent_system", api_url=url, cache_ttl=60)
+            self.assertEqual(recv["count"], 2)
+            self.clock[0] += 6
+            with self.assertLogs("evalkit", level="WARNING"):
+                prompts.get("support_agent_system", api_url=url, cache_ttl=60)
+            self.assertEqual(recv["count"], 3)
+        finally:
+            srv.shutdown()
+
+    def test_no_answer_at_all_also_serves_the_cached_copy(self):
+        srv, recv, url = _scripted_server([(200, None)])
+        prompts.get("support_agent_system", api_url=url, cache_ttl=60)
+        srv.shutdown()
+        srv.server_close()
+        self.clock[0] += 61
+        with self.assertLogs("evalkit", level="WARNING"):
+            prompt = prompts.get("support_agent_system", api_url=url, cache_ttl=60, timeout=2)
+        self.assertEqual(prompt.version, 3)
+
+    def test_a_refusal_is_raised_even_with_a_cached_copy(self):
+        srv, recv, url = _scripted_server([(200, None), (404, {"message": "Prompt not found"})])
+        try:
+            prompts.get("support_agent_system", api_url=url, cache_ttl=60)
+            self.clock[0] += 61
+            with self.assertRaises(evalkit.ApiError) as err:
+                prompts.get("support_agent_system", api_url=url, cache_ttl=60)
+            self.assertEqual(err.exception.code, 404)
+        finally:
+            srv.shutdown()
+
+    def test_the_cached_copy_is_served_only_within_stale_if_error(self):
+        srv, recv, url = _scripted_server([(200, None), (503, {"message": "down"})])
+        try:
+            prompts.get("support_agent_system", api_url=url, cache_ttl=60, stale_if_error=100)
+            self.clock[0] += 161
+            with self.assertRaises(evalkit.ApiError):
+                prompts.get("support_agent_system", api_url=url, cache_ttl=60, stale_if_error=100)
+        finally:
+            srv.shutdown()
+
+    def test_stale_if_error_zero_turns_it_off(self):
+        srv, recv, url = _scripted_server([(200, None), (503, {"message": "down"})])
+        try:
+            prompts.get("support_agent_system", api_url=url, cache_ttl=60, stale_if_error=0)
+            self.clock[0] += 61
+            with self.assertRaises(evalkit.ApiError):
+                prompts.get("support_agent_system", api_url=url, cache_ttl=60, stale_if_error=0)
+        finally:
+            srv.shutdown()
+
+    def test_variables_on_a_cached_copy_are_compiled_locally(self):
+        srv, recv, url = _scripted_server([(200, None), (502, {"message": "bad gateway"})])
+        try:
+            prompts.get("support_agent_system", api_url=url, cache_ttl=60)
+            self.clock[0] += 61
+            with self.assertLogs("evalkit", level="WARNING"):
+                prompt = prompts.get("support_agent_system", api_url=url, variables={"customer": "Ada", "plan": "pro"})
+            self.assertEqual(prompt.compiled, [{"role": "system", "content": "You help Ada on plan pro."}])
+        finally:
+            srv.shutdown()
+
+
+class TestPromptSingleFlight(unittest.TestCase):
+    def setUp(self):
+        reset_context()
+        _current_prompt.set(None)
+        prompts.clear_cache()
+        self.captured = []
+        self.client = fresh(self.captured)
+
+    def _together(self, calls):
+        """Run each zero-argument call in its own thread at once; return (results, errors) in order."""
+        results, errors = [None] * len(calls), [None] * len(calls)
+        start = threading.Barrier(len(calls))
+
+        def run(i, call):
+            start.wait()
+            try:
+                results[i] = call()
+            except BaseException as exc:  # noqa: BLE001 - the test inspects it
+                errors[i] = exc
+
+        threads = [threading.Thread(target=run, args=(i, c)) for i, c in enumerate(calls)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        return results, errors
+
+    def test_concurrent_reads_of_one_prompt_make_one_request(self):
+        srv, recv, url = _scripted_server([(200, None)], delay=0.3)
+        try:
+            results, errors = self._together([lambda: prompts.get("support_agent_system", api_url=url)] * 8)
+        finally:
+            srv.shutdown()
+        self.assertEqual(errors, [None] * 8)
+        self.assertEqual(recv["count"], 1)
+        self.assertEqual({r.version for r in results}, {3})
+
+    def test_waiters_with_variables_compile_the_fetched_template(self):
+        srv, recv, url = _scripted_server([(200, None)], delay=0.3)
+        calls = [lambda: prompts.get("support_agent_system", api_url=url)] + [
+            (lambda n=n: prompts.get("support_agent_system", api_url=url, variables={"customer": f"c{n}", "plan": "p"}))
+            for n in range(4)
+        ]
+        try:
+            results, errors = self._together(calls)
+        finally:
+            srv.shutdown()
+        self.assertEqual(errors, [None] * 5)
+        self.assertEqual(recv["count"], 1)
+        compiled = sorted(r.compiled[0]["content"] for r in results if r.compiled)
+        self.assertEqual(len(compiled), 4)
+
+    def test_a_failure_is_every_waiters_answer(self):
+        srv, recv, url = _scripted_server([(500, {"message": "boom"})], delay=0.3)
+        try:
+            _, errors = self._together([lambda: prompts.get("support_agent_system", api_url=url)] * 6)
+        finally:
+            srv.shutdown()
+        self.assertEqual(recv["count"], 1)
+        self.assertTrue(all(isinstance(e, evalkit.ApiError) and e.code == 500 for e in errors), errors)
+
+    def test_a_refusal_of_one_callers_variables_is_not_another_callers_answer(self):
+        def answer(path):
+            query = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(path).query))
+            if query.get("compile") == "true" and "plan" not in json.loads(query["variables"]):
+                return 400, {"message": "Missing variables: plan"}
+            return 200, None
+
+        srv, recv, url = _scripted_server([(200, answer)], delay=0.3)
+        first_started = threading.Event()
+        out = {}
+
+        def bad():
+            first_started.set()
+            try:
+                prompts.get("support_agent_system", api_url=url, variables={"customer": "Ada"})
+            except evalkit.ApiError as exc:
+                out["bad"] = exc
+
+        def good():
+            first_started.wait()
+            import time as _time
+
+            _time.sleep(0.1)
+            out["good"] = prompts.get("support_agent_system", api_url=url)
+
+        threads = [threading.Thread(target=bad), threading.Thread(target=good)]
+        try:
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(10)
+        finally:
+            srv.shutdown()
+        self.assertEqual(out["bad"].code, 400)
+        self.assertEqual(out["good"].version, 3)
+        self.assertEqual(recv["count"], 2)
+
+    def test_a_cache_ttl_of_zero_fetches_every_time(self):
+        srv, recv, url = _scripted_server([(200, None)])
+        try:
+            prompts.get("support_agent_system", api_url=url, cache_ttl=0)
+            prompts.get("support_agent_system", api_url=url, cache_ttl=0)
+        finally:
+            srv.shutdown()
+        self.assertEqual(recv["count"], 2)
 
 
 if __name__ == "__main__":
