@@ -1,7 +1,7 @@
 """``evalkit voice-test check``: one short call to see whether a bot is reachable and speaks the format.
 
 No backend is involved. The caller connects, waits for a greeting as the bot's first speaker says
-(the same waits a run's plan gives line 0), says one synthetic line, and waits for an answer; the call
+(the same waits a run's plan gives line 0), says one recorded line, and waits for an answer; the call
 is then analysed like any other, so "answered" means speech the analysis found on the bot's channel
 after the line, not merely bytes on the socket. Frames the format does not define are listed, with a
 hint when they look like the other format. When nothing usable comes back (no audio, or audio with no
@@ -22,7 +22,20 @@ from urllib.parse import urlsplit
 
 log = logging.getLogger("evalkit.voicetest.check")
 
-LINE_MS = 1200
+# The line the check says: a person's voice, since a bot that detects speech with a neural voice
+# activity detector (Silero, as Pipecat and LiveKit Agents use) does not hear the synthetic signal
+# the runs' tests use as speech, and never answers it. "Hello, can you hear me?" spoken by the
+# Kokoro-82M text-to-speech model (Apache-2.0), voice af_heart, as a 16 kHz mono PCM16 WAV.
+LINE_TEXT = "Hello, can you hear me?"
+LINE_WAV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "check-line.wav")
+
+
+def line_ms() -> int:
+    """The check line's length in ms, from its WAV header."""
+    import wave
+
+    with wave.open(LINE_WAV, "rb") as w:
+        return int(-(-w.getnframes() * 1000 // w.getframerate()))
 
 
 def check_script(answer_timeout_ms: int, first_speaker: str = "auto") -> Dict[str, Any]:
@@ -34,8 +47,8 @@ def check_script(answer_timeout_ms: int, first_speaker: str = "auto") -> Dict[st
     longest_wait = wait.get("max_ms", wait.get("ms", 0))
     return {
         "name": "check",
-        "max_call_ms": longest_wait + LINE_MS + answer_timeout_ms + 2000,
-        "lines": [{"text": "(check line)", "synth": {"ms": LINE_MS, "seed": 1}, "wait": wait}],
+        "max_call_ms": longest_wait + line_ms() + answer_timeout_ms + 2000,
+        "lines": [{"text": LINE_TEXT, "wav": {"path": LINE_WAV, "trim": True}, "wait": wait}],
         "end": {"mode": "bot_done", "silence_ms": 700, "max_ms": answer_timeout_ms},
     }
 

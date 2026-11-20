@@ -75,7 +75,7 @@ async def test_a_dynamic_call_asks_for_each_line_and_keeps_the_conversation(tmp_
         assert created["scenarios"] == [scenario]
         assert created["caller"] == {"provider": "google", "apiKey": CALLER_KEY}
         assert fake.plan["calls"][0]["script"]["mode"] == "dynamic"
-        assert report.caller == {"provider": "google", "model": "gemini-2.5-flash", "keySource": "request"}
+        assert report.caller == {"provider": "google", "model": "gemini-3.8-flash", "keySource": "request"}
 
         # one request per line after the opening, then the heard-only one after the last (turns.max + 1)
         requests = fake.turn_requests
@@ -86,6 +86,7 @@ async def test_a_dynamic_call_asks_for_each_line_and_keeps_the_conversation(tmp_
             assert r["headers"]["x-subscription-key"] == KEY
             # the bot's answer and the quiet that ended it, from the end of the caller's line
             assert 1300 <= r["audioMs"] <= 2500 and abs(r["audioMs"] - r["durationMs"]) <= 1
+            assert r["cutInAtMs"] is None  # no line cut into the bot's answer
 
         result = fake.results[0]
         assert result["error"] is None
@@ -196,8 +197,64 @@ async def test_a_cut_in_written_with_the_line_before(tmp_path, reply_ms, after_m
         assert turns[2]["interruption_planned"] and turns[2]["interruption_status"] == status
         assert (turns[2]["interruption_stop_ms"] is not None) == (status == "reached")
         assert turns[2]["caller"]["think_ms"] == 0  # written with the line before, so nothing to decide
-        # the interrupted answer is not transcribed; the bot's answer to the cut-in is
+        # The request after the cut-in sends the bot's audio from the end of line 1, the line whose answer
+        # was cut, with the point the cut-in began (RUN_API 4.1, cutInAtMs), so the API hears that answer
+        # as well as the reply to the cut-in. Reached: 300 ms to the answer, then after_ms of it; not
+        # reached: the 500 ms answer, then the turn wait's 600 ms of quiet.
+        after_cut = fake.turn_requests[1]
+        low, high = (700, 1300) if status == "reached" else (1200, 2200)
+        assert low <= after_cut["cutInAtMs"] <= high, after_cut["cutInAtMs"]
+        assert after_cut["audioMs"] > after_cut["cutInAtMs"] + 500  # the cut-in line, then the reply to it
+        line_1_end = next(e for e in _of(events, "line_end") if e["index"] == 1)["t"]
+        cut_start = next(e for e in _of(events, "line_start") if e["index"] == 2)["t"]
+        assert abs(after_cut["cutInAtMs"] - (cut_start - line_1_end)) <= 2
+        requested = [e for e in _of(events, "turn_request") if e["index"] == 3]
+        assert requested and all(e["cut_in_at_ms"] == after_cut["cutInAtMs"] for e in requested)
+        assert fake.turn_requests[0]["cutInAtMs"] is None
+        # an API that does not send heardBeforeCutIn leaves no text for the cut answer; the reply's is there
         assert turns[1]["heard"] is None and turns[2]["heard"].startswith("bot answer before turn 3")
+
+
+async def test_what_the_bot_said_before_a_cut_in_is_its_turn_in_the_transcript(tmp_path):
+    behaviour = {"turns": [{"delay_ms": 300, "reply_ms": 700}],
+                 "default_turn": {"delay_ms": 300, "reply_ms": 2400, "on_interrupt": "stop", "stop_delay_ms": 200}}
+    scenario = {"name": "cuts in", "goal": "Find out how long a refund takes", "opening": OPENING, "maxTurns": 2,
+                "interrupt": {"turn": 2, "afterBotMs": 600}}
+    with FakeVoiceApi(heard_before_cut_in=True) as fake:
+        report = await _run(fake, tmp_path, behaviour, [scenario])
+        assert report.calls[0].error is None, report.to_json()
+        cut = fake.turn_requests[1]["cutInAtMs"]
+        card = fake.results[0]["scorecard"]
+        turns = card["turns"]
+        # The answer the cut-in interrupted (line 1's) is what turn 3's answer heard before the cut-in.
+        assert turns[1]["heard"] == f"bot answer cut in at {cut} ms"
+        assert turns[2]["heard"].startswith("bot answer before turn 3")
+        # In order, as the API's call read has it: line 1, the bot's words before the cut-in, the cut-in.
+        entries = [(e["turn"], e["role"], e["text"]) for e in card["call"]["transcript"]][2:5]
+        assert entries == [(1, "caller", "Here is my reply number 1."), (1, "bot", f"bot answer cut in at {cut} ms"),
+                           (2, "caller", "Sorry, quick question.")]
+        assert card["call"]["transcript"][5]["text"].startswith("bot answer before turn 3")
+
+
+async def test_a_cut_in_planned_before_the_first_answer_sends_that_answer_too(tmp_path):
+    # interrupt.turn 1: the cut-in is planned as line 1, said 600 ms into the bot's answer to the opening.
+    behaviour = {"turns": [{"delay_ms": 300, "reply_ms": 2400, "on_interrupt": "stop", "stop_delay_ms": 200}],
+                 "default_turn": {"delay_ms": 300, "reply_ms": 700}}
+    scenario = {"name": "cuts in early", "goal": "Find out how long a refund takes", "opening": OPENING,
+                "maxTurns": 2, "interrupt": {"turn": 1, "afterBotMs": 600}}
+    with FakeVoiceApi() as fake:
+        report = await _run(fake, tmp_path, behaviour, [scenario])
+        assert report.calls[0].error is None, report.to_json()
+        assert [(r["turn"], r["retake"]) for r in fake.turn_requests] == [(2, 0), (3, 0)]
+        events = _events(report)
+        opening_end = next(e for e in _of(events, "line_end") if e["index"] == 0)["t"]
+        cut_start = next(e for e in _of(events, "line_start") if e["index"] == 1)["t"]
+        first, final = fake.turn_requests
+        assert 700 <= first["cutInAtMs"] <= 1300 and abs(first["cutInAtMs"] - (cut_start - opening_end)) <= 2
+        assert first["audioMs"] > first["cutInAtMs"] + 500
+        assert final["cutInAtMs"] is None  # line 2 was a plain line
+        turns = fake.results[0]["scorecard"]["turns"]
+        assert turns[1]["interruption_planned"] and turns[1]["interruption_status"] == "reached"
 
 
 async def test_done_ends_the_call_with_or_without_a_last_line(tmp_path):

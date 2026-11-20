@@ -17,7 +17,7 @@ call's think time (the caller deciding its next line) is the caller's too, so no
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from .intervals import Interval, clip, gaps, normalize, overlap, percentile, total_overlap
 
@@ -78,7 +78,8 @@ class CallTimeline:
     # "scripted" or "dynamic" (CONTRACT section 4.1), from call.json's script.
     mode: str = "scripted"
     # A dynamic call's turn answers: what the bot said before line `index`, as the turn endpoint heard
-    # it (the last answer for the index, so a retake's replaces the first).
+    # it (the last answer for the index, so a retake's replaces the first). Before a cut-in line, which
+    # is never asked for, it is what the next answer heard before the cut-in.
     heard: Dict[int, Optional[str]] = field(default_factory=dict)
     # Where the caller was deciding a line: [line_start - think ms, line_start].
     think_spans: List[Tuple[int, int]] = field(default_factory=list)
@@ -106,6 +107,7 @@ def timeline_from_events(events: Iterable[Dict[str, Any]], duration_ms: int, mod
     not_reached: Dict[int, Optional[int]] = {}
     wait_ends: Dict[int, str] = {}
     open_waits: List[Tuple[Optional[int], int, Optional[str]]] = []
+    answered: Set[int] = set()
     for event in events:
         kind = event.get("type")
         t = _int(event.get("t"), 0) or 0
@@ -141,6 +143,12 @@ def timeline_from_events(events: Iterable[Dict[str, Any]], duration_ms: int, mod
         elif kind == "turn_answer" and index is not None:
             heard = event.get("heard")
             timeline.heard[index] = heard.strip() if isinstance(heard, str) and heard.strip() else None
+            answered.add(index)
+            # The first answer after a cut-in heard the bot's interrupted answer too: it is the bot's
+            # speech before the cut-in line, the line `index - 1`, for which no request was made.
+            before = event.get("heard_before_cut_in")
+            if isinstance(before, str) and before.strip() and index - 1 not in answered:
+                timeline.heard[index - 1] = before.strip()
         elif kind == "turn_request":
             if not event.get("attempt"):
                 timeline.turn_requests += 1

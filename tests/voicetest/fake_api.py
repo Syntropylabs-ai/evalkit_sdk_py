@@ -161,11 +161,15 @@ class FakeVoiceApi:
                  require_voice_key: bool = False,
                  answer: Optional[Callable[..., Dict[str, Any]]] = None, think_s: float = 0.3,
                  default_max_turns: int = 2, call_max_ms: Optional[int] = None,
-                 caller: Optional[Dict[str, Any]] = None, platform_minutes_left: Any = None) -> None:
+                 caller: Optional[Dict[str, Any]] = None, platform_minutes_left: Any = None,
+                 heard_before_cut_in: bool = False) -> None:
         # The turn endpoint (RUN_API 4.1): `answer(call, turn, retake, request)` writes each answer (see
         # `default_answer`); it may also return {"status", "message", "retryAfter"} to fail the request,
         # and {"lose": True} to store the answer but lose it on the way back. `think_s` is the model's time.
+        # `heard_before_cut_in`: the first answer after a cut-in (a request with `cutInAtMs`) also says
+        # what the bot said before the cut-in, as `heardBeforeCutIn`.
         self.answer = answer or default_answer
+        self.heard_before_cut_in = heard_before_cut_in
         self.think_s = think_s
         self.default_max_turns = default_max_turns
         self.call_max_ms = call_max_ms
@@ -333,7 +337,7 @@ class FakeVoiceApi:
         caller = self.caller
         if caller is None and dynamic:
             given = body.get("caller") or {}
-            caller = {"provider": given.get("provider") or "google", "model": given.get("model") or "gemini-2.5-flash",
+            caller = {"provider": given.get("provider") or "google", "model": given.get("model") or "gemini-3.8-flash",
                       "keySource": "request" if given.get("apiKey") else "organization"}
         return {"runId": run_id, "consoleUrl": f"https://console.example/voice/{run_id}",
                 "limits": {"maxCallMs": self.max_call_ms, "maxConcurrentCalls": self.max_concurrent},
@@ -351,7 +355,12 @@ class FakeVoiceApi:
             self.turn_requests.append({"call": index, "turn": turn, "retake": retake, "keys": req.get("keys"),
                                        "format": fmt, "audioMs": audio_ms,
                                        "durationMs": (req.get("botAudio") or {}).get("durationMs"),
+                                       "cutInAtMs": (req.get("botAudio") or {}).get("cutInAtMs"),
                                        "headers": headers, "at": time.monotonic()})
+            cut = (req.get("botAudio") or {}).get("cutInAtMs")
+            if cut is not None and not (isinstance(cut, int) and 1 <= cut < audio_ms):
+                return 400, {"message": f"botAudio.cutInAtMs is {cut} ms, past the end of the "
+                                        f"{audio_ms} ms of audio sent"}, None, None
             stored = self.turn_answers.get((index, turn, retake))
             if stored is not None:  # a repeat: the stored answer, the model is not asked again
                 return 200, stored, None, None
@@ -371,6 +380,8 @@ class FakeVoiceApi:
         answer: Dict[str, Any] = {"turn": turn, "heard": f"bot answer before turn {turn} ({audio_ms} ms)",
                                   "done": bool(final or spec.get("done")), "line": None, "cutIn": None,
                                   "thinkMs": int(delay * 1000)}
+        if self.heard_before_cut_in and cut is not None:
+            answer["heardBeforeCutIn"] = f"bot answer cut in at {cut} ms"
         if not final and spec.get("line"):
             answer["line"] = {"text": spec["line"], "audio": wav_b64(spec["line"])}
         if not answer["done"] and spec.get("cutIn"):

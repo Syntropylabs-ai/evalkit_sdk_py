@@ -162,7 +162,7 @@ def test_cli_about_has_the_callers_written_and_prints_the_conversations(tmp_path
     about.write_text("A refund desk for an online shop. It finds orders and refunds duplicate charges.\n")
     port = free_port(PORTS)
     bot, _ = _refbot_process("pcm16", port, tmp_path)
-    caller = {"provider": "google", "model": "gemini-2.5-flash", "keySource": "platform"}
+    caller = {"provider": "google", "model": "gemini-3.8-flash", "keySource": "platform"}
     try:
         with FakeVoiceApi(caller=caller, platform_minutes_left=87) as fake:
             proc = _popen("run", "--url", f"ws://127.0.0.1:{port}/", "--format", "pcm16", "--about-file", str(about),
@@ -176,8 +176,10 @@ def test_cli_about_has_the_callers_written_and_prints_the_conversations(tmp_path
             assert "scenarios" not in created and "scenarioSetId" not in created and "caller" not in created
             assert "  conversation     1 turn after the opening" in stdout
             assert "    bot:    bot answer before turn 2" in stdout
-            assert "caller model: google/gemini-2.5-flash (the SyntropyLabs model); 87 SyntropyLabs model minutes " \
-                   "left this month" in stdout
+            assert "caller model: google/gemini-3.8-flash (the SyntropyLabs model); 87 SyntropyLabs model minutes " \
+                   "left this month, with this run's budget set aside" in stdout
+            # Printed once, at the start: the closing block names the caller without the plan's figure.
+            assert stdout.count("87 SyntropyLabs model minutes") == 1
             assert "task success:\n  call 0: 0.80 passed Met: the agent refunds the second charge." in stdout
     finally:
         bot.terminate()
