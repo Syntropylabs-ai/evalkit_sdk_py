@@ -399,6 +399,8 @@ The observer frames and session events the integrations use carry the times dire
 
 `evalkit voice-test` tests a voice bot the way a caller would. It calls the bot over its WebSocket, plays a caller, records both sides, and measures each call from the recording. A caller with a goal talks to the bot until the goal is met or it gives up, answering what the bot actually says; a caller with lines says exactly those lines. The calls are then reported to SyntropyLabs, where the voice evaluators score them. The calls start in your process, so a bot on `localhost` or on a private network can be tested, on your machine or in CI.
 
+Voice test runs are set up for each organization with SyntropyLabs: talk to us at https://syntropylabs.ai/contact. A run from an organization whose plan does not include them is refused with a 403, before any call is placed, and the command prints the API's message and exits with `2`. `evalkit voice-test check` and the reference bot (`evalkit voice-test refbot`) need no account.
+
 ```bash
 pip install "syntropylabs-evalkit[voice]"     # adds numpy, websockets, webrtcvad and PyYAML
 ```
@@ -407,7 +409,7 @@ The `voice` extra is needed only for voice tests. `import evalkit` never loads i
 
 ### Run a test
 
-Check first that the bot is reachable and speaks the format. `check` needs no key and sends nothing to SyntropyLabs:
+Check first that the bot is reachable and speaks the format. `check` needs no key and sends nothing to SyntropyLabs. It says one recorded line, "Hello, can you hear me?", so a bot that detects speech with a neural detector such as Silero hears it as speech:
 
 ```bash
 evalkit voice-test check --url ws://localhost:8765/ws --format pcm16 --sample-rate 16000
@@ -505,6 +507,7 @@ A caller with a goal says its opening, then, once the bot's answer is over (700 
 
 - **The bot is measured as before.** Every figure is the bot's, from the recording. The caller's own deciding time runs from the end of the bot's answer to its next line: it is not response delay, not silence and not the bot's fault. The summary reports it under the caller's health.
 - **The bot talking on.** If the bot speaks again while the line is being decided, the caller waits for it to finish, and when it said 1,000 ms or more, drops the line and asks once more with the longer audio.
+- **A cut-in.** The request after a line that cut into the bot's answer sends the bot's audio from the end of the caller's line before the cut-in, with the point the cut-in began (`cutInAtMs`), so SyntropyLabs hears the answer that was cut as well as the reply to the cut-in, and keeps both in the conversation.
 - **The conversation** is kept on the call: each turn's `heard` text and the caller's lines, in the scorecard's `call.transcript`. Voice Task Success judges it against the goal and the success criteria.
 - **When a line cannot be had.** A rate limit or an overloaded model is asked again after its `Retry-After` while the call's time lasts. Any other refusal (a key the provider refused, for one) ends the call at once with the error `caller_turn_failed` in the provider's words, and the run exits with `2`: the testing side failed, which says nothing about your bot.
 
@@ -512,12 +515,12 @@ A caller with a goal says its opening, then, once the bot's answer is over (700 
 
 The model that hears the bot and decides each line must take audio (any Gemini chat model, or one the model catalog marks for audio input). It is taken in this order:
 
-1. **Your own key, sent with the run.** `--caller-provider` (default `google`), `--caller-model` (default: the API's, `gemini-2.5-flash` on google) and `--caller-key-env`: the key is read from the environment, from `GOOGLE_API_KEY`, then `GEMINI_API_KEY`, for google, `<PROVIDER>_API_KEY` for another provider, or the variable `--caller-key-env` names. Any of these flags sends `caller` with the run. The key is used for this run only: SyntropyLabs keeps it nowhere, so the SDK sends it again with each turn, and it is kept out of everything the SDK prints and writes. There is no option that takes the key itself.
+1. **Your own key, sent with the run.** `--caller-provider` (default `google`), `--caller-model` (default: the API's, `gemini-3.8-flash` on google) and `--caller-key-env`: the key is read from the environment, from `GOOGLE_API_KEY`, then `GEMINI_API_KEY`, for google, `<PROVIDER>_API_KEY` for another provider, or the variable `--caller-key-env` names. Any of these flags sends `caller` with the run. The key is used for this run only: SyntropyLabs keeps it nowhere, so the SDK sends it again with each turn, and it is kept out of everything the SDK prints and writes. There is no option that takes the key itself.
 2. **Your organization's connection** for that provider, when a `--caller-*` flag names the provider and no key is in the environment.
 3. **Your organization's own audio-capable model**, with no `--caller-*` flag: a model configuration saved for audio, else its Google AI Studio connection.
-4. **The SyntropyLabs model**, on a plan with platform voice minutes left this month (by default 100 a month on Pro and 1,000 on Enterprise). It also writes the callers for `--about`, speaks the caller's lines when no text-to-speech key is set, and runs the AI listener and Voice Task Success. A run that uses it counts its calls' minutes, and the summary says how many are left.
+4. **The SyntropyLabs model**, for an organization that has no key of its own for this, where SyntropyLabs has set up model minutes for your organization and some are left this month (see https://syntropylabs.ai/contact). It also writes the callers for `--about`, speaks the caller's lines when no text-to-speech key is set, and runs Voice Task Success and, in a run whose evaluators include it, the AI listener. A run that uses it counts its calls' minutes: the line printed when the run starts says how many your organization has left once the run's budget is set aside, and the closing summary how many the run used.
 
-With none of them, the API refuses the run naming the fixes.
+With none of them, the API refuses the run naming the fixes. A `GOOGLE_API_KEY` in the environment is not sent on its own: pass `--caller-provider google` (or another `--caller-*` flag) to use it.
 
 ```bash
 export GOOGLE_API_KEY=...              # from your CI's secret store
@@ -527,9 +530,10 @@ evalkit voice-test run --url wss://bot.example.com/ws --format twilio \
 
 ### The caller's voice
 
-The caller's lines are synthesized on our side, with a text-to-speech key of yours. It comes from one of two places:
+The caller's lines are synthesized on our side, with a text-to-speech key of yours. It comes from one of three places, and a key sent with the run comes first:
 
 - **Your organization's settings in the console:** a provider connection, and a Text-to-Speech model under Models. `--voice PROVIDER:MODEL:VOICE` names the voice and uses your connection for that provider; with neither flag, your Text-to-Speech model and its voice are used.
+- **Your organization's Google AI Studio connection**, with no voice flag and no Text-to-Speech model: Gemini's speech model, `gemini-3.8-flash-tts` with the voice `Kore`, on that connection's key. It is the connection the caller's model and the AI listener fall back to as well.
 - **Your own key, sent with the run:** for CI where nothing is stored in the console. `--tts-provider` names the provider and the key is read from the environment, from the variable the provider's own SDK reads:
 
   ```bash
@@ -546,9 +550,9 @@ The caller's lines are synthesized on our side, with a text-to-speech key of you
   | `cartesia` | `CARTESIA_API_KEY` |
   | any other | `<PROVIDER>_API_KEY` |
 
-  `--tts-model` and `--tts-voice` name the model and the voice; left out, the API takes them from your project's Text-to-Speech model on that provider, else its own default for the provider (`openai`: `tts-1`, `alloy`; `google`: `gemini-2.5-flash-preview-tts`, `Kore`), and otherwise refuses the run asking for them. `--tts-key-env NAME` reads the key from another variable. The key is never taken on the command line, where the shell's history would keep it: there is no option for it, and an option given by mistake is reported without its value. It goes to the SyntropyLabs API over TLS in the run's create request, is used to synthesize that run's lines, and is not stored, logged or returned; the SDK keeps it out of everything it prints and writes. When the variable is not set, the command says so and sends no key, and your organization's stored key for the provider is used.
+  `--tts-model` and `--tts-voice` name the model and the voice; left out, the API takes them from your project's Text-to-Speech model on that provider, else its own default for the provider (`openai`: `tts-1`, `alloy`; `google`: `gemini-3.8-flash-tts`, `Kore`), and otherwise refuses the run asking for them. `--tts-key-env NAME` reads the key from another variable. The key is never taken on the command line, where the shell's history would keep it: there is no option for it, and an option given by mistake is reported without its value. It goes to the SyntropyLabs API over TLS in the run's create request, is used to synthesize that run's lines, and is not stored, logged or returned; the SDK keeps it out of everything it prints and writes. When the variable is not set, the command says so and sends no key, and your organization's stored key for the provider is used.
 
-With neither, the API refuses the run with a 400 that names both ways to fix it, and the command prints that message and exits with `2`. Synthesized lines are cached by voice and text, so a line already made is not synthesized again.
+With none of these, the SyntropyLabs model speaks the lines, where SyntropyLabs has set up model minutes for your organization; otherwise the API refuses the run with a 400 that names the ways to fix it, and the command prints that message and exits with `2`. Synthesized lines are cached by voice and text, so a line already made is not synthesized again.
 
 | Option | Meaning |
 |---|---|
@@ -579,7 +583,7 @@ The bot's headers and the URL's query are sent to the bot only. SyntropyLabs rec
 
 ### What it prints, and the exit code
 
-Each call's figures are printed as it ends. They are the response delay (p50, p95 and per turn), talk-over, planned interruptions and how fast the bot stopped, the longest silence, and the caller's own health. A caller with a goal also shows how many turns it took and the start and end of its conversation, and its health includes how long it took to decide its lines. A turn where the caller itself ran late is left out of the scores, and the summary says so. After the last call come the caller's model and the SyntropyLabs model minutes left, the evaluators' results, Voice Task Success per call, the console link and the verdict:
+Each call's figures are printed as it ends. They are the response delay (p50, p95 and per turn), talk-over, planned interruptions and how fast the bot stopped, the longest silence, and the caller's own health. A caller with a goal also shows how many turns it took and the start and end of its conversation, and its health includes how long it took to decide its lines. A turn where the caller itself ran late is left out of the scores, and the summary says so. After the last call come the caller's model and the SyntropyLabs model minutes the run used, the evaluators' results, Voice Task Success per call, the console link and the verdict. The minutes left this month are printed once, when the run starts, with the run's budget set aside:
 
 ```
 call 0: Refund for a duplicate charge (repeat 0), 24.8 s: ok
@@ -596,7 +600,7 @@ call 0: Refund for a duplicate charge (repeat 0), 24.8 s: ok
   caller           healthy (no late frames; deciding p50 1,640 ms, max 2,210 ms)
   recording        uploaded (1.5 MB)
 ...
-caller model: google/gemini-2.5-flash (your organization's key)
+caller model: google/gemini-3.8-flash (your organization's key)
 ...
 task success:
   call 0: 1.00 passed Met: the agent refunds the second charge; the agent says when the refund will arrive.
@@ -610,7 +614,7 @@ verdict: passed (exit 0)
 | `2` | A setup or network failure: a bad option, a scenarios file that breaks a limit, a missing key or extra, a run the API refused to create (its reason is printed), a result that could not be sent, caller audio that could not be fetched or did not match its sha256, a caller with a goal whose next line could not be had (`caller_turn_failed`), or a verdict that could not be read in time. |
 | `130` | The run was interrupted. |
 
-A call that fails does not stop the run. If the bot refuses the connection, hangs up before the script ends, or the call runs past the plan's `maxCallMs`, the call is reported with an `error` and the run goes on to the next call. `--json` prints `runId`, `consoleUrl`, `passed`, `verdict`, `exitCode`, `interrupted`, `problems`, `caller` and `platformMinutesLeft`, `calls` (each with its `error`, `mode`, `figures`, `turnsTaken`, `transcript` and `recording`) and `run` (the API's own summary). Calls to the SyntropyLabs API that fail on the network or with a 5xx are retried with backoff. Creating the run is retried only when the server cannot have received it.
+A call that fails does not stop the run. If the bot refuses the connection, hangs up before the script ends, or the call runs past the plan's `maxCallMs`, the call is reported with an `error` and the run goes on to the next call. `--json` prints `runId`, `consoleUrl`, `passed`, `verdict`, `exitCode`, `interrupted`, `problems`, `caller` and `platformMinutesLeft` (as the run's plan counted them, at the start), `calls` (each with its `error`, `mode`, `figures`, `turnsTaken`, `transcript` and `recording`) and `run` (the API's own summary). Calls to the SyntropyLabs API that fail on the network or with a 5xx are retried with backoff. Creating the run is retried only when the server cannot have received it.
 
 Pressing Ctrl-C once stops new calls, and the calls in progress finish. Pressing it again, or sending SIGTERM, ends those calls at once. Either way each call is reported, with what was recorded, and calls that never started are reported as `not_run`. The run is then completed, so it does not stay open.
 
@@ -645,7 +649,7 @@ Exactly one of `about`, `scenarios` and `scenario_set` is required. `about` has 
 These need no backend:
 
 - `evalkit voice-test init [PATH]` writes the starter scenarios file, `voice-tests.yaml` by default (JSON for a `.json` path), and refuses to overwrite one without `--force`.
-- `evalkit voice-test check` makes one short call. It reports whether the bot connected, whether it answered the line and how fast, the frames it sent that the format does not define, and hints such as "try `--format twilio`". `--first-speaker` sets the wait before the line, as for `run` (`auto` by default). It exits with `0` when the bot answered with no format errors, and `1` otherwise.
+- `evalkit voice-test check` makes one short call and says one recorded line, "Hello, can you hear me?". It reports whether the bot connected, whether it answered the line and how fast, the frames it sent that the format does not define, and hints such as "try `--format twilio`". `--first-speaker` sets the wait before the line, as for `run` (`auto` by default). It exits with `0` when the bot answered with no format errors, and `1` otherwise.
 - `evalkit voice-test call --script script.json --out DIR` runs one scripted call (a caller with a goal needs the run's turn endpoint, so it runs only within `run`) and writes `recording.wav` (two channels at 16 kHz: the caller as sent, the bot as heard), `events.jsonl` and `call.json`. `--analyse` also writes `scorecard.json`. A line's audio is a WAV file, the deterministic synthetic speech signal, or a plan's `audio`.
 - `evalkit voice-test refbot --format pcm16 --port 19500` runs the reference bot. Its delays, talk-over and interruptions are known, and it logs the ground truth, so you can try the caller with no bot of your own.
 

@@ -21,7 +21,12 @@ with a goal hears your bot and answers what it actually says.
   while it waits, and says the line that comes back. If the bot speaks again while the line is decided,
   the caller waits for it, and drops the line and asks once more (`retake`) when the bot spoke 1,000 ms
   or more. A planned interruption cuts into the bot's answer with the line written the turn before (and
-  is `not_reached` when the answer ends first). `done` ends the call after an optional last line; after
+  is `not_reached` when the answer ends first). The request after a cut-in sends the bot's audio from
+  the end of the caller's line before it, with `botAudio.cutInAtMs`, where the cut-in began, so the
+  answer the cut-in interrupted is heard and kept in the conversation as well as the reply to it. When
+  that answer carries `heardBeforeCutIn`, what the bot said before the cut-in, the SDK puts it in the
+  scorecard as the bot's words in the turn the cut-in interrupted, so the printed conversation and
+  `call.transcript` match the API's call read. `done` ends the call after an optional last line; after
   the last line the bot's answer is still sent, after the hang-up, so the transcript ends with it.
   Rate limits and overloads are asked again after `Retry-After` while the call's budget lasts; any other
   refusal ends the call at once as `caller_turn_failed`, which exits `2` like the other failures of the
@@ -39,9 +44,11 @@ with a goal hears your bot and answers what it actually says.
   measured from `heard`. The trace carries `evalkit.voice.v1.call.mode`, `transcript.bot` and
   `turn.think_ms`.
 - The run's summary shows each dynamic call's turns and a short excerpt of its conversation, Voice Task
-  Success per call, the caller's model and whose key it ran on, and the SyntropyLabs model minutes left
-  this month. `--json` adds `mode`, `turnsTaken` and `transcript` to each call, and `caller` and
-  `platformMinutesLeft` to the run.
+  Success per call, the caller's model and whose key it ran on, and the SyntropyLabs model minutes the
+  run used. The minutes left this month are printed once, when the run starts, with the run's budget
+  set aside; the run gives back what it did not use. `--json` adds `mode`, `turnsTaken` and
+  `transcript` to each call, and `caller` and `platformMinutesLeft` (the plan's figure, at the start) to
+  the run.
 - The hosted runner places dynamic calls through the same `run_planned_call`, asking the turn endpoint
   with its run token and no request keys.
 - `evalkit voice-test run --scenarios FILE`: scripted scenarios from a YAML or JSON file, sent with the
@@ -135,6 +142,10 @@ with a goal hears your bot and answers what it actually says.
   It was read as a list of set ids.
 - A stretch of constant level in the bot's audio (DC, digital silence at an offset) read as a 395 Hz
   pitch and widened its pitch range; it now has no pitch.
+- `evalkit voice-test check` says a recorded line, "Hello, can you hear me?" (1.3 s, shipped in the
+  package as a 16 kHz WAV, spoken by the open Kokoro-82M model), where it played the synthetic signal
+  the test suite uses. A bot that detects speech with Silero, as Pipecat and LiveKit Agents bots do,
+  never heard that signal as speech, sent nothing back, and failed the check with a hint about the format.
 - `evalkit voice-test check` against a bot that answers nothing usable (no audio, or audio with no speech)
   now hints the other `--format` first, with the `pcm16` sample rates to try and the endpoint path, before
   the URL and headers; it read "the bot sent no audio", although the usual cause is the format.

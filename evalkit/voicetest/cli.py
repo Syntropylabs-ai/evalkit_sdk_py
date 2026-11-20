@@ -223,7 +223,7 @@ def _add_run(sub) -> None:
                    help="the model provider that hears your bot and decides the caller's lines (default google), "
                         "with your own key read from the environment")
     p.add_argument("--caller-model", default=None, metavar="MODEL",
-                   help="the caller's model (default: the API's, gemini-2.5-flash on google)")
+                   help="the caller's model (default: the API's, gemini-3.8-flash on google)")
     p.add_argument("--caller-key-env", default=None, metavar="VAR",
                    help="the environment variable holding the caller's key (default GOOGLE_API_KEY, else "
                         "GEMINI_API_KEY, for google; <PROVIDER>_API_KEY otherwise)")

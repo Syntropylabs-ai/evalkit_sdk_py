@@ -19,7 +19,7 @@ import os
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Tuple
 
 from .audio import FRAME_MS, SpeechTracker, frame_samples, samples_to_ms
 from .recording import (
@@ -323,10 +323,14 @@ class _BotTail:
         while self._chunks and self._held - len(self._chunks[0][1]) >= self.keep:
             self._held -= len(self._chunks.popleft()[1])
 
+    def first_sample(self, start: int) -> int:
+        """The sample `since(start)` begins at: `start`, or later when that is more than `keep_ms` ago."""
+        return max(int(start), self.position - self.cap)
+
     def since(self, start: int) -> List[Any]:
         """The heard audio from sample `start` on, at most its last `keep_ms`, as views of the frames
         (joined off the loop, by the request)."""
-        start = max(int(start), self.position - self.cap)
+        start = self.first_sample(start)
         out = []
         for at, pcm in self._chunks:
             if at + len(pcm) > start:
@@ -369,6 +373,10 @@ class _DynamicRunner(_ScriptRunner):
         self.phase = "wait"  # wait | ask | rewait (speaking is `self.speaking`)
         # Where the caller's previous line ended: the bot's answer is sent from there.
         self.prev_end = 0
+        # Where each line said so far started and ended, by index: the first request after a cut-in
+        # sends the bot's audio from the end of the line before the cut-in.
+        self._line_starts: Dict[int, int] = {}
+        self._line_ends: Dict[int, int] = {}
         self.turn_failure: Optional[str] = None
         self._pending: Optional[asyncio.Future] = None
         self._retry_at: Optional[int] = None
@@ -489,6 +497,7 @@ class _DynamicRunner(_ScriptRunner):
             self.events.log("line_end", sample=end, index=self.index, text=line.text)
             self.speaking = False
             self.prev_end = end
+            self._line_ends[self.index] = end
             self.index += 1
             self.phase = "wait"
             self._begin_wait(self.index, end)
@@ -503,7 +512,27 @@ class _DynamicRunner(_ScriptRunner):
         self.speaking = True
         self.line_pos = 0
         self.line_start = start
+        self._line_starts[self.index] = start
         return self._speech()
+
+    def _bot_audio(self, turn: int) -> Tuple[List[Any], Optional[int]]:
+        """The bot audio a request for `turn` sends, and where in it the caller began a cut-in, in ms
+        (RUN_API section 4.1, `botAudio.cutInAtMs`). When the line before `turn` cut into the bot's
+        answer, the audio starts at the end of the line before that one, so the answer the cut-in
+        interrupted is heard as well as the reply to the cut-in; else it starts where the caller's
+        previous line ended and there is no cut-in point. A cut-in the bot's answer ended before is
+        sent the same way: that answer was not heard by any request either."""
+        cut = turn - 1
+        line = self.lines[cut] if 1 <= cut < len(self.lines) else None
+        if (line is not None and line.interrupt_after_bot_ms is not None
+                and cut in self._line_starts and cut - 1 in self._line_ends):
+            begin, cut_at = self._line_ends[cut - 1], self._line_starts[cut]
+            first = self.bot.first_sample(begin)
+            if cut_at > first:  # else the interrupted answer is older than the most a request carries
+                cut_ms = int(round(self._ms(cut_at - first)))
+                if cut_ms >= 1:
+                    return self.bot.since(begin), cut_ms
+        return self.bot.since(self.prev_end), None
 
     def _after_wait(self, start: int):
         if self._is_end(self.index):
@@ -529,28 +558,34 @@ class _DynamicRunner(_ScriptRunner):
     # -- the turn request ----------------------------------------------------------------------
 
     def _ask(self, start: int, retake: int) -> None:
-        chunks = self.bot.since(self.prev_end)
-        self._asked = {"index": self.index, "retake": retake, "at": start, "chunks": chunks}
+        chunks, cut_in_at_ms = self._bot_audio(self.index)
+        self._asked = {"index": self.index, "retake": retake, "at": start, "chunks": chunks,
+                       "cut_in_at_ms": cut_in_at_ms}
         self._attempt = 0
         self._submit(start)
 
     def _submit(self, start: int) -> None:
         asked = self._asked
         audio_ms = int(round(self._ms(sum(len(c) for c in asked["chunks"]))))
+        fields: Dict[str, Any] = {}
+        if asked["cut_in_at_ms"] is not None:
+            fields["cut_in_at_ms"] = asked["cut_in_at_ms"]
         self.events.log("turn_request", sample=start, index=asked["index"], retake=asked["retake"],
-                        bot_audio_ms=audio_ms, attempt=self._attempt)
+                        bot_audio_ms=audio_ms, attempt=self._attempt, **fields)
         left_s = (self.script.max_call_ms - samples_to_ms(start, self.rate)) / 1000.0
         timeout = max(1.0, min(float(self.client.api.timeout_s), left_s))
         self._retry_at = None
         self._pending = self.loop.run_in_executor(self.client.executor, self._request, asked["index"],
-                                                  asked["retake"], asked["chunks"], timeout)
+                                                  asked["retake"], asked["chunks"], timeout,
+                                                  asked["cut_in_at_ms"])
         self.phase = "ask"
 
-    def _request(self, turn: int, retake: int, chunks: List[Any], timeout: float):
+    def _request(self, turn: int, retake: int, chunks: List[Any], timeout: float,
+                 cut_in_at_ms: Optional[int] = None):
         """On the worker thread: the bot audio joined, sent, and the answer decoded."""
         np = self._np
         pcm = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.int16)
-        return self.client.ask(turn, retake, pcm, self.rate, timeout)
+        return self.client.ask(turn, retake, pcm, self.rate, timeout, cut_in_at_ms)
 
     def _poll(self, now: int, start: int):
         if self._pending is None:
@@ -571,7 +606,8 @@ class _DynamicRunner(_ScriptRunner):
             return self._failed(start, TurnError(self.client.scrub(
                 f"turn {self.index}: {type(exc).__name__}: {exc}")))
         self.events.log("turn_answer", sample=start, index=self.index, retake=self._asked["retake"],
-                        ms=round_trip, done=answer.done, heard=answer.heard)
+                        ms=round_trip, done=answer.done, heard=answer.heard,
+                        **({"heard_before_cut_in": answer.heard_before_cut_in} if answer.heard_before_cut_in else {}))
         self._answer = answer
         if answer.done and answer.line is None:
             self.ended_by = "script"  # the bot's last answer was in this request
@@ -641,12 +677,13 @@ class _DynamicRunner(_ScriptRunner):
         is not failed for it. Setting `stop` abandons it, so a drain or a cancel never waits on it."""
         from .turns import TurnError
 
-        chunks = self.bot.since(self.prev_end)
+        chunks, cut_in_at_ms = self._bot_audio(turn)
+        cut_field = {} if cut_in_at_ms is None else {"cut_in_at_ms": cut_in_at_ms}
         attempt = 0
         while True:
             audio_ms = int(round(self._ms(sum(len(c) for c in chunks))))
             self.events.log("turn_request", sample=sample, index=turn, retake=0, bot_audio_ms=audio_ms,
-                            attempt=attempt, final=True)
+                            attempt=attempt, final=True, **cut_field)
             left = deadline - time.monotonic()
             try:
                 if left <= 1.0:
@@ -654,7 +691,7 @@ class _DynamicRunner(_ScriptRunner):
                 if stop is not None and stop.is_set():
                     raise TurnError(f"turn {turn}: the run was stopped", retryable=False)
                 request = self.loop.run_in_executor(self.client.executor, self._request, turn, 0, chunks,
-                                                    min(float(self.client.api.timeout_s), left))
+                                                    min(float(self.client.api.timeout_s), left), cut_in_at_ms)
                 if stop is not None:
                     stopped = asyncio.ensure_future(stop.wait())
                     try:
@@ -684,7 +721,9 @@ class _DynamicRunner(_ScriptRunner):
                 self.events.log("turn_failed", sample=sample, index=turn, status=None, message=message)
                 return f"the bot's last answer was not transcribed: {message}"
             self.events.log("turn_answer", sample=sample, index=turn, retake=0, ms=round_trip,
-                            done=answer.done, heard=answer.heard, final=True)
+                            done=answer.done, heard=answer.heard, final=True,
+                            **({"heard_before_cut_in": answer.heard_before_cut_in}
+                               if answer.heard_before_cut_in else {}))
             return None
 
 

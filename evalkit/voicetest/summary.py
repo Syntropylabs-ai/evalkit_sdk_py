@@ -39,9 +39,18 @@ def _bytes(value: Any) -> str:
     return f"{value / 1024:.0f} kB"
 
 
+def _tenths(minutes: float) -> str:
+    """Minutes as the API states them, to the tenth, with no decimal on a whole number: rounding 14.6
+    left to 15 would name a minute the organization does not have."""
+    text = f"{minutes:,.1f}"
+    return text[:-2] if text.endswith(".0") else text
+
+
 def caller_text(caller: Any, minutes_left: Any) -> Optional[str]:
     """The model that decides the dynamic calls' lines and whose key it runs on, and the SyntropyLabs
-    model minutes left this month; None when the plan names neither."""
+    model minutes left this month with this run's budget set aside, as the plan counts them; None
+    when the plan names neither. The figure is the plan's: the run gives back what it did not use
+    once it is charged, so it belongs at the start only."""
     parts: List[str] = []
     if isinstance(caller, Mapping):
         name = "/".join(str(caller[k]) for k in ("provider", "model") if caller.get(k)) or "named by the API"
@@ -49,7 +58,8 @@ def caller_text(caller: Any, minutes_left: Any) -> Optional[str]:
         parts.append(f"caller model: {name}" + (f" ({source})" if source else ""))
     if isinstance(minutes_left, (int, float)) and not isinstance(minutes_left, bool):
         parts.append("SyntropyLabs model minutes: unlimited" if minutes_left < 0
-                     else f"{minutes_left:,.0f} SyntropyLabs model minutes left this month")
+                     else f"{_tenths(minutes_left)} SyntropyLabs model minutes left this month, with this run's "
+                          "budget set aside")
     return "; ".join(parts) or None
 
 
@@ -263,7 +273,9 @@ def run_lines(report: Any) -> List[str]:
     failed = [c for c in calls if c.error is not None]
     lines = [f"run {report.run_id}: {len(calls)} call{'s' if len(calls) != 1 else ''}, "
              f"{len(calls) - len(failed)} ok, {len(failed)} failed"]
-    described = caller_text(getattr(report, "caller", None), getattr(report, "platform_minutes_left", None))
+    # The minutes left are the plan's, read before the run was charged: the closing block says what
+    # the run used instead.
+    described = caller_text(getattr(report, "caller", None), None)
     if described:
         lines.append(described)
     charged = (report.summary or {}).get("platformMinutes")

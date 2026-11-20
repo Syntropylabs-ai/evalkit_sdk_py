@@ -81,9 +81,12 @@ def test_a_dynamic_call_shows_its_turns_a_conversation_excerpt_and_task_success(
     ]
     assert "  caller           healthy (no late frames; deciding p50 1,400 ms, max 1,400 ms)" in lines
 
-    assert caller_text({"provider": "google", "model": "gemini-2.5-flash", "keySource": "platform"}, 87) == (
-        "caller model: google/gemini-2.5-flash (the SyntropyLabs model); 87 SyntropyLabs model minutes left "
-        "this month")
+    assert caller_text({"provider": "google", "model": "gemini-3.8-flash", "keySource": "platform"}, 87) == (
+        "caller model: google/gemini-3.8-flash (the SyntropyLabs model); 87 SyntropyLabs model minutes left "
+        "this month, with this run's budget set aside")
+    # The API's own tenths, never rounded up to a minute the organization does not have.
+    assert caller_text(None, 14.6) == (
+        "14.6 SyntropyLabs model minutes left this month, with this run's budget set aside")
     assert caller_text({"provider": "google", "keySource": "request"}, -1) == (
         "caller model: google (your key, sent with the run); SyntropyLabs model minutes: unlimited")
     assert caller_text(None, None) is None
@@ -93,10 +96,19 @@ def test_a_dynamic_call_shows_its_turns_a_conversation_excerpt_and_task_success(
          "reason": "Met: the refund. Missed: when the money arrives."}])])
     report = SimpleNamespace(calls=[outcome], summary=run, problems=[], out_dir=None, console_url=None,
                              run_id="r1", verdict="failed", exit_code=1,
-                             caller={"provider": "google", "model": "gemini-2.5-flash", "keySource": "organization"},
+                             caller={"provider": "google", "model": "gemini-3.8-flash", "keySource": "organization"},
                              platform_minutes_left=None)
     out = run_lines(report)
-    assert out[1:3] == ["caller model: google/gemini-2.5-flash (your organization's key)",
+    assert out[1:3] == ["caller model: google/gemini-3.8-flash (your organization's key)",
                         "this run used 2.2 SyntropyLabs model minutes"]
+
+    # The plan's minutes left were counted before the run was charged and gave back what it did not
+    # use, so the closing block never repeats them.
+    report.caller = {"provider": "google", "model": "gemini-3.8-flash", "keySource": "platform"}
+    report.platform_minutes_left = 15
+    out = run_lines(report)
+    assert out[1:3] == ["caller model: google/gemini-3.8-flash (the SyntropyLabs model)",
+                        "this run used 2.2 SyntropyLabs model minutes"]
+    assert not any("left this month" in line for line in out)
     assert out[out.index("task success:") + 1] == (
         "  call 0: 0.50 passed Met: the refund. Missed: when the money arrives.")

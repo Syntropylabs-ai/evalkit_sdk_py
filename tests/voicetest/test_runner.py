@@ -450,25 +450,57 @@ def test_check_against_the_reference_bot(tmp_path):
     bot, _ = _refbot_process("pcm16", port, tmp_path)
     try:
         buf = io.StringIO()
-        assert main(["check", "--url", f"ws://127.0.0.1:{port}/", "--format", "pcm16", "--json"], out=buf) == 0
+        out_dir = tmp_path / "check"
+        assert main(["check", "--url", f"ws://127.0.0.1:{port}/", "--format", "pcm16", "--json",
+                     "--out", str(out_dir)], out=buf) == 0
         found = json.loads(buf.getvalue())
         assert found["connected"] and found["answered"] and found["formatErrors"] == []
         assert found["responseDelayMs"] == pytest.approx(500, abs=60)
+        with open(out_dir / "events.jsonl", encoding="utf-8") as fh:
+            said = [e for e in map(json.loads, fh) if e["type"] == "line_start"]
+        assert [e["text"] for e in said] == ["Hello, can you hear me?"]
     finally:
         bot.terminate()
         bot.wait(timeout=10)
 
 
+def test_the_check_line_is_recorded_speech_shipped_with_the_package():
+    """A bot that detects speech with a neural detector (Silero) hears no speech in a synthetic signal,
+    so the check says a recorded line: a short 16 kHz mono PCM16 WAV inside the package, rendered as a
+    `wav` line and found to be speech by the analysis's own detector over most of its length."""
+    import wave
+
+    from evalkit.voicetest.analysis.vad import DEFAULT_VAD_VERSION, detect_segments, get_spec
+    from evalkit.voicetest.check import LINE_TEXT, LINE_WAV, check_script, line_ms
+    from evalkit.voicetest.script import parse_script
+    from evalkit.voicetest.sources import render_lines
+
+    with wave.open(LINE_WAV, "rb") as w:
+        assert (w.getnchannels(), w.getsampwidth(), w.getframerate()) == (1, 2, 16000)
+        pcm = w.readframes(w.getnframes())
+    assert 1000 <= line_ms() <= 3000 and os.path.getsize(LINE_WAV) < 100_000
+    speech = detect_segments(pcm, 16000, get_spec(DEFAULT_VAD_VERSION))
+    assert sum(e - s for s, e in speech) >= 0.6 * line_ms(), speech
+
+    raw = check_script(8000, "caller")
+    (line,) = raw["lines"]
+    assert line["text"] == LINE_TEXT and "synth" not in line and line["wav"]["path"] == LINE_WAV
+    script = parse_script(raw)
+    for rate in (8000, 16000, 24000):
+        (rendered,) = render_lines(script, rate)
+        assert abs(len(rendered) * 1000 / rate - line_ms()) <= 150  # trimmed edges only
+
+
 def test_check_waits_before_its_line_as_the_first_speaker_says():
-    from evalkit.voicetest.check import LINE_MS, check_script
+    from evalkit.voicetest.check import check_script, line_ms
     from evalkit.voicetest.cli import build_parser
 
     auto, caller = check_script(8000), check_script(8000, "caller")
     assert auto["lines"][0]["wait"] == {"mode": "bot_done", "start_within_ms": 3000, "silence_ms": 700,
                                         "max_ms": 15000}
     assert caller["lines"][0]["wait"] == {"mode": "fixed", "ms": 0}
-    assert caller["max_call_ms"] == LINE_MS + 8000 + 2000
-    assert auto["max_call_ms"] == 15000 + LINE_MS + 8000 + 2000
+    assert caller["max_call_ms"] == line_ms() + 8000 + 2000
+    assert auto["max_call_ms"] == 15000 + line_ms() + 8000 + 2000
     parser = build_parser()
     commands = {"check": ["check", "--url", "ws://x/"],
                 "run": ["run", "--url", "ws://x/", "--format", "pcm16", "--scenario-set", "s"]}

@@ -181,9 +181,9 @@ class VoiceTestApi:
 
         One attempt only: the caller retries by itself, sending silence meanwhile, while its call's
         budget lasts, and a failure raises VoiceTestApiError with the status and the Retry-After.
-        `bot_audio` is ``{"data": <base64 WAV>, "durationMs"}``. `keys` are the request keys the run was
-        created with (``caller``, ``voice``), sent again because the API keeps neither; each is kept out
-        of every message from here on."""
+        `bot_audio` is ``{"data": <base64 WAV>, "durationMs", "cutInAtMs"?}``. `keys` are the request
+        keys the run was created with (``caller``, ``voice``), sent again because the API keeps
+        neither; each is kept out of every message from here on."""
         body: Dict[str, Any] = {"turn": int(turn), "retake": int(retake), "botAudio": dict(bot_audio)}
         sent = {name: value.strip() for name, value in (keys or {}).items()
                 if isinstance(value, str) and value.strip()}

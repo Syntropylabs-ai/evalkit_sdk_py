@@ -289,7 +289,7 @@ def test_a_quota_refusal_is_not_waited_out():
 
 
 # A dynamic call (RUN_API section 3.3): the opening as line 0, and the loop's rules.
-DYNAMIC = dict(PLAN, caller={"provider": "google", "model": "gemini-2.5-flash", "keySource": "platform"},
+DYNAMIC = dict(PLAN, caller={"provider": "google", "model": "gemini-3.8-flash", "keySource": "platform"},
                platformMinutesLeft=87, calls=[dict(PLAN["calls"][0], script={
                    "mode": "dynamic", "maxCallMs": 300000,
                    "lines": [dict(PLAN["calls"][0]["script"]["lines"][0],
@@ -301,7 +301,7 @@ DYNAMIC = dict(PLAN, caller={"provider": "google", "model": "gemini-2.5-flash", 
 
 def test_a_dynamic_plan_becomes_a_dynamic_script():
     plan = parse_plan(DYNAMIC)
-    assert plan.caller == {"provider": "google", "model": "gemini-2.5-flash", "keySource": "platform"}
+    assert plan.caller == {"provider": "google", "model": "gemini-3.8-flash", "keySource": "platform"}
     assert plan.platform_minutes_left == 87
     (call,) = plan.calls
     assert call.mode == "dynamic"
@@ -364,3 +364,41 @@ def test_the_turn_request_scrubs_the_keys_it_carries():
         (sent,) = fake.turn_requests
         assert sent["keys"] == {"caller": "AIza-caller", "voice": "sk-voice"}
         assert len(fake.requests_to(r"POST /v1/voice-tests/r1/calls/0/turns")) == 1  # one attempt: the caller retries
+
+
+@pytest.mark.parametrize("cut_in_at_ms, sent", [(None, None), (700, 700), (0, None), (1500, None)])
+def test_the_turn_request_carries_the_cut_in_point_inside_the_audio(cut_in_at_ms, sent):
+    """RUN_API 4.1: `botAudio.cutInAtMs` goes with the audio when it falls inside it, from 1 ms to
+    before its end, and is left out otherwise, which the API reads as audio heard whole."""
+    import numpy as np
+
+    from evalkit.voicetest.turns import TurnClient
+
+    with FakeVoiceApi() as fake:
+        api = VoiceTestApi.with_subscription_key(fake.url, KEY, retry=FAST)
+        fake.plan = {"calls": [{"callIndex": 0, "script": {"turns": {"max": 2}}}]}
+        fake.next_turn[0] = 2
+        client = TurnClient(api, "r1", 0)
+        answer, _, audio_ms = client.ask(2, 0, np.zeros(16000, dtype=np.int16), 16000, 5.0, cut_in_at_ms)
+        assert audio_ms == 1000 and answer.line is not None
+        (request,) = fake.turn_requests
+        assert request["cutInAtMs"] == sent and request["durationMs"] == 1000
+
+
+def test_the_cut_in_point_follows_the_audio_when_its_start_is_cut():
+    """An answer longer than the most a request carries keeps its last 60 s: the cut-in point moves
+    with the start, and is left out when it falls before it."""
+    import numpy as np
+
+    from evalkit.voicetest.turns import MAX_BOT_AUDIO_MS, TurnClient
+
+    rate = 8000
+    long = np.zeros(rate * (MAX_BOT_AUDIO_MS // 1000 + 2), dtype=np.int16)  # 62 s: the first 2 s are dropped
+    for cut, sent in [(5000, 3000), (1500, None)]:
+        with FakeVoiceApi() as fake:
+            api = VoiceTestApi.with_subscription_key(fake.url, KEY, retry=FAST)
+            fake.plan = {"calls": [{"callIndex": 0, "script": {"turns": {"max": 2}}}]}
+            fake.next_turn[0] = 2
+            TurnClient(api, "r1", 0).ask(2, 0, long, rate, 5.0, cut)
+            (request,) = fake.turn_requests
+            assert request["durationMs"] == MAX_BOT_AUDIO_MS and request["cutInAtMs"] == sent

@@ -16,7 +16,7 @@ import io
 import time
 import wave
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 from .api import VoiceTestApi, VoiceTestApiError
 from .audio_cache import MAX_AUDIO_BYTES, AudioError
@@ -56,12 +56,16 @@ class SpokenLine:
 
 @dataclass
 class TurnAnswer:
+    """`heard_before_cut_in` is set on the first turn after a cut-in: what the bot said of the answer
+    the cut-in interrupted, which stands in the transcript before the cut-in line."""
+
     turn: int
     heard: Optional[str]
     done: bool
     line: Optional[SpokenLine]
     cut_in: Optional[SpokenLine] = None
     think_ms: Optional[int] = None
+    heard_before_cut_in: Optional[str] = None
 
 
 def retryable_status(status: Optional[int]) -> bool:
@@ -162,6 +166,8 @@ def parse_answer(body: Mapping[str, Any], turn: int, rate: int, timeout_s: float
     done = body.get("done") is True
     heard = body.get("heard")
     heard = heard.strip()[:20_000] if isinstance(heard, str) else None
+    before = body.get("heardBeforeCutIn")
+    before = before.strip()[:20_000] if isinstance(before, str) else None
     line = _spoken(body.get("line"), f"turn {turn}: the line", rate, timeout_s)
     if line is None and not done:
         raise TurnError(f"turn {turn}: the answer has no line and is not done")
@@ -169,7 +175,8 @@ def parse_answer(body: Mapping[str, Any], turn: int, rate: int, timeout_s: float
                                        cut_in=True)
     think = body.get("thinkMs")
     think = int(think) if isinstance(think, (int, float)) and not isinstance(think, bool) else None
-    return TurnAnswer(turn=turn, heard=heard or None, done=done, line=line, cut_in=cut_in, think_ms=think)
+    return TurnAnswer(turn=turn, heard=heard or None, done=done, line=line, cut_in=cut_in, think_ms=think,
+                      heard_before_cut_in=before or None)
 
 
 class TurnClient:
@@ -190,14 +197,23 @@ class TurnClient:
     def scrub(self, text: str) -> str:
         return self.api._scrub(text)
 
-    def ask(self, turn: int, retake: int, bot_pcm: Any, rate: int, timeout_s: float) -> Tuple[TurnAnswer, int, int]:
+    def ask(self, turn: int, retake: int, bot_pcm: Any, rate: int, timeout_s: float,
+            cut_in_at_ms: Optional[int] = None) -> Tuple[TurnAnswer, int, int]:
         """Blocking: one request for `turn`. Returns the answer, the round trip in ms and the bot audio
-        sent in ms. Raises TurnError."""
+        sent in ms. Raises TurnError. `cut_in_at_ms` is where in `bot_pcm` the caller began a cut-in
+        (RUN_API section 4.1, `botAudio.cutInAtMs`); it is sent only when it falls inside the audio
+        as sent, which keeps its last MAX_BOT_AUDIO_MS."""
         data, audio_ms = bot_audio_wav(bot_pcm, rate)
+        bot_audio: Dict[str, Any] = {"data": data, "durationMs": audio_ms}
+        if cut_in_at_ms is not None:
+            dropped_ms = max(0, len(bot_pcm) - rate * MAX_BOT_AUDIO_MS // 1000) * 1000.0 / rate
+            cut = int(round(cut_in_at_ms - dropped_ms))
+            if 1 <= cut < audio_ms:
+                bot_audio["cutInAtMs"] = cut
         started = time.monotonic()
         try:
             body = self.api.next_turn(self.run_id, self.call_index, turn, retake,
-                                      {"data": data, "durationMs": audio_ms}, self.keys, timeout_s=timeout_s)
+                                      bot_audio, self.keys, timeout_s=timeout_s)
         except VoiceTestApiError as exc:
             message = exc.server_message or str(exc)
             raise TurnError(self.scrub(f"turn {turn}: {message}"), exc.status,
@@ -209,4 +225,6 @@ class TurnClient:
             raise TurnError(self.scrub(str(exc)), exc.status, exc.retryable, exc.retry_after_s) from None
         if answer.heard:
             answer.heard = self.scrub(answer.heard)
+        if answer.heard_before_cut_in:
+            answer.heard_before_cut_in = self.scrub(answer.heard_before_cut_in)
         return answer, round_trip, audio_ms
