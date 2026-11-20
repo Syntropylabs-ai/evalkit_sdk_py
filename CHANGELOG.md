@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.9 — unreleased (set the date at publish)
+## 0.3.9 — 2026-11-21
 
 Voice tests need nothing saved in the console: the callers can be written for you from what your bot
 does, or come from a file, and the caller's voice and model can run on your own provider keys. A caller
